@@ -1,8 +1,10 @@
 import asyncio
 import aiohttp
 import json
+import re
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
+from aiogram.types import BotCommand
 from aiohttp import web
 import time
 import os
@@ -141,6 +143,17 @@ def fmt_money(x):
     return f"{x:,.0f}" if abs(x) >= 1000 else f"{x:,.2f}"
 
 
+def normalize_pair(raw: str) -> str:
+    """Приводит ввод пользователя к формату пары бирж ("BTCUSDT"). Раньше сюда
+    просто клали .upper() от аргумента команды — если пользователь писал монету
+    как "$BTC", "BTC/USDT", "btc-usdt" и т.п., в ЧС/мут попадала строка вроде
+    "$BTCUSDT" или "BTC/USDT", которая НИКОГДА не совпадала с реальным ключом
+    пары ("BTCUSDT") из данных бирж — команда отвечала "успехом", а по факту
+    ничего не блокировала. Теперь сначала вырезаем всё, кроме букв/цифр."""
+    coin = re.sub(r"[^A-Z0-9]", "", raw.upper())
+    return coin if coin.endswith("USDT") else f"{coin}USDT"
+
+
 def fmt_price(x):
     """Цена без обрезания значимых знаков — у мелких монет 6-8 знаков после запятой важны."""
     try:
@@ -181,8 +194,9 @@ async def start_cmd(message: types.Message):
         f"   └ сейчас: <b>{stable_display}</b>\n"
         f"/tr — вкл/выкл фильтр по доступности вывода/ввода (см. ⚠️ ниже про ограничение)\n"
         f"   └ сейчас: <b>{'Вкл' if settings['require_transferable'] else 'Выкл'}</b>\n"
-        f"/b BTC — добавить монету в чёрный список НАВСЕГДА (без алертов, пока не уберёшь той же командой)\n"
+        f"/b BTC — добавить/убрать монету из чёрного списка (повторный вызов с той же монетой снимает её)\n"
         f"   └ в ЧС сейчас: <b>{len(blacklist)} шт.</b>\n"
+        f"/bl — показать список монет в ЧС (проверить, что реально добавилось)\n"
         f"/mute BTC 30 — замьютить монету ВРЕМЕННО на N минут (снимается само)\n"
         f"   └ в муте сейчас: <b>{len(muted_until)} шт.</b>\n"
         f"/unmute BTC — снять мут досрочно\n"
@@ -315,15 +329,25 @@ async def toggle_transfer_filter(message: types.Message):
 async def add_blacklist(message: types.Message, command: CommandObject):
     settings["chat_id"] = message.chat.id
     if command.args:
-        coin = command.args.upper()
-        pair = coin if coin.endswith("USDT") else f"{coin}USDT"
+        pair = normalize_pair(command.args)
         if pair in blacklist:
             blacklist.discard(pair)
-            await message.answer(f"✅ <b>{pair}</b> убран из ЧС", parse_mode="HTML")
+            await message.answer(f"✅ <b>{pair}</b> убран из ЧС (сейчас в ЧС: {len(blacklist)})", parse_mode="HTML")
         else:
             blacklist.add(pair)
-            await message.answer(f"🚫 <b>{pair}</b> в ЧС", parse_mode="HTML")
+            await message.answer(f"🚫 <b>{pair}</b> в ЧС (сейчас в ЧС: {len(blacklist)})", parse_mode="HTML")
         asyncio.create_task(save_state())
+    else:
+        await message.answer("❌ Ошибка. Пример: /b BTC (повторный вызов уберёт монету из ЧС). Список ЧС — /bl")
+
+
+@dp.message(Command("bl"))
+async def list_blacklist(message: types.Message):
+    if not blacklist:
+        await message.answer("🚫 Чёрный список пуст")
+        return
+    coins = "\n".join(f"• {p}" for p in sorted(blacklist))
+    await message.answer(f"🚫 <b>Чёрный список ({len(blacklist)}):</b>\n{coins}", parse_mode="HTML")
 
 
 @dp.message(Command("mute"))
@@ -336,8 +360,7 @@ async def mute_coin(message: types.Message, command: CommandObject):
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("❌ Ошибка. Пример: /mute BTC 30 (монета + минуты)")
         return
-    coin = parts[0].upper()
-    pair = coin if coin.endswith("USDT") else f"{coin}USDT"
+    pair = normalize_pair(parts[0])
     minutes = int(parts[1])
     muted_until[pair] = time.time() + minutes * 60
     asyncio.create_task(save_state())
@@ -350,8 +373,7 @@ async def unmute_coin(message: types.Message, command: CommandObject):
     if not command.args:
         await message.answer("❌ Ошибка. Пример: /unmute BTC")
         return
-    coin = command.args.upper()
-    pair = coin if coin.endswith("USDT") else f"{coin}USDT"
+    pair = normalize_pair(command.args)
     if pair in muted_until:
         del muted_until[pair]
         asyncio.create_task(save_state())
@@ -1035,6 +1057,25 @@ async def scanner_task():
 
 # ================= WEB & RUN =================
 
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Инфо и список команд"),
+    BotCommand(command="s", description="Текущий статус настроек"),
+    BotCommand(command="debug", description="Диагностика последнего прохода сканера"),
+    BotCommand(command="sp", description="Мин. % спреда для алерта"),
+    BotCommand(command="spm", description="Порог спреда именно MEXC→HTX"),
+    BotCommand(command="v", description="Мин. объём 24ч на обеих биржах"),
+    BotCommand(command="mt", description="Мин. сумма для прокрутки по стакану"),
+    BotCommand(command="cd", description="Пауза между повторными алертами"),
+    BotCommand(command="ss", description="Мин. время стабильности спреда"),
+    BotCommand(command="tr", description="Вкл/выкл фильтр доступности перевода"),
+    BotCommand(command="b", description="Добавить/убрать монету из ЧС"),
+    BotCommand(command="bl", description="Показать список монет в ЧС"),
+    BotCommand(command="mute", description="Временно замьютить монету"),
+    BotCommand(command="unmute", description="Снять мут с монеты"),
+    BotCommand(command="channel", description="Куда дублировать сигналы"),
+]
+
+
 async def handle_ping(request):
     return web.Response(text="OK", status=200)
 
@@ -1056,6 +1097,10 @@ async def main():
     http_session = aiohttp.ClientSession(connector=connector)
 
     await load_state()  # восстанавливаем settings/blacklist/muted из Upstash, если настроен
+
+    # Регистрируем список команд в Telegram — по нажатию "/" в чате сразу
+    # всплывает меню с подсказками, без этого вызова Telegram о командах не знает.
+    await bot.set_my_commands(BOT_COMMANDS)
 
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(scanner_task())
