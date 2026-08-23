@@ -41,6 +41,12 @@ HTX_HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
+# Таймауты объектами ClientTimeout, а не голым числом: число aiohttp 3.x ещё
+# принимает (заворачивает в total=), но в 4.x это уже ошибка.
+TIMEOUT_BULK = aiohttp.ClientTimeout(total=15)
+TIMEOUT_HEAVY = aiohttp.ClientTimeout(total=20)
+TIMEOUT_REDIS = aiohttp.ClientTimeout(total=10)
+
 settings = {
     # ПЕРВИЧНЫЙ критерий: мин. % спреда между MEXC и HTX (в ЛЮБУЮ из двух сторон),
     # чтобы сработал алерт. Спред считается как отношение (цена продажи - цена
@@ -75,6 +81,13 @@ settings = {
     # 0 = выключено (фильтр не применяется, сумма просто показывается в алерте).
     "min_turnover_usd": 0,
 
+    # ВЕРХНЯЯ отсечка спреда, %. Если тикер на биржах совпал, а актив по факту
+    # разный (разная деноминация — классика 1000SATS против SATS; или тикер
+    # переиспользован после ребренда токена), спред считается в сотни-тысячи
+    # процентов и приходит как самый жирный сигнал в списке. Реальный арбитраж
+    # таких величин на ликвидных парах не даёт. 0 = отсечку не применять.
+    "max_spread_percent": 50.0,
+
     # Фильтр по факту возможности перевода монеты. ВАЖНО: реально проверяется
     # ТОЛЬКО сторона HTX (публичный эндпоинт, без API-ключа). Статус MEXC без
     # приватного API-ключа недоступен в принципе — эта сторона в алерте всегда
@@ -106,6 +119,14 @@ HTX_TRANSFER_TTL = 600  # 10 минут
 mexc_contracts_cache = {"ts": 0.0, "data": {}}
 MEXC_CONTRACTS_TTL = 6 * 3600  # 6 часов — сети/контракты почти никогда не меняются
 
+# Кэш суточных объёмов MEXC: {"ts": fetched_at, "data": {symbol: quoteVolume}}.
+# /api/v3/ticker/24hr — самый тяжёлый ответ у MEXC (все пары разом, ~1 МБ), а
+# нужен он только ради фильтра ликвидности (/v). Объём за 24ч физически не может
+# заметно измениться за 10 секунд, поэтому тянуть его каждый проход — чистая
+# трата трафика и времени. Цены (bookTicker) при этом обновляются каждый проход.
+mexc_vol_cache = {"ts": 0.0, "data": {}}
+MEXC_VOL_TTL = 60  # 1 минута
+
 debug_stats = {
     "ts": 0.0,
     "mexc_ok": False,
@@ -122,6 +143,17 @@ debug_stats = {
     "passed_cooldown": 0,
     "alerts_sent": 0,
     "last_error": None,
+    # Сколько записей молча выброшено при разборе ответов бирж. Раньше такие
+    # пропуски были полностью невидимы (голый except ... continue), из-за чего
+    # сломанный парсинг статусов перевода жил незамеченным.
+    "skipped_mexc": 0,
+    "skipped_htx": 0,
+    "skipped_htx_transfer": 0,
+    "skip_reason": None,
+    # Отсечено как заведомо не-арбитраж (разная деноминация тикера и т.п.)
+    "blocked_by_sanity": 0,
+    # Отсечено фильтром /mt из-за того, что глубину посчитать не удалось
+    "blocked_by_unknown_depth": 0,
 }
 
 bot = Bot(token=BOT_TOKEN)
@@ -129,8 +161,8 @@ dp = Dispatcher()
 
 # Одна общая HTTP-сессия на всё время жизни бота вместо создания новой сессии
 # (= новый TCP+TLS handshake) на КАЖДЫЙ запрос. Инициализируется в main() —
-# держит пул соединений (keep-alive) и DNS-кэш, заметно снижает задержку,
-# особенно для частых точечных запросов вроде get_htx_depth.
+# держит пул соединений (keep-alive) и DNS-кэш, заметно снижает задержку
+# повторных обращений к тем же хостам.
 http_session: aiohttp.ClientSession | None = None
 
 
@@ -173,6 +205,7 @@ async def start_cmd(message: types.Message):
     stable_display = "Выкл" if settings["spread_stable_sec"] == 0 else f"{settings['spread_stable_sec']} сек"
     turnover_display = "Выкл" if settings["min_turnover_usd"] == 0 else f"{settings['min_turnover_usd']:,.0f}$"
     spm_display = "Выкл (общий /sp)" if settings["spread_percent_mexc_to_htx"] == 0 else f"{settings['spread_percent_mexc_to_htx']}%"
+    spmax_display = "Выкл" if settings["max_spread_percent"] == 0 else f"{settings['max_spread_percent']}%"
     await message.answer(
         "🔀 <b>Спред-сканер MEXC ⇄ HTX (Huobi) запущен</b>\n"
         "Ищет расхождение цены по ВСЕМ общим USDT-парам на обеих биржах. "
@@ -184,6 +217,8 @@ async def start_cmd(message: types.Message):
         f"   └ сейчас: <b>{settings['spread_percent']}%</b>\n"
         f"/spm 2 — отдельный порог именно для направления MEXC→HTX (0 = использовать общий /sp)\n"
         f"   └ сейчас: <b>{spm_display}</b>\n"
+        f"/spmax 50 — верхняя отсечка: спреды выше этого % считаются не-арбитражем (разная деноминация одноимённых тикеров), 0 = выключить\n"
+        f"   └ сейчас: <b>{spmax_display}</b>\n"
         f"/v 100000 — мин. объём торгов за 24ч в $, обязателен на ОБЕИХ биржах сразу (фильтр ликвидности/фантомных спредов)\n"
         f"   └ сейчас: <b>{settings['min_volume']:,}$</b>\n"
         f"/mt 500 — мин. сумма в $, которую реально можно прокрутить по глубине стакана (0 = не фильтровать, просто показывать)\n"
@@ -229,7 +264,7 @@ async def set_channel(message: types.Message, command: CommandObject):
     else:
         settings["channel_id"] = None
         await message.answer("✅ Дублирование в канал <b>ОТКЛЮЧЕНО</b>", parse_mode="HTML")
-    asyncio.create_task(save_state())
+    schedule_save()
 
 
 @dp.message(Command("sp"))
@@ -239,7 +274,7 @@ async def set_spread(message: types.Message, command: CommandObject):
         val = abs(float(command.args.replace(',', '.')))
         settings["spread_percent"] = val
         await message.answer(f"✅ Мин. % спреда для алерта: <b>{val}%</b>", parse_mode="HTML")
-        asyncio.create_task(save_state())
+        schedule_save()
     except Exception:
         await message.answer("❌ Ошибка. Пример: /sp 1.5")
 
@@ -254,9 +289,29 @@ async def set_spread_mexc_to_htx(message: types.Message, command: CommandObject)
             await message.answer("✅ Отдельный порог для MEXC→HTX <b>ВЫКЛЮЧЕН</b> — используется общий /sp", parse_mode="HTML")
         else:
             await message.answer(f"✅ Порог именно для направления MEXC→HTX: <b>{val}%</b> (для HTX→MEXC остаётся общий /sp)", parse_mode="HTML")
-        asyncio.create_task(save_state())
+        schedule_save()
     except Exception:
         await message.answer("❌ Ошибка. Пример: /spm 2 (0 = выключить, использовать общий /sp)")
+
+
+@dp.message(Command("spmax"))
+async def set_spread_max(message: types.Message, command: CommandObject):
+    settings["chat_id"] = message.chat.id
+    try:
+        val = max(0.0, float(command.args.replace(',', '.')))
+        settings["max_spread_percent"] = val
+        if val == 0:
+            await message.answer(
+                "⚠️ Верхняя отсечка спреда <b>ВЫКЛЮЧЕНА</b> — в алерты снова смогут "
+                "попадать пары с одинаковым тикером, но разным активом/деноминацией "
+                "(спреды в сотни процентов)", parse_mode="HTML")
+        else:
+            await message.answer(
+                f"✅ Спреды выше <b>{val}%</b> отбрасываются как заведомо не-арбитраж "
+                f"(разная деноминация одноимённых тикеров и т.п.)", parse_mode="HTML")
+        schedule_save()
+    except Exception:
+        await message.answer("❌ Ошибка. Пример: /spmax 50 (0 = выключить отсечку)")
 
 
 @dp.message(Command("v"))
@@ -265,7 +320,7 @@ async def set_volume(message: types.Message, command: CommandObject):
     if command.args and command.args.isdigit():
         settings["min_volume"] = int(command.args)
         await message.answer(f"✅ Мин. объём 24ч (на ОБЕИХ биржах): <b>{settings['min_volume']:,}$</b>", parse_mode="HTML")
-        asyncio.create_task(save_state())
+        schedule_save()
     else:
         await message.answer("❌ Ошибка. Пример: /v 100000")
 
@@ -281,7 +336,7 @@ async def set_spread_stable(message: types.Message, command: CommandObject):
             await message.answer("✅ Фильтр стабильности спреда <b>ВЫКЛЮЧЕН</b> (алерт сразу, как только спред превысит порог)", parse_mode="HTML")
         else:
             await message.answer(f"✅ Спред должен непрерывно держаться выше порога минимум <b>{val} сек</b> перед алертом", parse_mode="HTML")
-        asyncio.create_task(save_state())
+        schedule_save()
     else:
         await message.answer("❌ Ошибка. Пример: /ss 30 (0 = выключить)")
 
@@ -296,7 +351,7 @@ async def set_min_turnover(message: types.Message, command: CommandObject):
             await message.answer("✅ Фильтр мин. оборота <b>ВЫКЛЮЧЕН</b> (сумма для прокрутки просто показывается в алерте, не фильтрует)", parse_mode="HTML")
         else:
             await message.answer(f"✅ Мин. сумма для прокрутки (по глубине стакана): <b>{val:,.0f}$</b> — пары с меньшей глубиной не алертятся", parse_mode="HTML")
-        asyncio.create_task(save_state())
+        schedule_save()
     else:
         await message.answer("❌ Ошибка. Пример: /mt 500 (0 = выключить)")
 
@@ -307,7 +362,7 @@ async def set_cooldown(message: types.Message, command: CommandObject):
     if command.args and command.args.isdigit():
         settings["cooldown_min"] = int(command.args)
         await message.answer(f"✅ Пауза между повторными алертами: <b>{settings['cooldown_min']} мин</b>", parse_mode="HTML")
-        asyncio.create_task(save_state())
+        schedule_save()
     else:
         await message.answer("❌ Ошибка. Пример: /cd 10")
 
@@ -322,7 +377,7 @@ async def toggle_transfer_filter(message: types.Message):
         f"<i>Напоминание: реально проверяется только сторона HTX (публичный статус). "
         f"MEXC не проверяется — нет API-ключа, эта сторона в алерте всегда помечена как непроверенная.</i>",
         parse_mode="HTML")
-    asyncio.create_task(save_state())
+    schedule_save()
 
 
 @dp.message(Command("b"))
@@ -336,7 +391,7 @@ async def add_blacklist(message: types.Message, command: CommandObject):
         else:
             blacklist.add(pair)
             await message.answer(f"🚫 <b>{pair}</b> в ЧС (сейчас в ЧС: {len(blacklist)})", parse_mode="HTML")
-        asyncio.create_task(save_state())
+        schedule_save()
     else:
         await message.answer("❌ Ошибка. Пример: /b BTC (повторный вызов уберёт монету из ЧС). Список ЧС — /bl")
 
@@ -363,7 +418,7 @@ async def mute_coin(message: types.Message, command: CommandObject):
     pair = normalize_pair(parts[0])
     minutes = int(parts[1])
     muted_until[pair] = time.time() + minutes * 60
-    asyncio.create_task(save_state())
+    schedule_save()
     await message.answer(f"🔇 <b>{pair}</b> замьючена на <b>{minutes} мин</b> (алертов по ней не будет до истечения)", parse_mode="HTML")
 
 
@@ -376,7 +431,7 @@ async def unmute_coin(message: types.Message, command: CommandObject):
     pair = normalize_pair(command.args)
     if pair in muted_until:
         del muted_until[pair]
-        asyncio.create_task(save_state())
+        schedule_save()
         await message.answer(f"🔊 <b>{pair}</b> размьючена досрочно", parse_mode="HTML")
     else:
         await message.answer(f"ℹ️ <b>{pair}</b> и так не в муте", parse_mode="HTML")
@@ -387,10 +442,12 @@ async def status_cmd(message: types.Message):
     stable_display = "Выкл" if settings["spread_stable_sec"] == 0 else f"{settings['spread_stable_sec']} сек"
     turnover_display = "Выкл" if settings["min_turnover_usd"] == 0 else f"{settings['min_turnover_usd']:,.0f}$"
     spm_display = "Выкл (общий /sp)" if settings["spread_percent_mexc_to_htx"] == 0 else f"{settings['spread_percent_mexc_to_htx']}%"
+    spmax_display = "Выкл" if settings["max_spread_percent"] == 0 else f"{settings['max_spread_percent']}%"
     await message.answer(
         "📊 <b>Статус</b>\n"
         f"🔀 Мин. % спреда (общий): <b>{settings['spread_percent']}%</b>\n"
         f"🔀 Мин. % спреда MEXC→HTX: <b>{spm_display}</b>\n"
+        f"🔀 Верхняя отсечка спреда: <b>{spmax_display}</b>\n"
         f"💰 Мин. объём 24ч (обе биржи): <b>{settings['min_volume']:,}$</b>\n"
         f"📦 Мин. сумма для прокрутки: <b>{turnover_display}</b>\n"
         f"⏱ Пауза между повторными алертами: <b>{settings['cooldown_min']} мин</b>\n"
@@ -429,13 +486,25 @@ async def debug_cmd(message: types.Message):
         f"📡 MEXC (контракты монет): {contracts_status}",
         f"1️⃣ Общих USDT-пар на обеих биржах: {debug_stats['common_pairs']}",
         f"2️⃣ Прошли мин. объём 24ч на обеих биржах (/v): {debug_stats['passed_volume_floor']}",
-        f"3️⃣ Прошли порог спреда (/sp): {debug_stats['passed_spread_filter']}",
+        f"3️⃣ Прошли порог спреда (/sp): {debug_stats['passed_spread_filter']} (отсечено сверху /spmax: {debug_stats['blocked_by_sanity']})",
         f"4️⃣ Прошли фильтр стабильности (/ss): {debug_stats['passed_stability']}",
         f"5️⃣ Прошли фильтр перевода (/tr): {debug_stats['passed_transfer_check']} (заблокировано: {debug_stats['blocked_by_transfer']})",
         f"6️⃣ Прошли анти-спам (кулдаун /cd): {debug_stats['passed_cooldown']}",
-        f"7️⃣ Прошли фильтр мин. оборота (/mt): {debug_stats['passed_turnover_filter']}",
+        f"7️⃣ Прошли фильтр мин. оборота (/mt): {debug_stats['passed_turnover_filter']} (без данных о глубине: {debug_stats['blocked_by_unknown_depth']})",
         f"📨 Алертов отправлено за этот проход: {debug_stats['alerts_sent']}",
     ]
+
+    skipped_total = (debug_stats["skipped_mexc"] + debug_stats["skipped_htx"]
+                     + debug_stats["skipped_htx_transfer"])
+    if skipped_total:
+        lines.append("")
+        lines.append(
+            f"⚠️ Записей выброшено при разборе ответов: MEXC {debug_stats['skipped_mexc']}, "
+            f"HTX {debug_stats['skipped_htx']}, статусы перевода {debug_stats['skipped_htx_transfer']}"
+        )
+        if debug_stats["skip_reason"]:
+            lines.append(f"   └ причина последней: {debug_stats['skip_reason']}")
+
     if debug_stats["last_error"]:
         lines.append(f"⚠️ Последняя ошибка: {debug_stats['last_error']}")
 
@@ -451,43 +520,75 @@ async def debug_cmd(message: types.Message):
 
 # ================= API =================
 
-async def fetch_mexc_data():
+async def _mexc_get(url, label, timeout=TIMEOUT_BULK):
+    """GET к публичному эндпоинту MEXC. Возвращает разобранный JSON или None."""
+    async with http_session.get(url, timeout=timeout) as resp:
+        if resp.status != 200:
+            debug_stats["last_error"] = f"MEXC {label} HTTP {resp.status}"
+            return None
+        return await resp.json()
+
+
+async def fetch_mexc_volumes():
     """
-    Возвращает dict symbol -> {"bid": float, "ask": float, "vol": float ($ за 24ч)}.
-    Два bulk-запроса без параметров (все пары сразу): bookTicker даёт bid/ask,
-    ticker/24hr даёт объём в quote-валюте (USDT). Запускаются ПАРАЛЛЕЛЬНО
-    (asyncio.gather) вместо последовательных await — они независимы друг от
-    друга, нет смысла ждать первый, прежде чем начать второй.
+    Суточные объёмы MEXC (quoteVolume, т.е. в USDT) по всем USDT-парам.
+    Кэшируется на MEXC_VOL_TTL: это самый тяжёлый ответ у MEXC (все пары разом),
+    а объём за 24ч за несколько секунд не меняется ни на что значимое — тянуть
+    его каждый проход бессмысленно. Если запрос упал, отдаём прошлый кэш:
+    слегка устаревший объём лучше, чем обнуление фильтра ликвидности.
     """
-    async def _get(url, label):
-        async with http_session.get(url, timeout=15) as resp:
-            if resp.status != 200:
-                debug_stats["last_error"] = f"MEXC {label} HTTP {resp.status}"
-                return None
-            return await resp.json()
+    now = time.time()
+    if mexc_vol_cache["data"] and (now - mexc_vol_cache["ts"]) < MEXC_VOL_TTL:
+        return mexc_vol_cache["data"]
 
     try:
-        book_data, vol_data = await asyncio.gather(
-            _get("https://api.mexc.com/api/v3/ticker/bookTicker", "bookTicker"),
-            _get("https://api.mexc.com/api/v3/ticker/24hr", "24hr"),
-        )
+        vol_data = await _mexc_get("https://api.mexc.com/api/v3/ticker/24hr", "24hr")
     except Exception as e:
-        debug_stats["last_error"] = f"MEXC запрос: {e}"
-        return {}
+        debug_stats["last_error"] = f"MEXC 24hr запрос: {e}"
+        return mexc_vol_cache["data"]
 
-    if book_data is None or vol_data is None:
-        return {}
+    if vol_data is None:
+        return mexc_vol_cache["data"]
 
-    result = {}
     vol_by_symbol = {}
     for item in vol_data:
         try:
             sym = item["symbol"]
             if sym.endswith("USDT"):
                 vol_by_symbol[sym] = float(item["quoteVolume"])
-        except Exception:
+        except Exception as e:
+            debug_stats["skipped_mexc"] += 1
+            debug_stats["skip_reason"] = f"MEXC 24hr: {type(e).__name__} {e}"
             continue
 
+    if vol_by_symbol:
+        mexc_vol_cache["ts"] = now
+        mexc_vol_cache["data"] = vol_by_symbol
+
+    return mexc_vol_cache["data"]
+
+
+async def fetch_mexc_data():
+    """
+    Возвращает dict symbol -> {"bid", "ask", "vol" ($ за 24ч), "bid_qty", "ask_qty"}.
+    Цены и объём топа стакана берутся из bookTicker (лёгкий bulk-ответ, тянется
+    каждый проход), суточный объём — из кэша fetch_mexc_volumes (тяжёлый ответ,
+    раз в MEXC_VOL_TTL). Оба запроса стартуют параллельно; когда объём ещё
+    свежий в кэше, второй запрос вообще не уходит в сеть.
+    """
+    try:
+        book_data, vol_by_symbol = await asyncio.gather(
+            _mexc_get("https://api.mexc.com/api/v3/ticker/bookTicker", "bookTicker"),
+            fetch_mexc_volumes(),
+        )
+    except Exception as e:
+        debug_stats["last_error"] = f"MEXC запрос: {e}"
+        return {}
+
+    if book_data is None:
+        return {}
+
+    result = {}
     for item in book_data:
         try:
             sym = item["symbol"]
@@ -502,7 +603,9 @@ async def fetch_mexc_data():
                 "bid_qty": float(item.get("bidQty", 0) or 0),
                 "ask_qty": float(item.get("askQty", 0) or 0),
             }
-        except Exception:
+        except Exception as e:
+            debug_stats["skipped_mexc"] += 1
+            debug_stats["skip_reason"] = f"MEXC bookTicker: {type(e).__name__} {e}"
             continue
 
     return result
@@ -515,15 +618,34 @@ def _first_num(v):
     return float(v)
 
 
+def _opt_num(v):
+    """float или None, если значения нет/оно не число (для необязательных полей)."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
 async def fetch_huobi_data():
     """
-    Возвращает dict symbol (в формате MEXC, напр. "BTCUSDT") -> {"bid", "ask", "vol"}.
-    Один bulk-запрос без параметров — все пары сразу, поле "vol" — суточный оборот
-    в quote-валюте (для *usdt пар — в USDT), совпадает по смыслу с quoteVolume MEXC.
+    Возвращает dict symbol (в формате MEXC, напр. "BTCUSDT") ->
+    {"bid", "ask", "vol", "bid_qty", "ask_qty"}.
+
+    Один bulk-запрос без параметров — все пары сразу. Поле "vol" — суточный
+    оборот в quote-валюте (для *usdt пар — в USDT), совпадает по смыслу с
+    quoteVolume MEXC (в базовой валюте у HTX идёт "amount", он нам не нужен).
+
+    ВАЖНО про скорость: этот же ответ содержит bidSize/askSize — объём на лучшей
+    цене, то есть ровно то, ради чего раньше по КАЖДОМУ кандидату улетал
+    отдельный запрос /market/depth. Берём глубину прямо отсюда — целая сетевая
+    фаза сканера (N запросов на проход) исчезает.
     """
     result = {}
     try:
-        async with http_session.get("https://api.huobi.pro/market/tickers", headers=HTX_HEADERS, timeout=15) as resp:
+        async with http_session.get("https://api.huobi.pro/market/tickers", headers=HTX_HEADERS, timeout=TIMEOUT_BULK) as resp:
             if resp.status != 200:
                 debug_stats["last_error"] = f"HTX tickers HTTP {resp.status}"
                 return {}
@@ -543,8 +665,16 @@ async def fetch_huobi_data():
             if not bid or not ask or bid <= 0 or ask <= 0:
                 continue
             vol = float(item.get("vol", 0.0) or 0.0)  # оборот в USDT за сутки
-            result[sym] = {"bid": bid, "ask": ask, "vol": vol}
-        except Exception:
+            result[sym] = {
+                "bid": bid, "ask": ask, "vol": vol,
+                # None (а не 0), если поля нет — 0 означал бы «стакан пустой» и
+                # ошибочно резал бы пару фильтром /mt.
+                "bid_qty": _opt_num(item.get("bidSize")),
+                "ask_qty": _opt_num(item.get("askSize")),
+            }
+        except Exception as e:
+            debug_stats["skipped_htx"] += 1
+            debug_stats["skip_reason"] = f"HTX tickers: {type(e).__name__} {e}"
             continue
 
     return result
@@ -582,7 +712,7 @@ async def get_mexc_contracts():
 
     url = f"https://api.mexc.com/api/v3/capital/config/getall?{query}"
     try:
-        async with http_session.get(url, headers={"X-MEXC-APIKEY": api_key}, timeout=20) as resp:
+        async with http_session.get(url, headers={"X-MEXC-APIKEY": api_key}, timeout=TIMEOUT_HEAVY) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 debug_stats["last_error"] = f"MEXC contracts HTTP {resp.status}: {body[:150]}"
@@ -626,9 +756,19 @@ async def get_mexc_contracts():
         debug_stats["mexc_contracts_ok"] = False
 
     return mexc_contracts_cache["data"]
+
+
+def _extract_withdraw_fee(chain):
     """Возвращает (сумма_комиссии, тип) для одной сети HTX, или (None, None), если
     определить не удалось. fixed — фиксированная сумма; circulated/ratio — берём
-    минимальную границу комиссии (minTransactFeeWithdraw)."""
+    минимальную границу комиссии (minTransactFeeWithdraw).
+
+    ВАЖНО (был баг): у этой функции пропала строка `def`, и её тело оказалось
+    недостижимым куском внутри get_mexc_contracts (сразу после return). Из-за
+    этого вызов ниже падал с NameError, который гасился голым `except Exception:
+    continue` — в кэш статусов перевода попадали ТОЛЬКО монеты с закрытым
+    выводом на всех сетях, а по всем остальным статус считался «неизвестен», и
+    фильтр /tr фактически не блокировал ничего."""
     fee_type = chain.get("withdrawFeeType")
     try:
         if fee_type == "fixed":
@@ -655,7 +795,7 @@ async def get_htx_transfer_status():
 
     result = {}
     try:
-        async with http_session.get("https://api.huobi.pro/v2/reference/currencies", headers=HTX_HEADERS, timeout=20) as resp:
+        async with http_session.get("https://api.huobi.pro/v2/reference/currencies", headers=HTX_HEADERS, timeout=TIMEOUT_HEAVY) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 debug_stats["last_error"] = f"HTX currencies HTTP {resp.status}: {body[:150]}"
@@ -685,7 +825,9 @@ async def get_htx_transfer_status():
                 "deposit": deposit_ok, "withdraw": withdraw_ok,
                 "fee": best_fee, "fee_type": best_fee_type, "fee_chain": best_chain,
             }
-        except Exception:
+        except Exception as e:
+            debug_stats["skipped_htx_transfer"] += 1
+            debug_stats["skip_reason"] = f"HTX currencies: {type(e).__name__} {e}"
             continue
 
     if result:
@@ -698,26 +840,11 @@ async def get_htx_transfer_status():
     return htx_transfer_cache["data"]
 
 
-async def get_htx_depth(symbol_lower):
-    """
-    Топ стакана HTX (объём на лучшей цене bid/ask) — только по паре, которая уже
-    прошла остальные фильтры, поэтому лишним запросом не нагружаем весь цикл.
-    Возвращает (bid_qty, ask_qty) в штуках монеты, либо (None, None) при ошибке.
-    """
-    url = f"https://api.huobi.pro/market/depth?symbol={symbol_lower}&type=step0"
-    try:
-        async with http_session.get(url, headers=HTX_HEADERS, timeout=8) as resp:
-            if resp.status != 200:
-                return None, None
-            data = await resp.json()
-        tick = data.get("tick") or {}
-        bids = tick.get("bids") or []
-        asks = tick.get("asks") or []
-        bid_qty = float(bids[0][1]) if bids else None
-        ask_qty = float(asks[0][1]) if asks else None
-        return bid_qty, ask_qty
-    except Exception:
-        return None, None
+# ПРИМЕЧАНИЕ: раньше здесь была get_htx_depth() — точечный запрос
+# /market/depth по каждому кандидату ради объёма на лучшей цене. Она удалена:
+# bulk-ответ /market/tickers, который сканер и так тянет каждый проход, уже
+# содержит bidSize/askSize с тем же смыслом (см. fetch_huobi_data). Это убрало
+# из прохода N дополнительных HTTP-запросов, где N — число кандидатов.
 
 
 # ================= UPSTASH (персистентность настроек) =================
@@ -732,7 +859,7 @@ async def redis_cmd(*args):
             UPSTASH_REDIS_REST_URL,
             json=list(args),
             headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
-            timeout=10,
+            timeout=TIMEOUT_REDIS,
         ) as resp:
             if resp.status != 200:
                 return None
@@ -741,6 +868,20 @@ async def redis_cmd(*args):
     except Exception as e:
         print(f"Upstash ошибка: {e}", flush=True)
         return None
+
+
+# Event loop держит на задачи только СЛАБЫЕ ссылки: если не сохранить ссылку на
+# результат create_task, сборщик мусора может убить задачу прямо посреди
+# выполнения, и сохранение в Upstash молча потеряется. Держим ссылки здесь и
+# отпускаем по завершении.
+_background_tasks = set()
+
+
+def schedule_save():
+    """Fire-and-forget сохранение состояния, но со ссылкой на задачу."""
+    task = schedule_save()
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def save_state():
@@ -810,6 +951,11 @@ async def scanner_task():
             debug_stats["blocked_by_transfer"] = 0
             debug_stats["passed_cooldown"] = 0
             debug_stats["alerts_sent"] = 0
+            debug_stats["skipped_mexc"] = 0
+            debug_stats["skipped_htx"] = 0
+            debug_stats["skipped_htx_transfer"] = 0
+            debug_stats["blocked_by_sanity"] = 0
+            debug_stats["blocked_by_unknown_depth"] = 0
 
             if not mexc_data or not huobi_data:
                 await asyncio.sleep(settings["check_interval"])
@@ -820,6 +966,12 @@ async def scanner_task():
             debug_stats["common_pairs"] = len(common)
 
             now = time.time()
+
+            # Чистим память алертов старше суток — кулдаун всё равно считается
+            # минутами, а без этого словарь только рос всё время работы процесса.
+            stale = [p for p, a in alert_memory.items() if (now - a["last_msg"]) >= 86400]
+            for p in stale:
+                del alert_memory[p]
 
             # ===== ФАЗА 1: синхронная фильтрация, без единого сетевого вызова =====
             candidates = []
@@ -856,6 +1008,17 @@ async def scanner_task():
                 if spread_htx_to_mexc >= htx_to_mexc_threshold:
                     dir_candidates.append(("HTX", "MEXC", spread_htx_to_mexc, h["ask"], m["bid"]))
 
+                # ===== САНИТИ-ОТСЕЧКА СВЕРХУ =====
+                # Отбрасываем направления с неправдоподобно большим спредом ДО
+                # выбора лучшего — иначе "спред" в 900%, возникший из-за разной
+                # деноминации одноимённых тикеров, всегда побеждал бы в max()
+                # и вытеснял настоящие сигналы по этой паре.
+                if settings["max_spread_percent"] > 0:
+                    sane = [c for c in dir_candidates if c[2] <= settings["max_spread_percent"]]
+                    if len(sane) != len(dir_candidates):
+                        debug_stats["blocked_by_sanity"] += 1
+                    dir_candidates = sane
+
                 if not dir_candidates:
                     spread_track.pop(pair, None)  # ни одно направление не прошло свой порог — сбрасываем отсчёт
                     continue
@@ -874,7 +1037,10 @@ async def scanner_task():
                         continue  # ещё не набрали нужную длительность
                 debug_stats["passed_stability"] += 1
 
-                base_coin = pair.replace("USDT", "")
+                # Именно срез, а не replace("USDT", ""): replace вырезает ВСЕ
+                # вхождения, и тикер вида USDTBUSDT превратился бы в "B".
+                # endswith("USDT") здесь уже гарантирован отбором пар выше.
+                base_coin = pair[:-4]
                 htx_leg = "withdraw" if buy_ex == "HTX" else "deposit"
                 htx_coin_status = htx_transfer.get(base_coin)
                 htx_known = htx_coin_status is not None
@@ -913,26 +1079,18 @@ async def scanner_task():
                 await asyncio.sleep(settings["check_interval"])
                 continue
 
-            # ===== ФАЗА 2: глубина стакана HTX для ВСЕХ кандидатов ПАРАЛЛЕЛЬНО =====
-            # Раньше это было await внутри цикла — при нескольких одновременных
-            # кандидатах каждый следующий ждал завершения предыдущего запроса.
-            # Теперь все запросы улетают разом, ждём самый медленный.
-            depths = await asyncio.gather(
-                *[get_htx_depth(c["pair"].lower()) for c in candidates],
-                return_exceptions=True,
-            )
-
-            # ===== ФАЗА 3: фильтр мин. оборота + сборка сообщений =====
+            # ===== ФАЗА 2: фильтр мин. оборота + сборка сообщений =====
+            # Сетевых вызовов здесь больше нет: глубина топа стакана по обеим
+            # биржам уже пришла в bulk-ответах (MEXC bookTicker — bidQty/askQty,
+            # HTX tickers — bidSize/askSize). Раньше на этом месте улетало по
+            # отдельному запросу /market/depth на каждого кандидата.
             def _fmt_qty(q):
                 return f"{q:,.4f}".rstrip('0').rstrip('.') if q is not None else "н/д"
 
             messages = []  # [(chat_id_или_channel, текст), ...] — отправим все разом в конце
 
-            for c, depth_result in zip(candidates, depths):
-                if isinstance(depth_result, Exception):
-                    htx_bid_qty, htx_ask_qty = None, None
-                else:
-                    htx_bid_qty, htx_ask_qty = depth_result
+            for c in candidates:
+                htx_bid_qty, htx_ask_qty = c["h"].get("bid_qty"), c["h"].get("ask_qty")
 
                 pair, m, h = c["pair"], c["m"], c["h"]
                 buy_ex, sell_ex = c["buy_ex"], c["sell_ex"]
@@ -953,8 +1111,16 @@ async def scanner_task():
                     tradable_usd = tradable * buy_price
 
                 # ============ ФИЛЬТР МИН. ОБОРОТА (/mt) ============
-                if settings["min_turnover_usd"] > 0 and tradable_usd is not None and tradable_usd < settings["min_turnover_usd"]:
-                    continue
+                # Если фильтр включён, а глубину посчитать не удалось — пара НЕ
+                # проходит. Раньше такие пары проскакивали (условие требовало
+                # tradable_usd is not None), то есть при включённом /mt всё равно
+                # приходили алерты по парам с непроверенным оборотом.
+                if settings["min_turnover_usd"] > 0:
+                    if tradable_usd is None:
+                        debug_stats["blocked_by_unknown_depth"] += 1
+                        continue
+                    if tradable_usd < settings["min_turnover_usd"]:
+                        continue
                 debug_stats["passed_turnover_filter"] += 1
 
                 depth_line = f"📦 Доступно: купить {_fmt_qty(buy_qty)} {base_coin} / продать {_fmt_qty(sell_qty)} {base_coin}"
@@ -1063,6 +1229,7 @@ BOT_COMMANDS = [
     BotCommand(command="debug", description="Диагностика последнего прохода сканера"),
     BotCommand(command="sp", description="Мин. % спреда для алерта"),
     BotCommand(command="spm", description="Порог спреда именно MEXC→HTX"),
+    BotCommand(command="spmax", description="Верхняя отсечка спреда (анти-мусор)"),
     BotCommand(command="v", description="Мин. объём 24ч на обеих биржах"),
     BotCommand(command="mt", description="Мин. сумма для прокрутки по стакану"),
     BotCommand(command="cd", description="Пауза между повторными алертами"),
@@ -1091,20 +1258,29 @@ async def main():
     await site.start()
 
     # Общая сессия на всё время жизни процесса: пул соединений (keep-alive) +
-    # DNS-кэш — реальная экономия задержки на каждом запросе, особенно на
-    # точечных вызовах get_htx_depth, которых за проход может быть несколько.
+    # DNS-кэш — реальная экономия задержки на каждом запросе к тем же хостам.
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     http_session = aiohttp.ClientSession(connector=connector)
 
-    await load_state()  # восстанавливаем settings/blacklist/muted из Upstash, если настроен
+    scanner = None
+    try:
+        await load_state()  # восстанавливаем settings/blacklist/muted из Upstash, если настроен
 
-    # Регистрируем список команд в Telegram — по нажатию "/" в чате сразу
-    # всплывает меню с подсказками, без этого вызова Telegram о командах не знает.
-    await bot.set_my_commands(BOT_COMMANDS)
+        # Регистрируем список команд в Telegram — по нажатию "/" в чате сразу
+        # всплывает меню с подсказками, без этого вызова Telegram о командах не знает.
+        await bot.set_my_commands(BOT_COMMANDS)
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    asyncio.create_task(scanner_task())
-    await dp.start_polling(bot)
+        await bot.delete_webhook(drop_pending_updates=True)
+        scanner = asyncio.create_task(scanner_task())
+        await dp.start_polling(bot)
+    finally:
+        # Render перезапускает процесс регулярно — закрываемся аккуратно, чтобы
+        # не оставлять недописанное состояние и открытые соединения.
+        if scanner is not None:
+            scanner.cancel()
+        await save_state()
+        await http_session.close()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
