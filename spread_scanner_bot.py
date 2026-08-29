@@ -46,6 +46,7 @@ HTX_HEADERS = {
 TIMEOUT_BULK = aiohttp.ClientTimeout(total=15)
 TIMEOUT_HEAVY = aiohttp.ClientTimeout(total=20)
 TIMEOUT_REDIS = aiohttp.ClientTimeout(total=10)
+TIMEOUT_DEPTH = aiohttp.ClientTimeout(total=8)
 
 settings = {
     # ПЕРВИЧНЫЙ критерий: мин. % спреда между MEXC и HTX (в ЛЮБУЮ из двух сторон),
@@ -154,6 +155,10 @@ debug_stats = {
     "blocked_by_sanity": 0,
     # Отсечено фильтром /mt из-за того, что глубину посчитать не удалось
     "blocked_by_unknown_depth": 0,
+    # По скольким парам пришлось дозапрашивать стакан HTX (в норме 0 — размеры
+    # приходят в bulk-ответе; стабильно ненулевое значение = HTX не отдаёт
+    # bidSize/askSize, и точечные запросы вернулись в горячий путь)
+    "depth_fallback": 0,
 }
 
 bot = Bot(token=BOT_TOKEN)
@@ -490,7 +495,9 @@ async def debug_cmd(message: types.Message):
         f"4️⃣ Прошли фильтр стабильности (/ss): {debug_stats['passed_stability']}",
         f"5️⃣ Прошли фильтр перевода (/tr): {debug_stats['passed_transfer_check']} (заблокировано: {debug_stats['blocked_by_transfer']})",
         f"6️⃣ Прошли анти-спам (кулдаун /cd): {debug_stats['passed_cooldown']}",
-        f"7️⃣ Прошли фильтр мин. оборота (/mt): {debug_stats['passed_turnover_filter']} (без данных о глубине: {debug_stats['blocked_by_unknown_depth']})",
+        f"7️⃣ Прошли фильтр мин. оборота (/mt): {debug_stats['passed_turnover_filter']} "
+        f"(отсечено без данных о глубине: {debug_stats['blocked_by_unknown_depth']}, "
+        f"дозапрошен стакан HTX: {debug_stats['depth_fallback']})",
         f"📨 Алертов отправлено за этот проход: {debug_stats['alerts_sent']}",
     ]
 
@@ -840,11 +847,31 @@ async def get_htx_transfer_status():
     return htx_transfer_cache["data"]
 
 
-# ПРИМЕЧАНИЕ: раньше здесь была get_htx_depth() — точечный запрос
-# /market/depth по каждому кандидату ради объёма на лучшей цене. Она удалена:
-# bulk-ответ /market/tickers, который сканер и так тянет каждый проход, уже
-# содержит bidSize/askSize с тем же смыслом (см. fetch_huobi_data). Это убрало
-# из прохода N дополнительных HTTP-запросов, где N — число кандидатов.
+async def get_htx_depth(symbol_lower):
+    """
+    Топ стакана HTX точечным запросом — ФОЛБЭК на случай, когда в bulk-ответе
+    /market/tickers по паре не оказалось bidSize/askSize (пустое поле или ноль).
+    В норме не вызывается вообще: размеры берутся из bulk-ответа, который сканер
+    тянет в любом случае (см. fetch_huobi_data). Раньше этот запрос уходил по
+    КАЖДОМУ кандидату каждый проход — именно его мы убрали из горячего пути.
+    Возвращает (bid_qty, ask_qty) в штуках монеты, либо (None, None) при ошибке.
+    """
+    url = f"https://api.huobi.pro/market/depth?symbol={symbol_lower}&type=step0"
+    try:
+        async with http_session.get(url, headers=HTX_HEADERS, timeout=TIMEOUT_DEPTH) as resp:
+            if resp.status != 200:
+                debug_stats["last_error"] = f"HTX depth {symbol_lower} HTTP {resp.status}"
+                return None, None
+            data = await resp.json()
+        tick = data.get("tick") or {}
+        bids = tick.get("bids") or []
+        asks = tick.get("asks") or []
+        bid_qty = float(bids[0][1]) if bids else None
+        ask_qty = float(asks[0][1]) if asks else None
+        return bid_qty, ask_qty
+    except Exception as e:
+        debug_stats["last_error"] = f"HTX depth {symbol_lower}: {type(e).__name__} {e}"
+        return None, None
 
 
 # ================= UPSTASH (персистентность настроек) =================
@@ -956,6 +983,7 @@ async def scanner_task():
             debug_stats["skipped_htx_transfer"] = 0
             debug_stats["blocked_by_sanity"] = 0
             debug_stats["blocked_by_unknown_depth"] = 0
+            debug_stats["depth_fallback"] = 0
 
             if not mexc_data or not huobi_data:
                 await asyncio.sleep(settings["check_interval"])
@@ -1079,11 +1107,33 @@ async def scanner_task():
                 await asyncio.sleep(settings["check_interval"])
                 continue
 
-            # ===== ФАЗА 2: фильтр мин. оборота + сборка сообщений =====
-            # Сетевых вызовов здесь больше нет: глубина топа стакана по обеим
-            # биржам уже пришла в bulk-ответах (MEXC bookTicker — bidQty/askQty,
-            # HTX tickers — bidSize/askSize). Раньше на этом месте улетало по
-            # отдельному запросу /market/depth на каждого кандидата.
+            # ===== ФАЗА 2: добор глубины HTX ТОЛЬКО там, где её не было =====
+            # В норме размеры топа стакана уже пришли в bulk-ответах (MEXC
+            # bookTicker — bidQty/askQty, HTX tickers — bidSize/askSize), и
+            # сетевых вызовов здесь не происходит вовсе. Но если HTX по какой-то
+            # паре не отдал bidSize/askSize, без добора мы бы либо показали
+            # "н/д", либо (при включённом /mt) молча потеряли живой сигнал —
+            # поэтому по таким пáрам, и только по ним, дозапрашиваем стакан.
+            need_depth = [
+                c for c in candidates
+                if c["h"].get("bid_qty") is None or c["h"].get("ask_qty") is None
+            ]
+            if need_depth:
+                debug_stats["depth_fallback"] = len(need_depth)
+                fetched = await asyncio.gather(
+                    *[get_htx_depth(c["pair"].lower()) for c in need_depth],
+                    return_exceptions=True,
+                )
+                for c, res in zip(need_depth, fetched):
+                    if isinstance(res, Exception):
+                        continue
+                    got_bid, got_ask = res
+                    if c["h"].get("bid_qty") is None:
+                        c["h"]["bid_qty"] = got_bid
+                    if c["h"].get("ask_qty") is None:
+                        c["h"]["ask_qty"] = got_ask
+
+            # ===== ФАЗА 3: фильтр мин. оборота + сборка сообщений =====
             def _fmt_qty(q):
                 return f"{q:,.4f}".rstrip('0').rstrip('.') if q is not None else "н/д"
 
