@@ -43,6 +43,13 @@ HTX_HEADERS = {
 
 # Таймауты объектами ClientTimeout, а не голым числом: число aiohttp 3.x ещё
 # принимает (заворачивает в total=), но в 4.x это уже ошибка.
+# Метка сборки. Нужна, чтобы по одному сообщению бота было видно, какой код
+# реально крутится: без неё старый и новый деплой по алертам почти неотличимы,
+# и «баг» легко перепутать с «Render не передеплоился». RENDER_GIT_COMMIT Render
+# подставляет сам; BUILD_TAG бампаем руками при значимых изменениях логики.
+BUILD_TAG = "2026-09-07 executable-depth"
+BUILD_COMMIT = (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "локально"
+
 TIMEOUT_BULK = aiohttp.ClientTimeout(total=15)
 TIMEOUT_HEAVY = aiohttp.ClientTimeout(total=20)
 TIMEOUT_REDIS = aiohttp.ClientTimeout(total=10)
@@ -98,6 +105,33 @@ settings = {
     "chat_id": None,
     "channel_id": None,
 }
+
+def apply_env_overrides():
+    """Позволяет задать любую настройку переменной окружения BOT_<КЛЮЧ>, напр.
+    BOT_MIN_TURNOVER_USD=250, BOT_SPREAD_PERCENT=1.5, BOT_MIN_VOLUME=100000.
+
+    Зачем: на бесплатном Render процесс перезапускается регулярно, и без Upstash
+    все настройки, выставленные командами, каждый раз откатывались к дефолтам —
+    выглядело это как «я задал /mt 250, а бот его игнорирует». Переменные
+    окружения переживают перезапуск всегда. Приоритет: дефолты → env → Upstash
+    (живое состояние из команд важнее, поэтому оно применяется последним)."""
+    for key, default in list(settings.items()):
+        raw = os.environ.get(f"BOT_{key.upper()}")
+        if raw is None or raw == "":
+            continue
+        try:
+            if isinstance(default, bool):
+                settings[key] = raw.strip().lower() in ("1", "true", "yes", "on", "да")
+            elif isinstance(default, int) and not isinstance(default, bool):
+                settings[key] = int(float(raw.replace(",", ".")))
+            elif isinstance(default, float):
+                settings[key] = float(raw.replace(",", "."))
+            else:
+                settings[key] = raw
+            print(f"env-override: {key} = {settings[key]}", flush=True)
+        except Exception as e:
+            print(f"env-override: не разобрал BOT_{key.upper()}={raw!r}: {e}", flush=True)
+
 
 blacklist = set()
 
@@ -448,8 +482,14 @@ async def status_cmd(message: types.Message):
     turnover_display = "Выкл" if settings["min_turnover_usd"] == 0 else f"{settings['min_turnover_usd']:,.0f}$"
     spm_display = "Выкл (общий /sp)" if settings["spread_percent_mexc_to_htx"] == 0 else f"{settings['spread_percent_mexc_to_htx']}%"
     spmax_display = "Выкл" if settings["max_spread_percent"] == 0 else f"{settings['max_spread_percent']}%"
+    upstash_line = (
+        "<b>Подключён</b>" if UPSTASH_REDIS_REST_URL
+        else "<b>⚠️ НЕ НАСТРОЕН</b> — настройки слетят при перезапуске Render "
+             "(задай их через переменные BOT_*, они переживают рестарт)"
+    )
     await message.answer(
         "📊 <b>Статус</b>\n"
+        f"🏷 Сборка: <code>{BUILD_TAG}</code> · коммит <code>{BUILD_COMMIT}</code>\n"
         f"🔀 Мин. % спреда (общий): <b>{settings['spread_percent']}%</b>\n"
         f"🔀 Мин. % спреда MEXC→HTX: <b>{spm_display}</b>\n"
         f"🔀 Верхняя отсечка спреда: <b>{spmax_display}</b>\n"
@@ -460,7 +500,7 @@ async def status_cmd(message: types.Message):
         f"🚚 Фильтр перевода (только HTX-плечо): <b>{'Вкл' if settings['require_transferable'] else 'Выкл'}</b>\n"
         f"🚫 В чёрном списке: <b>{len(blacklist)} шт.</b>\n"
         f"🔇 В муте сейчас: <b>{len(muted_until)} шт.</b>\n"
-        f"💾 Upstash: <b>{'Подключён' if UPSTASH_REDIS_REST_URL else 'Не настроен'}</b>\n"
+        f"💾 Upstash: {upstash_line}\n"
         f"📢 Канал: {settings['channel_id'] or 'Не задан'}\n"
         f"🔁 Интервал проверки: {settings['check_interval']} сек\n"
         f"🛑 В памяти алертов: {len(alert_memory)}\n"
@@ -484,6 +524,9 @@ async def debug_cmd(message: types.Message):
 
     lines = [
         "🔍 <b>Воронка последнего прохода сканера</b>",
+        f"🏷 Сборка: <code>{BUILD_TAG}</code> · коммит <code>{BUILD_COMMIT}</code>",
+        f"⚙️ Сейчас активно: /mt={settings['min_turnover_usd']:g} /sp={settings['spread_percent']:g} "
+        f"/v={settings['min_volume']:g} /tr={'вкл' if settings['require_transferable'] else 'выкл'}",
         f"⏱ Прошёл: {ago_str}",
         f"📡 MEXC (bid/ask + объём): {mexc_status}",
         f"📡 HTX (bid/ask + объём): {huobi_status}",
@@ -1314,7 +1357,14 @@ async def main():
 
     scanner = None
     try:
+        # Порядок важен: дефолты в коде → переменные окружения (переживают
+        # перезапуск Render) → Upstash (живое состояние, выставленное командами).
+        apply_env_overrides()
         await load_state()  # восстанавливаем settings/blacklist/muted из Upstash, если настроен
+
+        print(f"--- Старт: сборка {BUILD_TAG} ({BUILD_COMMIT}), "
+              f"mt={settings['min_turnover_usd']}, sp={settings['spread_percent']}, "
+              f"upstash={'да' if UPSTASH_REDIS_REST_URL else 'НЕТ'} ---", flush=True)
 
         # Регистрируем список команд в Telegram — по нажатию "/" в чате сразу
         # всплывает меню с подсказками, без этого вызова Telegram о командах не знает.
