@@ -171,6 +171,10 @@ class NetworkMissing(ExchangeError):
     """Нужной сети у монеты на бирже просто нет — не ошибка, а повод пропустить монету."""
 
 
+class ContractMismatch(ExchangeError):
+    """Контракты на HTX и MEXC разные — это две разные монеты с одним тикером."""
+
+
 # ================= ЧИСЛА =================
 
 def D(x):
@@ -393,6 +397,42 @@ async def htx_chains(coin):
     chains = item.get("chains", []) if item else []
     _htx_chains_cache[coin] = (time.time(), chains)
     return chains
+
+
+_htx_ca_cache = {}
+
+
+async def htx_contract(coin, chain):
+    """Адрес контракта монеты в сети на HTX или None, если HTX его не отдал.
+    Основной источник — /v1/settings/common/chains (поле ca), запасной — поля
+    самой сети из /v2/reference/currencies."""
+    key = (coin.lower(), chain.get("chain"))
+    hit = _htx_ca_cache.get(key)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    ca = None
+    try:
+        rows = await htx_req("GET", "/v1/settings/common/chains",
+                             {"currency": coin.lower()}, signed=False)
+        for row in rows or []:
+            if row.get("chain") == chain.get("chain"):
+                ca = row.get("ca") or row.get("contractAddress") or row.get("contract")
+                break
+    except Exception as e:
+        print(f"[arb] HTX chains {coin}: {e}", flush=True)
+    ca = ca or chain.get("contractAddress") or chain.get("contract") or chain.get("ca")
+    ca = str(ca).strip() if ca else None
+    _htx_ca_cache[key] = (time.time(), ca)
+    return ca
+
+
+def norm_contract(x):
+    """Приводит адреса к одному виду: регистр EVM не важен, а у Sui 0x2 == 0x000…02."""
+    x = str(x or "").strip().lower()
+    addr, sep, rest = x.partition("::")
+    if addr.startswith("0x"):
+        addr = "0x" + (addr[2:].lstrip("0") or "0")
+    return addr + sep + rest
 
 
 def htx_chain_fee(chain):
@@ -826,12 +866,22 @@ async def resolve_coin(coin, cfg):
     mx = mx[0]
 
     token = None
+    htx_ca = None
     if coin.upper() != NATIVE_COIN[net]:
         token = (mx.get("contract") or "").strip()
         if not token:
             raise ExchangeError(f"MEXC не отдал контракт {coin} в сети {NET_TITLES[net]}")
-    elif net == "sui":
-        token = SUI_NATIVE_TYPE
+        # Главная защита от «один тикер — две разные монеты»: сверяем контракт.
+        htx_ca = await htx_contract(hc, htx)
+        if htx_ca and norm_contract(htx_ca) != norm_contract(token):
+            raise ContractMismatch(
+                f"контракты разные — это РАЗНЫЕ монеты!\nHTX ({hc}): <code>{htx_ca}</code>\n"
+                f"MEXC ({coin}): <code>{token}</code>")
+        contract_status = "ok" if htx_ca else "unknown"
+    else:
+        contract_status = "native"
+        if net == "sui":
+            token = SUI_NATIVE_TYPE
 
     return {
         "htx_chain": htx.get("chain"),
@@ -842,7 +892,29 @@ async def resolve_coin(coin, cfg):
         "mexc_net": mx,
         "mexc_deposit_ok": bool(mx.get("depositEnable", True)),
         "token": token,
+        "htx_contract": htx_ca,
+        # ok — совпал с HTX; native — нативная монета сети, контракта нет;
+        # unknown — HTX контракт не отдал, нужна ручная сверка (/arb_confirm).
+        "contract_status": contract_status,
     }
+
+
+def contract_confirmed(cfg, res):
+    return res["contract_status"] in ("ok", "native") or \
+        (cfg.get("confirmed_contract") and norm_contract(cfg["confirmed_contract"]) == norm_contract(res["token"]))
+
+
+def contract_line(coin, cfg, res):
+    st = res["contract_status"]
+    if st == "native":
+        return "Контракт: нативная монета сети (контракта нет)"
+    line = f"Контракт MEXC: <code>{res['token']}</code>"
+    if st == "ok":
+        return line + "\n✅ Совпадает с контрактом на HTX"
+    if contract_confirmed(cfg, res):
+        return line + "\n✅ Подтверждён вручную (/arb_confirm)"
+    return (line + "\n⚠️ HTX не отдал контракт — сверь его на странице депозита HTX в этой сети и, "
+            f"если совпадает, подтверди: /arb_confirm {coin}. До этого реальных сделок по монете не будет.")
 
 
 # ================= TELEGRAM: уведомления и спам =================
@@ -1013,6 +1085,10 @@ async def try_start(coin, cfg, opp):
     try:
         res = await resolve_coin(coin, cfg)
         wallet_address(cfg["net"])
+    except ContractMismatch as e:
+        await note_once(f"ca:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {e}\nНе торгую.",
+                        every=6 * 3600)
+        return False
     except NetworkMissing as e:
         await note_once(f"nonet:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {e} — пропускаю.",
                         every=3 * 3600)
@@ -1025,6 +1101,10 @@ async def try_start(coin, cfg, opp):
         return False
     if not res["mexc_deposit_ok"]:
         await note_once(f"dep:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но на MEXC закрыт депозит в этой сети — пропускаю.")
+        return False
+    if not arb["dry_run"] and not contract_confirmed(cfg, res):
+        await note_once(f"unconf:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но контракт не сверен.\n"
+                                          f"{contract_line(coin, cfg, res)}", every=3 * 3600)
         return False
 
     if arb["dry_run"]:
@@ -1041,7 +1121,7 @@ async def try_start(coin, cfg, opp):
             f"Сеть: HTX <code>{res['htx_chain']}</code> → кошелёк "
             f"<code>{wallet_address(cfg['net'])}</code> → MEXC "
             f"<code>{res['mexc_net'].get('netWork') or res['mexc_net'].get('network')}</code>\n"
-            f"Контракт: <code>{res['token'] or 'нативная монета'}</code>\n"
+            f"{contract_line(coin, cfg, res)}\n"
             f"<i>Реальные сделки: /arb_live on</i>"), every=300)
         return False
 
@@ -1497,6 +1577,7 @@ async def cmd_help(message: types.Message):
         "   если бот не нашёл сеть сам: добавь <code>htx=код</code> и/или <code>mexc=имя</code> (см. /arb_chains)\n"
         "   если тикер на HTX другой: <code>htxcoin=ТИКЕР</code>, напр. /arb_add MON 1.5 monad htxcoin=MONAD\n"
         "/arb_del PEPE — убрать монету\n"
+        "/arb_confirm PEPE — подтвердить контракт вручную, если HTX его не отдал\n"
         "/arb_chains PEPE — сети монеты на HTX и MEXC и что выбрал бот\n"
         "/arb_on · /arb_off — включить/выключить автоторговлю\n"
         "/arb_live on · /arb_live off — реальные сделки / тестовый режим\n"
@@ -1560,10 +1641,34 @@ async def cmd_add(message: types.Message, command: CommandObject):
         res = await resolve_coin(coin, cfg)
         text += (f"\nHTX сеть: <code>{res['htx_chain']}</code> (вывод {'открыт' if res['htx_withdraw_ok'] else 'ЗАКРЫТ'} по API)"
                  f"\nMEXC сеть: <code>{res['mexc_net'].get('netWork') or res['mexc_net'].get('network')}</code>"
-                 f"\nКонтракт: <code>{res['token'] or 'нативная монета'}</code>")
+                 f"\n{contract_line(coin, cfg, res)}")
     except Exception as e:
         text += f"\n⚠️ Проверка сетей: {e}"
     await message.answer(text, parse_mode="HTML")
+
+
+@router.message(Command("arb_confirm"))
+async def cmd_confirm(message: types.Message, command: CommandObject):
+    if not await _guard(message):
+        return
+    coin = re.sub(r"[^A-Z0-9]", "", (command.args or "").upper())
+    cfg = arb["coins"].get(coin)
+    if not cfg:
+        await message.answer("Пример: /arb_confirm PEPE (монета должна быть в /arb)")
+        return
+    try:
+        res = await resolve_coin(coin, cfg)
+    except Exception as e:
+        await message.answer(f"❌ {e}", parse_mode="HTML")
+        return
+    if res["contract_status"] != "unknown":
+        await message.answer(contract_line(coin, cfg, res) + "\nРучное подтверждение не нужно.", parse_mode="HTML")
+        return
+    # Запоминаем именно этот адрес: если MEXC когда-нибудь сменит контракт,
+    # подтверждение перестанет действовать само.
+    cfg["confirmed_contract"] = res["token"]
+    await save()
+    await message.answer(f"✅ <b>{coin}</b>: контракт <code>{res['token']}</code> подтверждён.", parse_mode="HTML")
 
 
 @router.message(Command("arb_del"))
@@ -1823,6 +1928,7 @@ BOT_COMMANDS = [
     ("arb_add", "Добавить монету: PEPE 3 bsc [проба$]"),
     ("arb_del", "Убрать монету из автоарбитража"),
     ("arb_chains", "Сети монеты на HTX и MEXC"),
+    ("arb_confirm", "Подтвердить контракт монеты вручную"),
     ("arb_net", "Свои EVM-сети: список / add / del"),
     ("arb_on", "Включить автоарбитраж"),
     ("arb_off", "Выключить автоарбитраж"),
