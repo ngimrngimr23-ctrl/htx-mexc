@@ -779,13 +779,21 @@ async def wallet_send_all(net, token, to):
 
 # ================= СОПОСТАВЛЕНИЕ СЕТЕЙ =================
 
+def hcoin(coin, cfg):
+    """Тикер монеты на HTX. Обычно совпадает с MEXC, но не всегда: Monad на HTX —
+    MONAD, на MEXC — MON (а MON на HTX — вообще другая монета, PixelMon)."""
+    return (cfg.get("htx_coin") or coin).upper()
+
+
 async def resolve_coin(coin, cfg):
     """Находит сеть монеты на обеих биржах и контракт токена.
     Возвращает dict или бросает ExchangeError с понятной причиной."""
     net = cfg["net"]
-    chains = await htx_chains(coin)
+    hc = hcoin(coin, cfg)
+    chains = await htx_chains(hc)
     if not chains:
-        raise NetworkMissing(f"монеты {coin} нет на HTX — проверь тикер (как в паре {coin}/USDT на бирже)")
+        raise NetworkMissing(f"монеты {hc} нет на HTX — проверь тикер (как в паре {hc}/USDT на бирже); "
+                             f"если на HTX тикер другой: /arb_add {coin} {cfg['pct']} {net} htxcoin=ТИКЕР")
     if cfg.get("htx_chain"):
         htx = [c for c in chains if c.get("chain") == cfg["htx_chain"]]
     else:
@@ -793,10 +801,11 @@ async def resolve_coin(coin, cfg):
             net, c.get("baseChain"), c.get("baseChainProtocol"), c.get("displayName"), c.get("chain"))]
     found = ", ".join(c.get("chain", "?") for c in chains) or "нет ни одной"
     if not htx:
-        raise NetworkMissing(f"на HTX у {coin} нет сети {NET_TITLES[net]} (есть: {found})")
+        raise NetworkMissing(f"на HTX у {hc} нет сети {NET_TITLES[net]} (есть: {found}). Если это не та монета, "
+                             f"укажи тикер HTX: /arb_add {coin} {cfg['pct']} {net} htxcoin=ТИКЕР")
     if len(htx) > 1:
         raise ExchangeError(
-            f"HTX: не удалось однозначно найти сеть {NET_TITLES[net]} для {coin} "
+            f"HTX: не удалось однозначно найти сеть {NET_TITLES[net]} для {hc} "
             f"(сети на HTX: {found}). Укажи вручную: /arb_add {coin} {cfg['pct']} {net} htx=<код>")
     htx = htx[0]
 
@@ -935,7 +944,7 @@ async def load():
 async def check_opportunity(coin, cfg):
     """Спред HTX→MEXC по лучшим ценам. None, если ниже минимума."""
     sym = f"{coin}USDT"
-    (mbids, _), (_, hasks) = await asyncio.gather(mexc_depth(sym), htx_depth(sym))
+    (mbids, _), (_, hasks) = await asyncio.gather(mexc_depth(sym), htx_depth(f"{hcoin(coin, cfg)}USDT"))
     if not mbids or not hasks:
         return None
     mexc_bid = mbids[0][0]
@@ -1075,7 +1084,7 @@ async def run_deal():
 
 async def stage_buy(d):
     coin, cfg = d["coin"], d["cfg"]
-    sym = f"{coin}USDT"
+    sym = f"{hcoin(coin, cfg)}USDT"
     budget, _ = await htx_balance("usdt")
     if d["phase"] == "probe":
         budget = min(budget, D(cfg["probe"]))
@@ -1122,13 +1131,13 @@ async def stage_withdraw(d):
     if d["wallet_baseline"] is None:
         d["wallet_baseline"] = await wallet_balance(cfg["net"], res["token"])
 
-    free, _ = await htx_balance(coin)
+    free, _ = await htx_balance(hcoin(coin, cfg))
     amount = round_down(free - res["htx_fee"], res["htx_withdraw_step"])
     if amount <= 0 or amount < res["htx_min_withdraw"]:
         await start_rescue(d, f"сумма к выводу {fmt(amount)} меньше минимума HTX {fmt(res['htx_min_withdraw'])}")
         return
     try:
-        wid = await htx_withdraw(wallet_address(cfg["net"]), coin, amount, res["htx_chain"], res["htx_fee"])
+        wid = await htx_withdraw(wallet_address(cfg["net"]), hcoin(coin, cfg), amount, res["htx_chain"], res["htx_fee"])
     except ExchangeError as e:
         await start_rescue(d, f"HTX отклонил заявку на вывод: {e}")
         return
@@ -1143,7 +1152,7 @@ async def stage_withdraw_check(d):
     wait = d["withdraw_at"] + arb["check_sec"] - time.time()
     if wait > 0:
         await asyncio.sleep(wait)
-    free, frozen = await htx_balance(coin)
+    free, frozen = await htx_balance(hcoin(coin, d["cfg"]))
     cur_withdraw = D(d["cur_withdraw"])
     avg = D(d["cur_cost"]) / D(d["cur_qty"])
     if free >= cur_withdraw * D("0.05") and free * avg >= 1:
@@ -1167,7 +1176,7 @@ async def start_rescue(d, reason):
     либо завершается (если это была проба/единственная покупка), либо едет
     дальше только с тем, что уже успешно выведено."""
     r = {
-        "id": uuid.uuid4().hex[:8], "coin": d["coin"],
+        "id": uuid.uuid4().hex[:8], "coin": hcoin(d["coin"], d["cfg"]),
         "breakeven": str(D(d["cur_cost"]) / D(d["cur_qty"])),
         "reason": reason, "order_id": None, "created": time.time(),
     }
@@ -1427,6 +1436,8 @@ def _coins_text():
             manual.append(f"htx={c['htx_chain']}")
         if c.get("mexc_net"):
             manual.append(f"mexc={c['mexc_net']}")
+        if c.get("htx_coin"):
+            manual.append(f"на HTX тикер {c['htx_coin']}")
         rows.append(f"• <b>{coin}</b> — от {c['pct']}%, {NET_TITLES[c['net']]}{extra}"
                     + (f" ({' '.join(manual)})" if manual else ""))
     return "\n".join(rows)
@@ -1484,6 +1495,7 @@ async def cmd_help(message: types.Message):
         "/arb_add PEPE 3 bsc 150 — то же, но сперва проба на 150$, после успешного вывода — весь баланс\n"
         f"   сети: {nets_list_text()} (свои EVM-сети — /arb_net)\n"
         "   если бот не нашёл сеть сам: добавь <code>htx=код</code> и/или <code>mexc=имя</code> (см. /arb_chains)\n"
+        "   если тикер на HTX другой: <code>htxcoin=ТИКЕР</code>, напр. /arb_add MON 1.5 monad htxcoin=MONAD\n"
         "/arb_del PEPE — убрать монету\n"
         "/arb_chains PEPE — сети монеты на HTX и MEXC и что выбрал бот\n"
         "/arb_on · /arb_off — включить/выключить автоторговлю\n"
@@ -1528,7 +1540,9 @@ async def cmd_add(message: types.Message, command: CommandObject):
             raise ValueError
         cfg = {"pct": pct, "net": net, "probe": 0, "htx_chain": None, "mexc_net": None}
         for a in args[3:]:
-            if a.lower().startswith("htx="):
+            if a.lower().startswith("htxcoin="):
+                cfg["htx_coin"] = re.sub(r"[^A-Z0-9]", "", a[8:].upper()) or None
+            elif a.lower().startswith("htx="):
                 cfg["htx_chain"] = a[4:]
             elif a.lower().startswith("mexc="):
                 cfg["mexc_net"] = a[5:]
@@ -1570,14 +1584,16 @@ async def cmd_del(message: types.Message, command: CommandObject):
 async def cmd_chains(message: types.Message, command: CommandObject):
     if not await _guard(message):
         return
-    coin = re.sub(r"[^A-Z0-9]", "", (command.args or "").upper())
+    parts = [re.sub(r"[^A-Z0-9]", "", p) for p in (command.args or "").upper().split()]
+    coin = parts[0] if parts else ""
     if not coin:
-        await message.answer("Пример: /arb_chains PEPE")
+        await message.answer("Пример: /arb_chains PEPE  ·  если на HTX тикер другой: /arb_chains MON MONAD")
         return
-    lines = [f"🔗 <b>{coin}</b>"]
+    htx_ticker = parts[1] if len(parts) > 1 else hcoin(coin, arb["coins"].get(coin, {}))
+    lines = [f"🔗 <b>{coin}</b>" + (f" (на HTX: {htx_ticker})" if htx_ticker != coin else "")]
     try:
         lines.append("<b>HTX:</b>")
-        for c in await htx_chains(coin):
+        for c in await htx_chains(htx_ticker):
             lines.append(f"• <code>{c.get('chain')}</code> {c.get('displayName') or ''} "
                          f"[{c.get('baseChain') or ''} {c.get('baseChainProtocol') or ''}] "
                          f"вывод: {c.get('withdrawStatus')}, комиссия ~{fmt(htx_chain_fee(c))}, "
