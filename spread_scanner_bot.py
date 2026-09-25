@@ -1186,16 +1186,33 @@ async def load_state():
 
 # ================= ОСНОВНОЙ ЦИКЛ =================
 
+def _open_sides(c):
+    """Когда сети бирж сопоставить не удалось: какие сети открыты на вывод на
+    бирже покупки и на депозит на бирже продажи (по отдельности)."""
+    htx_chains = (c.get("htx_coin_status") or {}).get("chains", [])
+    mexc_nets = c.get("mexc_nets") or []
+    if c["buy_ex"] == "HTX":
+        src = [(ch.get("names", [None])[0] or ch.get("chain"), ch.get("fee")) for ch in htx_chains if ch.get("withdraw")]
+        dst = [n.get("network") for n in mexc_nets if n.get("deposit_enable")]
+    else:
+        src = [(n.get("network"), n.get("withdraw_fee")) for n in mexc_nets if n.get("withdraw_enable")]
+        dst = [ch.get("names", [None])[0] or ch.get("chain") for ch in htx_chains if ch.get("deposit")]
+    return src, dst
+
+
 def _withdraw_fee_usd(c):
-    """Комиссия вывода в $ для кандидата: по выбранной общей сети, а если сети
-    сопоставить не удалось — по самой дешёвой открытой сети HTX. None = неизвестна."""
+    """Комиссия вывода в $ для кандидата. По выбранной общей сети; если сеть
+    определить не удалось — по открытым сетям биржи покупки: одна сеть — её
+    комиссия, несколько — САМАЯ ДОРОГАЯ (чтобы чистый спред не был завышен).
+    None — комиссия неизвестна."""
     route, price = c["route"], c["buy_price"]
     best = route.get("best")
     if route["state"] == "open" and best and best.get("fee") is not None:
         return best["fee"] * price
-    hs = c.get("htx_coin_status")
-    if c["buy_ex"] == "HTX" and route["state"] in ("nodata", "nomatch") and hs and hs.get("fee") is not None:
-        return hs["fee"] * price
+    if route["state"] in ("nomatch", "nodata"):
+        fees = [f for _, f in _open_sides(c)[0] if f is not None]
+        if fees:
+            return max(fees) * price
     return None
 
 
@@ -1364,8 +1381,13 @@ async def scanner_task():
                     htx_ok = htx_coin_status.get(htx_leg, False) if htx_coin_status else True
                     transfer_blocked = htx_coin_status is not None and not htx_ok
                 elif route["state"] == "nomatch":
+                    # Сети сопоставить не удалось (ни по названию, ни по контракту).
+                    # Не режем, но если вывод на бирже покупки или депозит на бирже
+                    # продажи закрыт во ВСЕХ сетях — перевести точно нельзя.
                     debug_stats["route_unmatched"] += 1
-                    transfer_blocked = False  # не смогли сопоставить названия — не режем, но пометим
+                    src, dst = _open_sides({"buy_ex": buy_ex, "htx_coin_status": htx_coin_status,
+                                            "mexc_nets": mexc_contracts.get(base_coin, [])})
+                    transfer_blocked = not src or not dst
                 else:
                     transfer_blocked = route["state"] == "closed"
 
@@ -1386,6 +1408,7 @@ async def scanner_task():
                     "buy_price": buy_price, "sell_price": sell_price, "threshold": threshold,
                     "base_coin": base_coin, "htx_coin_status": htx_coin_status,
                     "hpair": hpair, "htx_base": htx_base,
+                    "mexc_nets": mexc_contracts.get(base_coin, []),
                     "route": route, "prev": prev,
                 })
 
@@ -1500,7 +1523,15 @@ async def scanner_task():
                 elif route["state"] == "closed":
                     transfer_lines.append(f"🚚 ❌ Нет общей сети, где открыт вывод {from_ex} и депозит {to_ex}")
                 elif route["state"] == "nomatch":
-                    transfer_lines.append("🚚 ⚠️ Сети бирж не удалось сопоставить по названиям — проверь вручную")
+                    src, dst = _open_sides(c)
+                    transfer_lines.append(
+                        f"🚚 ⚠️ Не удалось определить общую сеть — проверь вручную. "
+                        f"Вывод {from_ex} открыт: {', '.join(str(n) for n, _ in src[:3])}; "
+                        f"депозит {to_ex} открыт: {', '.join(str(n) for n in dst[:3])}")
+                    if withdraw_fee_usd is not None:
+                        how = "единственной открытой сети" if len([f for _, f in src if f is not None]) == 1 \
+                            else "самой дорогой из открытых сетей — сеть не определена"
+                        transfer_lines.append(f"💸 Комиссия вывода с {from_ex}: ~{fmt_money(withdraw_fee_usd)}$ (по {how})")
                 else:
                     hs = c["htx_coin_status"]
                     leg = "вывод" if buy_ex == "HTX" else "ввод"
