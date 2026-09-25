@@ -12,6 +12,8 @@ import hmac
 import hashlib
 import urllib.parse
 
+import arbitrage
+
 # ================= НАСТРОЙКИ =================
 # ВАЖНО: токен ТОЛЬКО из переменной окружения. Никогда не хардкодь его в файле,
 # иначе при пуше на GitHub он утечёт даже из приватного репозитория. На Render:
@@ -47,7 +49,7 @@ HTX_HEADERS = {
 # реально крутится: без неё старый и новый деплой по алертам почти неотличимы,
 # и «баг» легко перепутать с «Render не передеплоился». RENDER_GIT_COMMIT Render
 # подставляет сам; BUILD_TAG бампаем руками при значимых изменениях логики.
-BUILD_TAG = "2026-09-07 executable-depth"
+BUILD_TAG = "2026-09-25 auto-arbitrage"
 BUILD_COMMIT = (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "локально"
 
 TIMEOUT_BULK = aiohttp.ClientTimeout(total=15)
@@ -197,6 +199,7 @@ debug_stats = {
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+dp.include_router(arbitrage.router)
 
 # Одна общая HTTP-сессия на всё время жизни бота вместо создания новой сессии
 # (= новый TCP+TLS handshake) на КАЖДЫЙ запрос. Инициализируется в main() —
@@ -277,7 +280,8 @@ async def start_cmd(message: types.Message):
         f"/channel @имя_канала — куда дублировать сигналы (пусто = выкл)\n"
         f"   └ сейчас: <b>{settings['channel_id'] or 'Не задан'}</b>\n"
         f"/s — текущий статус настроек\n"
-        f"/debug — воронка последнего прохода сканера (диагностика, если алертов нет)\n\n"
+        f"/debug — воронка последнего прохода сканера (диагностика, если алертов нет)\n"
+        f"/arb — автоарбитраж HTX → кошелёк → MEXC (помощь: /arb_help)\n\n"
 
         f"💾 <b>Upstash</b>: {'подключён — настройки/ЧС/муты переживут перезапуск' if UPSTASH_REDIS_REST_URL else 'не настроен — состояние в памяти, слетит при перезапуске'}\n\n"
 
@@ -949,7 +953,7 @@ _background_tasks = set()
 
 def schedule_save():
     """Fire-and-forget сохранение состояния, но со ссылкой на задачу."""
-    task = schedule_save()
+    task = asyncio.create_task(save_state())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
@@ -1333,7 +1337,7 @@ BOT_COMMANDS = [
     BotCommand(command="mute", description="Временно замьютить монету"),
     BotCommand(command="unmute", description="Снять мут с монеты"),
     BotCommand(command="channel", description="Куда дублировать сигналы"),
-]
+] + [BotCommand(command=c, description=d) for c, d in arbitrage.BOT_COMMANDS]
 
 
 async def handle_ping(request):
@@ -1356,6 +1360,19 @@ async def main():
     http_session = aiohttp.ClientSession(connector=connector)
 
     scanner = None
+    arb_tasks = []
+
+    def _set_chat(chat_id):
+        settings["chat_id"] = chat_id
+        schedule_save()
+
+    arbitrage.setup(
+        bot,
+        session_getter=lambda: http_session,
+        redis_cmd=redis_cmd if UPSTASH_REDIS_REST_URL else None,
+        chat_get=lambda: settings["chat_id"],
+        chat_set=_set_chat,
+    )
     try:
         # Порядок важен: дефолты в коде → переменные окружения (переживают
         # перезапуск Render) → Upstash (живое состояние, выставленное командами).
@@ -1372,13 +1389,17 @@ async def main():
 
         await bot.delete_webhook(drop_pending_updates=True)
         scanner = asyncio.create_task(scanner_task())
+        arb_tasks = await arbitrage.start()
         await dp.start_polling(bot)
     finally:
         # Render перезапускает процесс регулярно — закрываемся аккуратно, чтобы
         # не оставлять недописанное состояние и открытые соединения.
         if scanner is not None:
             scanner.cancel()
+        for t in arb_tasks:
+            t.cancel()
         await save_state()
+        await arbitrage.save()
         await http_session.close()
         await runner.cleanup()
 
