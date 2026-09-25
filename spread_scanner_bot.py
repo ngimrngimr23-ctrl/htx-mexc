@@ -13,6 +13,7 @@ import hashlib
 import urllib.parse
 
 import arbitrage
+import scanner_quality as sq
 
 # ================= НАСТРОЙКИ =================
 # ВАЖНО: токен ТОЛЬКО из переменной окружения. Никогда не хардкодь его в файле,
@@ -49,7 +50,7 @@ HTX_HEADERS = {
 # реально крутится: без неё старый и новый деплой по алертам почти неотличимы,
 # и «баг» легко перепутать с «Render не передеплоился». RENDER_GIT_COMMIT Render
 # подставляет сам; BUILD_TAG бампаем руками при значимых изменениях логики.
-BUILD_TAG = "2026-09-26 net-spread"
+BUILD_TAG = "2026-09-26 depth-routes"
 BUILD_COMMIT = (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "локально"
 
 TIMEOUT_BULK = aiohttp.ClientTimeout(total=15)
@@ -112,6 +113,10 @@ settings = {
     # помечается как "не проверяется", её нужно смотреть на бирже вручную.
     "require_transferable": True,
 
+    # Не слать сигналы, если контракты монеты на HTX и MEXC РАЗНЫЕ — значит, это
+    # разные монеты с одним тикером (/ca). Где контракт не отдан — не режем.
+    "check_contracts": True,
+
     "chat_id": None,
     "channel_id": None,
 }
@@ -161,6 +166,9 @@ spread_track = {}
 htx_transfer_cache = {"ts": 0.0, "data": {}}
 HTX_TRANSFER_TTL = 600  # 10 минут
 
+# Сколько кандидатов за проход догружаем стаканами (по 2 запроса на кандидата).
+MAX_DEPTH_CANDIDATES = 25
+
 mexc_contracts_cache = {"ts": 0.0, "data": {}}
 MEXC_CONTRACTS_TTL = 6 * 3600  # 6 часов — сети/контракты почти никогда не меняются
 
@@ -203,6 +211,10 @@ debug_stats = {
     # приходят в bulk-ответе; стабильно ненулевое значение = HTX не отдаёт
     # bidSize/askSize, и точечные запросы вернулись в горячий путь)
     "depth_fallback": 0,
+    "blocked_by_contract": 0,
+    "route_unmatched": 0,
+    # Что HTX реально отдал по сетям (заполняет get_htx_transfer_status)
+    "htx_data": {},
 }
 
 bot = Bot(token=BOT_TOKEN)
@@ -299,8 +311,10 @@ async def start_cmd(message: types.Message):
         f"/dir — вкл/выкл сигналы MEXC→HTX (HTX→MEXC есть всегда)\n"
         f"   └ сейчас: <b>{'оба направления' if settings['scan_mexc_to_htx'] else 'только HTX→MEXC'}</b>\n"
         f"/fee 0.2 0.05 — торговые комиссии HTX и MEXC (%) для чистого спреда\n"
-        f"/tr — вкл/выкл фильтр по доступности вывода/ввода (см. ⚠️ ниже про ограничение)\n"
+        f"/tr — вкл/выкл фильтр «есть общая открытая сеть для перевода»\n"
         f"   └ сейчас: <b>{'Вкл' if settings['require_transferable'] else 'Выкл'}</b>\n"
+        f"/ca — вкл/выкл отсев монет с разными контрактами на HTX и MEXC\n"
+        f"   └ сейчас: <b>{'Вкл' if settings['check_contracts'] else 'Выкл'}</b>\n"
         f"/b BTC — добавить/убрать монету из чёрного списка (повторный вызов с той же монетой снимает её)\n"
         f"   └ в ЧС сейчас: <b>{len(blacklist)} шт.</b>\n"
         f"/bl — показать список монет в ЧС (проверить, что реально добавилось)\n"
@@ -319,12 +333,10 @@ async def start_cmd(message: types.Message):
         "Это спред между ценами В МОМЕНТ ЗАПРОСА, без учёта комиссий за сделки "
         "(обычно ~0.1-0.2% на каждой бирже) и БЕЗ учёта времени перевода монеты "
         "между биржами.\n\n"
-        "🚚 <b>Фильтр перевода (/tr)</b>: бот проверяет статус ввода/вывода "
-        "монеты ТОЛЬКО на HTX (публичные данные, без ключа). Статус MEXC "
-        "недоступен без приватного API-ключа — эта сторона в каждом алерте "
-        "помечена как «не проверяется», проверяй её на бирже вручную перед "
-        "сделкой. Если фильтр выключен — алерты идут вообще без проверки "
-        "переводимости ни по одной из бирж.",
+        "🚚 <b>Фильтр перевода (/tr)</b>: сигнал проходит, только если есть "
+        "ОДНА сеть, где на бирже покупки открыт вывод, а на бирже продажи — "
+        "депозит (сторона MEXC — по ключу MEXC_API_KEY). Статусы HTX — со слов "
+        "HTX, они бывают неточны. Сколько данных HTX реально отдаёт — в /debug.",
         parse_mode="HTML")
 
 
@@ -476,6 +488,15 @@ async def set_fees(message: types.Message, command: CommandObject):
     schedule_save()
 
 
+@dp.message(Command("ca"))
+async def toggle_contract_check(message: types.Message):
+    settings["check_contracts"] = not settings["check_contracts"]
+    await message.answer(
+        f"✅ Отсев монет с РАЗНЫМИ контрактами на HTX и MEXC: "
+        f"<b>{'ВКЛЮЧЁН' if settings['check_contracts'] else 'ВЫКЛЮЧЕН'}</b>", parse_mode="HTML")
+    schedule_save()
+
+
 @dp.message(Command("tr"))
 async def toggle_transfer_filter(message: types.Message):
     settings["chat_id"] = message.chat.id
@@ -483,8 +504,9 @@ async def toggle_transfer_filter(message: types.Message):
     state = "ВКЛЮЧЕН" if settings["require_transferable"] else "ВЫКЛЮЧЕН"
     await message.answer(
         f"✅ Фильтр по доступности перевода: <b>{state}</b>\n"
-        f"<i>Напоминание: реально проверяется только сторона HTX (публичный статус). "
-        f"MEXC не проверяется — нет API-ключа, эта сторона в алерте всегда помечена как непроверенная.</i>",
+        f"<i>Сигнал проходит, только если есть одна сеть, где открыт вывод на бирже покупки и "
+        f"депозит на бирже продажи. Сторона MEXC проверяется при заданном MEXC_API_KEY, "
+        f"статусы HTX — со слов HTX (бывают неточны).</i>",
         parse_mode="HTML")
     schedule_save()
 
@@ -608,13 +630,31 @@ async def debug_cmd(message: types.Message):
         f"2️⃣ Прошли мин. объём 24ч на обеих биржах (/v): {debug_stats['passed_volume_floor']}",
         f"3️⃣ Прошли порог спреда (/sp): {debug_stats['passed_spread_filter']} (отсечено сверху /spmax: {debug_stats['blocked_by_sanity']})",
         f"4️⃣ Прошли фильтр стабильности (/ss): {debug_stats['passed_stability']}",
-        f"5️⃣ Прошли фильтр перевода (/tr): {debug_stats['passed_transfer_check']} (заблокировано: {debug_stats['blocked_by_transfer']})",
+        f"5️⃣ Прошли сверку контракта и общую сеть (/tr): {debug_stats['passed_transfer_check']} "
+        f"(разные контракты: {debug_stats['blocked_by_contract']}, нет открытой общей сети: {debug_stats['blocked_by_transfer']}, "
+        f"сети не сопоставились: {debug_stats['route_unmatched']})",
         f"6️⃣ Прошли анти-спам (кулдаун /cd): {debug_stats['passed_cooldown']}",
-        f"7️⃣ Прошли фильтр мин. оборота (/mt): {debug_stats['passed_turnover_filter']} "
-        f"(отсечено без данных о глубине: {debug_stats['blocked_by_unknown_depth']}, "
-        f"дозапрошен стакан HTX: {debug_stats['depth_fallback']})",
+        f"7️⃣ Прошли фильтр мин. оборота по стакану (/mt): {debug_stats['passed_turnover_filter']} "
+        f"(без данных о стакане: {debug_stats['blocked_by_unknown_depth']}, "
+        f"стакан не загрузился: {debug_stats['depth_fallback']})",
         f"📨 Алертов отправлено за этот проход: {debug_stats['alerts_sent']}",
     ]
+
+    hd = debug_stats.get("htx_data") or {}
+    if hd:
+        ch = hd.get("chains") or 0
+        pct = lambda n: f"{n} из {ch} ({n / ch * 100:.0f}%)" if ch else str(n)
+        lines += [
+            "",
+            f"📑 <b>Что HTX отдаёт по сетям</b> ({hd.get('coins', 0)} монет, {ch} сетей):",
+            f"   комиссия вывода: основной источник {pct(hd.get('v2_fee', 0))}, "
+            f"второй источник добавил ещё {hd.get('v1_fee', 0)}",
+            f"   контракт: {pct(hd.get('ca', 0))}",
+            f"   второй источник (/v1/settings/common/chains): "
+            + ("✅ отвечает" if hd.get("v1_ok") else f"❌ {hd.get('v1_err', 'не отвечает')}"),
+        ]
+        if hd.get("v1_keys"):
+            lines.append(f"   его поля: <code>{hd['v1_keys']}</code>")
 
     skipped_total = (debug_stats["skipped_mexc"] + debug_stats["skipped_htx"]
                      + debug_stats["skipped_htx_transfer"])
@@ -817,12 +857,10 @@ def _mexc_signed_query(extra_params=None):
 
 async def get_mexc_contracts():
     """
-    Реальные контракты/сети монет с MEXC через ПОДПИСЫВАЕМЫЙ эндпоинт
-    /api/v3/capital/config/getall (Binance-style HMAC-SHA256, требует
-    MEXC_API_KEY + MEXC_API_SECRET в переменных окружения; ключ — только Read).
-    Если переменные не заданы — просто ничего не возвращает, остальной бот
-    работает как и раньше, без проверки контрактов.
-    Кэшируется надолго — список сетей/контрактов почти никогда не меняется.
+    Сети монет на MEXC через ПОДПИСЫВАЕМЫЙ /api/v3/capital/config/getall
+    (нужны MEXC_API_KEY + MEXC_API_SECRET). По каждой сети: названия, контракт,
+    комиссия вывода и — главное для фильтра переводимости — открыт ли депозит и
+    вывод именно в этой сети. Кэш на MEXC_CONTRACTS_TTL.
     """
     now = time.time()
     if mexc_contracts_cache["data"] and (now - mexc_contracts_cache["ts"]) < MEXC_CONTRACTS_TTL:
@@ -850,7 +888,6 @@ async def get_mexc_contracts():
             coin = str(item.get("coin", "")).upper()
             networks = []
             for net in item.get("networkList", []):
-                addr = net.get("contract") or net.get("contractAddress")
                 fee_raw = net.get("withdrawFee")
                 fee = None
                 if fee_raw not in (None, ""):
@@ -858,13 +895,14 @@ async def get_mexc_contracts():
                         fee = float(fee_raw)
                     except (TypeError, ValueError):
                         fee = None
-                if addr or fee is not None:
-                    networks.append({
-                        "network": net.get("network") or net.get("netWork") or "?",
-                        "contract": addr,
-                        "withdraw_fee": fee,
-                        "withdraw_enable": net.get("withdrawEnable", True),
-                    })
+                networks.append({
+                    "network": net.get("network") or net.get("netWork") or "?",
+                    "names": [net.get("network"), net.get("netWork"), net.get("name")],
+                    "contract": net.get("contract") or net.get("contractAddress"),
+                    "withdraw_fee": fee,
+                    "withdraw_enable": bool(net.get("withdrawEnable", False)),
+                    "deposit_enable": bool(net.get("depositEnable", False)),
+                })
             if networks:
                 result[coin] = networks
         except Exception:
@@ -883,14 +921,7 @@ async def get_mexc_contracts():
 def _extract_withdraw_fee(chain):
     """Возвращает (сумма_комиссии, тип) для одной сети HTX, или (None, None), если
     определить не удалось. fixed — фиксированная сумма; circulated/ratio — берём
-    минимальную границу комиссии (minTransactFeeWithdraw).
-
-    ВАЖНО (был баг): у этой функции пропала строка `def`, и её тело оказалось
-    недостижимым куском внутри get_mexc_contracts (сразу после return). Из-за
-    этого вызов ниже падал с NameError, который гасился голым `except Exception:
-    continue` — в кэш статусов перевода попадали ТОЛЬКО монеты с закрытым
-    выводом на всех сетях, а по всем остальным статус считался «неизвестен», и
-    фильтр /tr фактически не блокировал ничего."""
+    минимальную границу комиссии (minTransactFeeWithdraw)."""
     fee_type = chain.get("withdrawFeeType")
     try:
         if fee_type == "fixed":
@@ -902,50 +933,99 @@ def _extract_withdraw_fee(chain):
     return None, None
 
 
+def _v1_fee(row):
+    """Комиссия вывода из второго источника HTX (/v1/settings/common/chains):
+    ft — тип, fn — фиксированная сумма. None, если данных нет."""
+    try:
+        if str(row.get("ft", "")).lower() in ("fixed", "fix") and row.get("fn") not in (None, ""):
+            return float(row["fn"]), "фикс"
+        if row.get("fn") not in (None, "") and float(row["fn"]) > 0:
+            return float(row["fn"]), "фикс"
+    except (TypeError, ValueError):
+        pass
+    return None, None
+
+
+async def _htx_json(url):
+    async with http_session.get(url, headers=HTX_HEADERS, timeout=TIMEOUT_HEAVY) as resp:
+        if resp.status != 200:
+            body = await resp.text()
+            raise RuntimeError(f"HTTP {resp.status}: {body[:150]}")
+        return await resp.json()
+
+
 async def get_htx_transfer_status():
     """
-    Статус ввода/вывода и комиссия за вывод по каждой монете на HTX. ПУБЛИЧНЫЙ
-    эндпоинт, ключ не нужен. Агрегируем по всем сетям (chains) монеты: если хотя
-    бы одна сеть открыта — считаем ввод/вывод доступным, а комиссию берём по
-    САМОЙ ДЕШЁВОЙ из открытых для вывода сетей (для арбитража не важно через
-    какую именно сеть, важно с какой минимальной комиссией). Кэшируется на
-    HTX_TRANSFER_TTL — эти данные почти не меняются в течение дня.
+    Статусы ввода/вывода, комиссии и контракты монет на HTX ПО КАЖДОЙ СЕТИ.
+    Два публичных источника, склеиваются по (монета, сеть):
+      1) /v2/reference/currencies — статусы ввода/вывода и комиссии;
+      2) /v1/settings/common/chains — контракт (ca) и запасные комиссия/статусы.
+    HTX известен тем, что отдаёт это неполно, поэтому в debug_stats считаем,
+    по скольким сетям данные реально пришли (/debug), а в алерте честно пишем,
+    чего нет. Кэш на HTX_TRANSFER_TTL.
     """
     now = time.time()
     if htx_transfer_cache["data"] and (now - htx_transfer_cache["ts"]) < HTX_TRANSFER_TTL:
         return htx_transfer_cache["data"]
 
-    result = {}
-    try:
-        async with http_session.get("https://api.huobi.pro/v2/reference/currencies", headers=HTX_HEADERS, timeout=TIMEOUT_HEAVY) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                debug_stats["last_error"] = f"HTX currencies HTTP {resp.status}: {body[:150]}"
-                return htx_transfer_cache["data"]  # отдаём старый кэш, если был, лучше чем ничего
-            payload = await resp.json()
-    except Exception as e:
-        debug_stats["last_error"] = f"HTX currencies запрос: {e}"
+    v2, v1 = await asyncio.gather(
+        _htx_json("https://api.huobi.pro/v2/reference/currencies"),
+        _htx_json("https://api.huobi.pro/v1/settings/common/chains"),
+        return_exceptions=True,
+    )
+    if isinstance(v2, Exception):
+        debug_stats["last_error"] = f"HTX currencies: {v2}"
         return htx_transfer_cache["data"]
 
-    for item in payload.get("data", []):
+    v1_rows = {}
+    stats = {"coins": 0, "chains": 0, "v2_fee": 0, "v1_fee": 0, "ca": 0,
+             "v1_ok": not isinstance(v1, Exception), "v1_keys": ""}
+    if not isinstance(v1, Exception):
+        rows = v1.get("data") or []
+        for row in rows:
+            v1_rows[(str(row.get("currency", "")).lower(), row.get("chain"))] = row
+        if rows:
+            stats["v1_keys"] = ", ".join(sorted(rows[0].keys()))[:300]
+    else:
+        stats["v1_err"] = str(v1)[:150]
+
+    result = {}
+    for item in v2.get("data", []):
         try:
             coin = item.get("currency", "").upper()
-            chains = item.get("chains", [])
-            deposit_ok = any(ch.get("depositStatus") == "allowed" for ch in chains)
-            withdraw_ok = any(ch.get("withdrawStatus") == "allowed" for ch in chains)
-
-            best_fee, best_fee_type, best_chain = None, None, None
-            for ch in chains:
-                if ch.get("withdrawStatus") != "allowed":
-                    continue
+            chains = []
+            for ch in item.get("chains", []):
+                row = v1_rows.get((coin.lower(), ch.get("chain")), {})
                 fee, ftype = _extract_withdraw_fee(ch)
-                if fee is not None and (best_fee is None or fee < best_fee):
-                    best_fee, best_fee_type = fee, ftype
-                    best_chain = ch.get("displayName") or ch.get("chain")
+                if fee is not None:
+                    stats["v2_fee"] += 1
+                else:
+                    fee, ftype = _v1_fee(row)
+                    if fee is not None:
+                        stats["v1_fee"] += 1
+                ca = row.get("ca") or row.get("contractAddress") or ch.get("contractAddress")
+                if ca:
+                    stats["ca"] += 1
+                chains.append({
+                    "chain": ch.get("chain"),
+                    "names": [ch.get("displayName"), ch.get("baseChain"),
+                              ch.get("baseChainProtocol"), ch.get("chain")],
+                    "withdraw": ch.get("withdrawStatus") == "allowed",
+                    "deposit": ch.get("depositStatus") == "allowed",
+                    "fee": fee, "fee_type": ftype, "ca": ca,
+                })
+            stats["coins"] += 1
+            stats["chains"] += len(chains)
 
+            open_w = [c for c in chains if c["withdraw"] and c["fee"] is not None]
+            best = min(open_w, key=lambda c: c["fee"]) if open_w else None
             result[coin] = {
-                "deposit": deposit_ok, "withdraw": withdraw_ok,
-                "fee": best_fee, "fee_type": best_fee_type, "fee_chain": best_chain,
+                "deposit": any(c["deposit"] for c in chains),
+                "withdraw": any(c["withdraw"] for c in chains),
+                "fee": best["fee"] if best else None,
+                "fee_type": best["fee_type"] if best else None,
+                "fee_chain": (best["names"][0] or best["chain"]) if best else None,
+                "chains": chains,
             }
         except Exception as e:
             debug_stats["skipped_htx_transfer"] += 1
@@ -956,37 +1036,44 @@ async def get_htx_transfer_status():
         htx_transfer_cache["ts"] = now
         htx_transfer_cache["data"] = result
         debug_stats["htx_transfer_ok"] = True
+        debug_stats["htx_data"] = stats
     else:
         debug_stats["htx_transfer_ok"] = False
 
     return htx_transfer_cache["data"]
 
 
-async def get_htx_depth(symbol_lower):
-    """
-    Топ стакана HTX точечным запросом — ФОЛБЭК на случай, когда в bulk-ответе
-    /market/tickers по паре не оказалось bidSize/askSize (пустое поле или ноль).
-    В норме не вызывается вообще: размеры берутся из bulk-ответа, который сканер
-    тянет в любом случае (см. fetch_huobi_data). Раньше этот запрос уходил по
-    КАЖДОМУ кандидату каждый проход — именно его мы убрали из горячего пути.
-    Возвращает (bid_qty, ask_qty) в штуках монеты, либо (None, None) при ошибке.
-    """
+async def get_htx_book(symbol_lower):
+    """Стакан HTX целиком (до 150 уровней): (bids, asks) или None при ошибке."""
     url = f"https://api.huobi.pro/market/depth?symbol={symbol_lower}&type=step0"
     try:
         async with http_session.get(url, headers=HTX_HEADERS, timeout=TIMEOUT_DEPTH) as resp:
             if resp.status != 200:
-                debug_stats["last_error"] = f"HTX depth {symbol_lower} HTTP {resp.status}"
-                return None, None
+                return None
             data = await resp.json()
         tick = data.get("tick") or {}
-        bids = tick.get("bids") or []
-        asks = tick.get("asks") or []
-        bid_qty = float(bids[0][1]) if bids else None
-        ask_qty = float(asks[0][1]) if asks else None
-        return bid_qty, ask_qty
+        bids = [(float(p), float(q)) for p, q in tick.get("bids") or []]
+        asks = [(float(p), float(q)) for p, q in tick.get("asks") or []]
+        return bids, asks
     except Exception as e:
         debug_stats["last_error"] = f"HTX depth {symbol_lower}: {type(e).__name__} {e}"
-        return None, None
+        return None
+
+
+async def get_mexc_book(symbol):
+    """Стакан MEXC (до 100 уровней): (bids, asks) или None при ошибке."""
+    url = f"https://api.mexc.com/api/v3/depth?symbol={symbol}&limit=100"
+    try:
+        async with http_session.get(url, timeout=TIMEOUT_DEPTH) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        bids = [(float(p), float(q)) for p, q in data.get("bids") or []]
+        asks = [(float(p), float(q)) for p, q in data.get("asks") or []]
+        return bids, asks
+    except Exception as e:
+        debug_stats["last_error"] = f"MEXC depth {symbol}: {type(e).__name__} {e}"
+        return None
 
 
 # ================= UPSTASH (персистентность настроек) =================
@@ -1085,20 +1172,12 @@ async def scanner_task():
             debug_stats["ts"] = time.time()
             debug_stats["mexc_ok"] = bool(mexc_data)
             debug_stats["huobi_ok"] = bool(huobi_data)
-            debug_stats["passed_volume_floor"] = 0
-            debug_stats["passed_spread_filter"] = 0
-            debug_stats["passed_stability"] = 0
-            debug_stats["passed_turnover_filter"] = 0
-            debug_stats["passed_transfer_check"] = 0
-            debug_stats["blocked_by_transfer"] = 0
-            debug_stats["passed_cooldown"] = 0
-            debug_stats["alerts_sent"] = 0
-            debug_stats["skipped_mexc"] = 0
-            debug_stats["skipped_htx"] = 0
-            debug_stats["skipped_htx_transfer"] = 0
-            debug_stats["blocked_by_sanity"] = 0
-            debug_stats["blocked_by_unknown_depth"] = 0
-            debug_stats["depth_fallback"] = 0
+            for k in ("passed_volume_floor", "passed_spread_filter", "passed_stability",
+                      "passed_turnover_filter", "passed_transfer_check", "blocked_by_transfer",
+                      "passed_cooldown", "alerts_sent", "skipped_mexc", "skipped_htx",
+                      "skipped_htx_transfer", "blocked_by_sanity", "blocked_by_unknown_depth",
+                      "depth_fallback", "blocked_by_contract", "route_unmatched"):
+                debug_stats[k] = 0
 
             if not mexc_data or not huobi_data:
                 await asyncio.sleep(settings["check_interval"])
@@ -1147,15 +1226,14 @@ async def scanner_task():
 
                 dir_candidates = []
                 if settings["scan_mexc_to_htx"] and spread_mexc_to_htx >= mexc_to_htx_threshold:
-                    dir_candidates.append(("MEXC", "HTX", spread_mexc_to_htx, m["ask"], h["bid"]))
+                    dir_candidates.append(("MEXC", "HTX", spread_mexc_to_htx, m["ask"], h["bid"], mexc_to_htx_threshold))
                 if spread_htx_to_mexc >= htx_to_mexc_threshold:
-                    dir_candidates.append(("HTX", "MEXC", spread_htx_to_mexc, h["ask"], m["bid"]))
+                    dir_candidates.append(("HTX", "MEXC", spread_htx_to_mexc, h["ask"], m["bid"], htx_to_mexc_threshold))
 
                 # ===== САНИТИ-ОТСЕЧКА СВЕРХУ =====
                 # Отбрасываем направления с неправдоподобно большим спредом ДО
                 # выбора лучшего — иначе "спред" в 900%, возникший из-за разной
-                # деноминации одноимённых тикеров, всегда побеждал бы в max()
-                # и вытеснял настоящие сигналы по этой паре.
+                # деноминации одноимённых тикеров, всегда побеждал бы в max().
                 if settings["max_spread_percent"] > 0:
                     sane = [c for c in dir_candidates if c[2] <= settings["max_spread_percent"]]
                     if len(sane) != len(dir_candidates):
@@ -1168,7 +1246,7 @@ async def scanner_task():
                 debug_stats["passed_spread_filter"] += 1
 
                 # Если прошли оба направления — берём то, где спред больше.
-                buy_ex, sell_ex, best_spread, buy_price, sell_price = max(dir_candidates, key=lambda c: c[2])
+                buy_ex, sell_ex, best_spread, buy_price, sell_price, threshold = max(dir_candidates, key=lambda c: c[2])
 
                 # ============ ФИЛЬТР СТАБИЛЬНОСТИ СПРЕДА (/ss) ============
                 if settings["spread_stable_sec"] > 0:
@@ -1180,27 +1258,39 @@ async def scanner_task():
                         continue  # ещё не набрали нужную длительность
                 debug_stats["passed_stability"] += 1
 
-                # Именно срез, а не replace("USDT", ""): replace вырезает ВСЕ
-                # вхождения, и тикер вида USDTBUSDT превратился бы в "B".
-                # endswith("USDT") здесь уже гарантирован отбором пар выше.
+                # Именно срез, а не replace("USDT", ""): replace вырезает ВСЕ вхождения.
                 base_coin = pair[:-4]
-                htx_leg = "withdraw" if buy_ex == "HTX" else "deposit"
                 htx_coin_status = htx_transfer.get(base_coin)
-                htx_known = htx_coin_status is not None
-                htx_ok = htx_coin_status.get(htx_leg, False) if htx_known else True  # неизвестно = не блокируем
 
-                if settings["require_transferable"] and htx_known and not htx_ok:
+                # ===== ОБЩАЯ СЕТЬ + СВЕРКА КОНТРАКТА =====
+                # Перевести монету можно только по ОДНОЙ сети, где на бирже покупки
+                # открыт вывод, а на бирже продажи — депозит. И одинаковый тикер ещё
+                # не значит одну монету — сверяем контракты, где биржи их отдают.
+                route = sq.find_route(
+                    buy_ex,
+                    (htx_coin_status or {}).get("chains", []),
+                    mexc_contracts.get(base_coin, []),
+                )
+                if settings["check_contracts"] and route["contract"] == "mismatch":
+                    debug_stats["blocked_by_contract"] += 1
+                    continue
+
+                if route["state"] == "nodata":
+                    # Нет данных по сетям одной из бирж (например, нет ключа MEXC) —
+                    # как раньше, смотрим только агрегированный статус HTX.
+                    htx_leg = "withdraw" if buy_ex == "HTX" else "deposit"
+                    htx_ok = htx_coin_status.get(htx_leg, False) if htx_coin_status else True
+                    transfer_blocked = htx_coin_status is not None and not htx_ok
+                elif route["state"] == "nomatch":
+                    debug_stats["route_unmatched"] += 1
+                    transfer_blocked = False  # не смогли сопоставить названия — не режем, но пометим
+                else:
+                    transfer_blocked = route["state"] == "closed"
+
+                if settings["require_transferable"] and transfer_blocked:
                     debug_stats["blocked_by_transfer"] += 1
                     continue
                 debug_stats["passed_transfer_check"] += 1
-
-                leg_name_ru = "вывод" if htx_leg == "withdraw" else "ввод"
-                if not htx_known:
-                    htx_transfer_label = f"❔ статус {leg_name_ru}а неизвестен"
-                elif htx_ok:
-                    htx_transfer_label = f"✅ {leg_name_ru.upper()} ОТКРЫТ"
-                else:
-                    htx_transfer_label = f"❌ {leg_name_ru.upper()} ЗАКРЫТ"
 
                 # Анти-спам: простой кулдаун по времени.
                 prev = alert_memory.get(pair)
@@ -1211,75 +1301,64 @@ async def scanner_task():
                 candidates.append({
                     "pair": pair, "m": m, "h": h,
                     "buy_ex": buy_ex, "sell_ex": sell_ex, "best_spread": best_spread,
-                    "buy_price": buy_price, "sell_price": sell_price,
-                    "base_coin": base_coin, "htx_leg": htx_leg,
-                    "htx_coin_status": htx_coin_status, "htx_known": htx_known,
-                    "leg_name_ru": leg_name_ru, "htx_transfer_label": htx_transfer_label,
-                    "prev": prev,
+                    "buy_price": buy_price, "sell_price": sell_price, "threshold": threshold,
+                    "base_coin": base_coin, "htx_coin_status": htx_coin_status,
+                    "route": route, "prev": prev,
                 })
 
             if not candidates:
                 await asyncio.sleep(settings["check_interval"])
                 continue
 
-            # ===== ФАЗА 2: добор глубины HTX ТОЛЬКО там, где её не было =====
-            # В норме размеры топа стакана уже пришли в bulk-ответах (MEXC
-            # bookTicker — bidQty/askQty, HTX tickers — bidSize/askSize), и
-            # сетевых вызовов здесь не происходит вовсе. Но если HTX по какой-то
-            # паре не отдал bidSize/askSize, без добора мы бы либо показали
-            # "н/д", либо (при включённом /mt) молча потеряли живой сигнал —
-            # поэтому по таким пáрам, и только по ним, дозапрашиваем стакан.
-            need_depth = [
-                c for c in candidates
-                if c["h"].get("bid_qty") is None or c["h"].get("ask_qty") is None
-            ]
-            if need_depth:
-                debug_stats["depth_fallback"] = len(need_depth)
-                fetched = await asyncio.gather(
-                    *[get_htx_depth(c["pair"].lower()) for c in need_depth],
-                    return_exceptions=True,
-                )
-                for c, res in zip(need_depth, fetched):
-                    if isinstance(res, Exception):
-                        continue
-                    got_bid, got_ask = res
-                    if c["h"].get("bid_qty") is None:
-                        c["h"]["bid_qty"] = got_bid
-                    if c["h"].get("ask_qty") is None:
-                        c["h"]["ask_qty"] = got_ask
+            # ===== ФАЗА 2: стаканы обеих бирж по кандидатам =====
+            # Лучшая цена часто держит монет на $20 — по ней спред красивый, а на
+            # реальную сумму его нет. Поэтому по каждому кандидату тянем стаканы и
+            # считаем, сколько $ можно прокрутить, пока спред на очередном уровне
+            # не ниже порога, и какой средний спред на этот объём. Кандидатов после
+            # фильтров единицы, так что запросов немного; ограничиваем сверху.
+            candidates.sort(key=lambda c: c["best_spread"], reverse=True)
+            candidates = candidates[:MAX_DEPTH_CANDIDATES]
+            books = await asyncio.gather(
+                *[asyncio.gather(get_htx_book(c["pair"].lower()), get_mexc_book(c["pair"]))
+                  for c in candidates],
+                return_exceptions=True,
+            )
+            for c, res in zip(candidates, books):
+                htx_book, mexc_book = (None, None) if isinstance(res, Exception) else res
+                c["tradable_usd"] = c["avg_spread"] = None
+                c["depth_capped"] = False
+                if htx_book and mexc_book:
+                    if c["buy_ex"] == "HTX":
+                        asks, bids = htx_book[1], mexc_book[0]
+                    else:
+                        asks, bids = mexc_book[1], htx_book[0]
+                    cost, avg, capped = sq.arb_volume(asks, bids, c["threshold"])
+                    # «Стакан глубже загруженного» — только если упёрлись в лимит
+                    # загрузки (100+ уровней), а не в настоящий конец тонкого стакана.
+                    capped = capped and max(len(asks), len(bids)) >= 100
+                    c["tradable_usd"], c["avg_spread"], c["depth_capped"] = cost, avg, capped
+                else:
+                    debug_stats["depth_fallback"] += 1
+                    # Запасной вариант — объём только на лучшей цене из bulk-ответов.
+                    if c["buy_ex"] == "MEXC":
+                        bq, sq_ = c["m"].get("ask_qty"), c["h"].get("bid_qty")
+                    else:
+                        bq, sq_ = c["h"].get("ask_qty"), c["m"].get("bid_qty")
+                    if bq is not None and sq_ is not None:
+                        c["tradable_usd"] = min(bq, sq_) * c["buy_price"]
 
             # ===== ФАЗА 3: фильтр мин. оборота + сборка сообщений =====
-            def _fmt_qty(q):
-                return f"{q:,.4f}".rstrip('0').rstrip('.') if q is not None else "н/д"
-
             messages = []  # [(chat_id_или_channel, текст), ...] — отправим все разом в конце
 
             for c in candidates:
-                htx_bid_qty, htx_ask_qty = c["h"].get("bid_qty"), c["h"].get("ask_qty")
-
                 pair, m, h = c["pair"], c["m"], c["h"]
                 buy_ex, sell_ex = c["buy_ex"], c["sell_ex"]
                 best_spread, buy_price, sell_price = c["best_spread"], c["buy_price"], c["sell_price"]
-                base_coin, htx_leg = c["base_coin"], c["htx_leg"]
-                htx_coin_status, htx_known = c["htx_coin_status"], c["htx_known"]
-                leg_name_ru, htx_transfer_label = c["leg_name_ru"], c["htx_transfer_label"]
-                prev = c["prev"]
-
-                if buy_ex == "MEXC":
-                    buy_qty, sell_qty = m.get("ask_qty"), htx_bid_qty
-                else:
-                    buy_qty, sell_qty = htx_ask_qty, m.get("bid_qty")
-
-                tradable_usd = None
-                if buy_qty is not None and sell_qty is not None:
-                    tradable = min(buy_qty, sell_qty)
-                    tradable_usd = tradable * buy_price
+                base_coin, route, prev = c["base_coin"], c["route"], c["prev"]
+                tradable_usd, avg_spread = c["tradable_usd"], c["avg_spread"]
 
                 # ============ ФИЛЬТР МИН. ОБОРОТА (/mt) ============
-                # Если фильтр включён, а глубину посчитать не удалось — пара НЕ
-                # проходит. Раньше такие пары проскакивали (условие требовало
-                # tradable_usd is not None), то есть при включённом /mt всё равно
-                # приходили алерты по парам с непроверенным оборотом.
+                # Если фильтр включён, а объём посчитать не удалось — пара НЕ проходит.
                 if settings["min_turnover_usd"] > 0:
                     if tradable_usd is None:
                         debug_stats["blocked_by_unknown_depth"] += 1
@@ -1288,11 +1367,14 @@ async def scanner_task():
                         continue
                 debug_stats["passed_turnover_filter"] += 1
 
-                depth_line = f"📦 Доступно: купить {_fmt_qty(buy_qty)} {base_coin} / продать {_fmt_qty(sell_qty)} {base_coin}"
-                if tradable_usd is not None:
-                    depth_line += f" → прокрутить ~{_fmt_qty(min(buy_qty, sell_qty))} (~{fmt_money(tradable_usd)}$)"
+                if tradable_usd is None:
+                    depth_line = "📦 Сколько можно прокрутить: посчитать не удалось (стакан не загрузился)"
+                elif avg_spread is None:
+                    depth_line = f"📦 Прокрутить по стакану со спредом ≥ {c['threshold']:g}%: ~{fmt_money(tradable_usd)}$ (только лучшая цена)"
                 else:
-                    depth_line += " → сумму для прокрутки посчитать не удалось (нет данных по одной из сторон)"
+                    depth_line = (f"📦 Прокрутить со спредом ≥ {c['threshold']:g}%: <b>~{fmt_money(tradable_usd)}$</b>"
+                                  f"{'+ (стакан глубже загруженного)' if c['depth_capped'] else ''}, "
+                                  f"средний спред на этот объём <b>{avg_spread:+.2f}%</b>")
 
                 alert_memory[pair] = {
                     "time": prev["time"] if prev else now,
@@ -1301,82 +1383,76 @@ async def scanner_task():
                 }
                 debug_stats["alerts_sent"] += 1
 
-                # Комиссия за вывод релевантна, только если реально ВЫВОДИМ с HTX
-                # (т.е. купили на HTX и переводим монету на MEXC для продажи).
-                fee_line = None
+                # ----- Перевод: какая сеть и что с ней -----
                 withdraw_fee_usd = None
-                if htx_leg == "withdraw" and htx_known:
-                    fee_amt = htx_coin_status.get("fee")
-                    if fee_amt is not None:
-                        fee_type = htx_coin_status.get("fee_type") or ""
-                        fee_chain = htx_coin_status.get("fee_chain") or "?"
-                        fee_usd = withdraw_fee_usd = fee_amt * buy_price
-                        fee_line = (
-                            f"💸 Комиссия вывода с HTX ({fee_chain}, {fee_type}): "
-                            f"{fee_amt:g} {base_coin} (~{fmt_money(fee_usd)}$)"
-                        )
-                elif htx_leg == "deposit":
-                    # Значит выводим именно с MEXC — комиссию берём из того же
-                    # подписанного запроса, что и контракт (доп. запрос не нужен).
-                    mexc_nets = mexc_contracts.get(base_coin) or []
-                    fee_candidates = [
-                        n for n in mexc_nets
-                        if n.get("withdraw_fee") is not None and n.get("withdraw_enable", True)
-                    ]
-                    if fee_candidates:
-                        best = min(fee_candidates, key=lambda n: n["withdraw_fee"])
-                        fee_usd = withdraw_fee_usd = best["withdraw_fee"] * buy_price
-                        fee_line = (
-                            f"💸 Комиссия вывода с MEXC ({best['network']}): "
-                            f"{best['withdraw_fee']:g} {base_coin} (~{fmt_money(fee_usd)}$)"
-                        )
+                from_ex, to_ex = buy_ex, sell_ex
+                transfer_lines = []
+                best = route.get("best")
+                if route["state"] == "open" and best:
+                    net_name = best["htx"]["names"][0] or best["htx"]["chain"]
+                    transfer_lines.append(
+                        f"🚚 Общая сеть: <b>{net_name}</b> — вывод {from_ex} ✅ · депозит {to_ex} ✅")
+                    if best["fee"] is not None:
+                        withdraw_fee_usd = best["fee"] * buy_price
+                        transfer_lines.append(
+                            f"💸 Комиссия вывода с {from_ex}: {best['fee']:g} {base_coin} (~{fmt_money(withdraw_fee_usd)}$)")
+                    else:
+                        transfer_lines.append(f"💸 Комиссию вывода {from_ex} не отдал")
+                elif route["state"] == "closed":
+                    transfer_lines.append(f"🚚 ❌ Нет общей сети, где открыт вывод {from_ex} и депозит {to_ex}")
+                elif route["state"] == "nomatch":
+                    transfer_lines.append("🚚 ⚠️ Сети бирж не удалось сопоставить по названиям — проверь вручную")
+                else:
+                    hs = c["htx_coin_status"]
+                    leg = "вывод" if buy_ex == "HTX" else "ввод"
+                    if hs is None:
+                        transfer_lines.append(f"🚚 HTX ({leg}): ❔ статус неизвестен · MEXC: нет данных")
+                    else:
+                        ok = hs.get("withdraw" if buy_ex == "HTX" else "deposit")
+                        transfer_lines.append(f"🚚 HTX ({leg}): {'✅ открыт' if ok else '❌ закрыт'} в какой-то сети · MEXC: нет данных (нужен ключ)")
+                    if buy_ex == "HTX" and hs and hs.get("fee") is not None:
+                        withdraw_fee_usd = hs["fee"] * buy_price
+                        transfer_lines.append(f"💸 Комиссия вывода с HTX ({hs.get('fee_chain') or '?'}): {hs['fee']:g} {base_coin} (~{fmt_money(withdraw_fee_usd)}$)")
 
-                lines = [
-                    f"🔀 <b>СПРЕД: <code>{base_coin}</code></b>",
-                    "",
-                    f"💹 <b>{best_spread:+.2f}%</b> · Купить на <b>{buy_ex}</b> ({fmt_price(buy_price)}) "
-                    f"→ Продать на <b>{sell_ex}</b> ({fmt_price(sell_price)})",
-                    "",
-                    f"📥 MEXC: bid {fmt_price(m['bid'])} / ask {fmt_price(m['ask'])}",
-                    f"📤 HTX: bid {fmt_price(h['bid'])} / ask {fmt_price(h['ask'])}",
-                    "",
-                    depth_line,
-                    "",
-                    f"💰 Объём 24ч: MEXC {fmt_money(m['vol'])}$ · HTX {fmt_money(h['vol'])}$",
-                    "",
-                    f"🚚 Перевод HTX ({leg_name_ru}): {htx_transfer_label}",
-                    f"⚠️ Перевод MEXC: не проверяется (нет API-ключа)",
-                    f"<i>Статусы перевода справочные — сверяй на самой бирже перед крупным переводом, данные API могут отставать от реального состояния.</i>",
-                ]
-                if fee_line:
-                    lines.append(fee_line)
+                if route["contract"] == "ok":
+                    contract_line = "🔗 Контракт: ✅ совпадает на обеих биржах"
+                elif route["contract"] == "mismatch":
+                    contract_line = "🔗 Контракт: ⛔ РАЗНЫЙ на биржах — скорее всего разные монеты (/ca выключает проверку)"
+                else:
+                    mexc_cas = [n["contract"] for n in mexc_contracts.get(base_coin, []) if n.get("contract")]
+                    contract_line = ("🔗 Контракт: ⚠️ не сверен (HTX не отдал) — MEXC: "
+                                     + (", ".join(mexc_cas[:2]) if mexc_cas else "нет данных"))
 
-                # Чистый спред: минус торговые комиссии на обеих биржах и минус
-                # комиссия вывода, размазанная по сумме, которую можно прокрутить.
-                # HTX часто не отдаёт комиссию вывода — тогда честно пишем, что не учтена.
+                # ----- Чистый спред -----
+                # Средний спред по стакану на прокручиваемый объём, минус торговые
+                # комиссии обеих бирж, минус комиссия вывода, размазанная по этому объёму.
                 trade_fees = settings["fee_htx_pct"] + settings["fee_mexc_pct"]
-                net = best_spread - trade_fees
+                base_spread = avg_spread if avg_spread is not None else best_spread
+                net = base_spread - trade_fees
                 if withdraw_fee_usd is not None and tradable_usd:
                     net -= withdraw_fee_usd / tradable_usd * 100
                     net_note = f"торговые {trade_fees:g}% и вывод ~{fmt_money(withdraw_fee_usd)}$ на {fmt_money(tradable_usd)}$"
                 elif withdraw_fee_usd is not None:
-                    net_note = f"торговые {trade_fees:g}%; вывод ~{fmt_money(withdraw_fee_usd)}$ не учтён — неизвестна сумма"
+                    net_note = f"торговые {trade_fees:g}%; вывод ~{fmt_money(withdraw_fee_usd)}$ не учтён — неизвестен объём"
                 else:
                     net_note = f"торговые {trade_fees:g}%; комиссия вывода неизвестна — не учтена"
-                lines.append(f"🧮 Чистый спред ≈ <b>{net:+.2f}%</b> (минус {net_note})")
 
-                # Контракт MEXC — реальные данные, если заданы MEXC_API_KEY/SECRET;
-                # HTX публичного источника контрактов не имеет.
-                coin_networks = mexc_contracts.get(base_coin)
-                if coin_networks:
-                    top_nets = coin_networks[:3]
-                    nets_str = "; ".join(f"{n['network']}: {n['contract']}" for n in top_nets)
-                    lines.append(f"🔗 MEXC контракт: {nets_str}")
-                    lines.append("<i>Сверь этот адрес на странице пополнения HTX вручную — авто-сверки с HTX нет (нет публичного источника контрактов).</i>")
-                elif MEXC_API_KEY:
-                    lines.append("🔗 Контракт MEXC: не найден в ответе API для этой монеты")
-                else:
-                    lines.append("🔗 Проверка контракта: выключена (не задан MEXC_API_KEY/SECRET)")
+                lines = [
+                    f"🔀 <b>СПРЕД: <code>{base_coin}</code></b>",
+                    "",
+                    f"💹 <b>{best_spread:+.2f}%</b> по лучшей цене · Купить на <b>{buy_ex}</b> ({fmt_price(buy_price)}) "
+                    f"→ Продать на <b>{sell_ex}</b> ({fmt_price(sell_price)})",
+                    depth_line,
+                    f"🧮 Чистый спред ≈ <b>{net:+.2f}%</b> (минус {net_note})",
+                    "",
+                    f"📥 MEXC: bid {fmt_price(m['bid'])} / ask {fmt_price(m['ask'])}",
+                    f"📤 HTX: bid {fmt_price(h['bid'])} / ask {fmt_price(h['ask'])}",
+                    f"💰 Объём 24ч: MEXC {fmt_money(m['vol'])}$ · HTX {fmt_money(h['vol'])}$",
+                    "",
+                    *transfer_lines,
+                    contract_line,
+                    "<i>Статусы перевода — со слов бирж (HTX часто неточен), сверяй перед крупным переводом.</i>",
+                ]
                 alert_text = "\n".join(lines)
 
                 if settings["chat_id"]:
@@ -1414,7 +1490,8 @@ BOT_COMMANDS = [
     BotCommand(command="mt", description="Мин. сумма для прокрутки по стакану"),
     BotCommand(command="cd", description="Пауза между повторными алертами"),
     BotCommand(command="ss", description="Мин. время стабильности спреда"),
-    BotCommand(command="tr", description="Вкл/выкл фильтр доступности перевода"),
+    BotCommand(command="tr", description="Вкл/выкл фильтр общей открытой сети"),
+    BotCommand(command="ca", description="Вкл/выкл отсев разных контрактов"),
     BotCommand(command="int", description="Как часто проверять спреды, сек"),
     BotCommand(command="dir", description="Вкл/выкл сигналы MEXC→HTX"),
     BotCommand(command="fee", description="Торговые комиссии для чистого спреда"),

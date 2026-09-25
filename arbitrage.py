@@ -1701,7 +1701,11 @@ async def cmd_htx_check(message: types.Message, command: CommandObject):
             out.append("пусто")
         for row in rows or []:
             ca = row.get("ca") or row.get("contractAddress") or row.get("contract")
-            out.append(f"• <code>{row.get('chain')}</code>: " + (f"<code>{ca}</code>" if ca else "контракта нет"))
+            out.append(f"• <code>{row.get('chain')}</code>: " + (f"контракт <code>{ca}</code>" if ca else "контракта нет"))
+            # Все поля как есть — чтобы увидеть, отдаёт ли HTX тут статусы и комиссии.
+            raw = ", ".join(f"{k}={v}" for k, v in row.items() if k not in ("currency", "chain", "ca"))
+            if raw:
+                out.append(f"   <code>{raw[:600].replace('<', '')}</code>")
     except Exception as e:
         out.append(f"\n2. ошибка: {e}")
 
