@@ -49,7 +49,7 @@ HTX_HEADERS = {
 # реально крутится: без неё старый и новый деплой по алертам почти неотличимы,
 # и «баг» легко перепутать с «Render не передеплоился». RENDER_GIT_COMMIT Render
 # подставляет сам; BUILD_TAG бампаем руками при значимых изменениях логики.
-BUILD_TAG = "2026-09-25 auto-arbitrage"
+BUILD_TAG = "2026-09-26 net-spread"
 BUILD_COMMIT = (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "локально"
 
 TIMEOUT_BULK = aiohttp.ClientTimeout(total=15)
@@ -75,8 +75,16 @@ settings = {
     # широкий стакан без реальной глубины) и пропускается.
     "min_volume": 100000,
 
-    "check_interval": 10,    # Как часто проверять (сек) — bulk-эндпоинты дешёвые,
-                             # можно опрашивать чаще без риска упереться в рейт-лимит
+    "check_interval": 4,     # Как часто проверять (сек) — bulk-эндпоинты дешёвые,
+                             # можно опрашивать чаще без риска упереться в рейт-лимит (/int)
+
+    # Искать ли спреды в направлении MEXC→HTX (/dir). Автоарбитраж работает только
+    # HTX→MEXC, и если обратные сигналы не нужны — это просто шум.
+    "scan_mexc_to_htx": True,
+
+    # Торговые комиссии (taker, %) для оценки чистого спреда (/fee).
+    "fee_htx_pct": 0.2,
+    "fee_mexc_pct": 0.05,
     "cooldown_min": 10,      # Мин. пауза между повторными алертами по одной паре
 
     # Спред должен непрерывно держаться выше порога (/sp) хотя бы это число
@@ -201,6 +209,23 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 dp.include_router(arbitrage.router)
 
+
+# Если задан ARB_ADMIN_IDS — бот отвечает ТОЛЬКО этим людям. Без этого любой,
+# кто найдёт бота в поиске, мог менять настройки, а /start перенаправлял бы
+# все сообщения (включая сделки автоарбитража) в его чат.
+@dp.message.outer_middleware()
+async def _only_admins_messages(handler, event, data):
+    if arbitrage.ADMIN_IDS and (event.from_user is None or event.from_user.id not in arbitrage.ADMIN_IDS):
+        return None
+    return await handler(event, data)
+
+
+@dp.callback_query.outer_middleware()
+async def _only_admins_callbacks(handler, event, data):
+    if arbitrage.ADMIN_IDS and event.from_user.id not in arbitrage.ADMIN_IDS:
+        return None
+    return await handler(event, data)
+
 # Одна общая HTTP-сессия на всё время жизни бота вместо создания новой сессии
 # (= новый TCP+TLS handshake) на КАЖДЫЙ запрос. Инициализируется в main() —
 # держит пул соединений (keep-alive) и DNS-кэш, заметно снижает задержку
@@ -269,6 +294,11 @@ async def start_cmd(message: types.Message):
         f"   └ сейчас: <b>{settings['cooldown_min']} мин</b>\n"
         f"/ss 30 — спред должен непрерывно держаться выше порога минимум N секунд перед алертом (0 = выключить)\n"
         f"   └ сейчас: <b>{stable_display}</b>\n"
+        f"/int 4 — как часто проверять спреды, сек\n"
+        f"   └ сейчас: <b>{settings['check_interval']} сек</b>\n"
+        f"/dir — вкл/выкл сигналы MEXC→HTX (HTX→MEXC есть всегда)\n"
+        f"   └ сейчас: <b>{'оба направления' if settings['scan_mexc_to_htx'] else 'только HTX→MEXC'}</b>\n"
+        f"/fee 0.2 0.05 — торговые комиссии HTX и MEXC (%) для чистого спреда\n"
         f"/tr — вкл/выкл фильтр по доступности вывода/ввода (см. ⚠️ ниже про ограничение)\n"
         f"   └ сейчас: <b>{'Вкл' if settings['require_transferable'] else 'Выкл'}</b>\n"
         f"/b BTC — добавить/убрать монету из чёрного списка (повторный вызов с той же монетой снимает её)\n"
@@ -410,6 +440,42 @@ async def set_cooldown(message: types.Message, command: CommandObject):
         await message.answer("❌ Ошибка. Пример: /cd 10")
 
 
+@dp.message(Command("int"))
+async def set_interval(message: types.Message, command: CommandObject):
+    try:
+        val = max(2, int(float((command.args or "").replace(",", "."))))
+    except Exception:
+        await message.answer("❌ Пример: /int 4 (секунд между проходами сканера, минимум 2)")
+        return
+    settings["check_interval"] = val
+    await message.answer(f"✅ Сканер проверяет спреды каждые <b>{val} сек</b>", parse_mode="HTML")
+    schedule_save()
+
+
+@dp.message(Command("dir"))
+async def toggle_direction(message: types.Message):
+    settings["scan_mexc_to_htx"] = not settings["scan_mexc_to_htx"]
+    state = "HTX→MEXC и MEXC→HTX" if settings["scan_mexc_to_htx"] else "только HTX→MEXC"
+    await message.answer(f"✅ Направления сигналов: <b>{state}</b>", parse_mode="HTML")
+    schedule_save()
+
+
+@dp.message(Command("fee"))
+async def set_fees(message: types.Message, command: CommandObject):
+    args = (command.args or "").replace(",", ".").split()
+    try:
+        settings["fee_htx_pct"] = abs(float(args[0]))
+        settings["fee_mexc_pct"] = abs(float(args[1]))
+    except Exception:
+        await message.answer(
+            f"❌ Пример: /fee 0.2 0.05 — комиссия taker на HTX и на MEXC в %\n"
+            f"Сейчас: HTX {settings['fee_htx_pct']}%, MEXC {settings['fee_mexc_pct']}%")
+        return
+    await message.answer(f"✅ Комиссии для чистого спреда: HTX <b>{settings['fee_htx_pct']}%</b>, "
+                         f"MEXC <b>{settings['fee_mexc_pct']}%</b>", parse_mode="HTML")
+    schedule_save()
+
+
 @dp.message(Command("tr"))
 async def toggle_transfer_filter(message: types.Message):
     settings["chat_id"] = message.chat.id
@@ -507,6 +573,8 @@ async def status_cmd(message: types.Message):
         f"💾 Upstash: {upstash_line}\n"
         f"📢 Канал: {settings['channel_id'] or 'Не задан'}\n"
         f"🔁 Интервал проверки: {settings['check_interval']} сек\n"
+        f"↔️ Направления: {'оба' if settings['scan_mexc_to_htx'] else 'только HTX→MEXC'}\n"
+        f"🧮 Комиссии: HTX {settings['fee_htx_pct']}% · MEXC {settings['fee_mexc_pct']}%\n"
         f"🛑 В памяти алертов: {len(alert_memory)}\n"
         f"🔗 Общих пар на прошлом проходе: {debug_stats['common_pairs']}"
         , parse_mode="HTML")
@@ -1078,7 +1146,7 @@ async def scanner_task():
                 htx_to_mexc_threshold = settings["spread_percent"]
 
                 dir_candidates = []
-                if spread_mexc_to_htx >= mexc_to_htx_threshold:
+                if settings["scan_mexc_to_htx"] and spread_mexc_to_htx >= mexc_to_htx_threshold:
                     dir_candidates.append(("MEXC", "HTX", spread_mexc_to_htx, m["ask"], h["bid"]))
                 if spread_htx_to_mexc >= htx_to_mexc_threshold:
                     dir_candidates.append(("HTX", "MEXC", spread_htx_to_mexc, h["ask"], m["bid"]))
@@ -1236,12 +1304,13 @@ async def scanner_task():
                 # Комиссия за вывод релевантна, только если реально ВЫВОДИМ с HTX
                 # (т.е. купили на HTX и переводим монету на MEXC для продажи).
                 fee_line = None
+                withdraw_fee_usd = None
                 if htx_leg == "withdraw" and htx_known:
                     fee_amt = htx_coin_status.get("fee")
                     if fee_amt is not None:
                         fee_type = htx_coin_status.get("fee_type") or ""
                         fee_chain = htx_coin_status.get("fee_chain") or "?"
-                        fee_usd = fee_amt * buy_price
+                        fee_usd = withdraw_fee_usd = fee_amt * buy_price
                         fee_line = (
                             f"💸 Комиссия вывода с HTX ({fee_chain}, {fee_type}): "
                             f"{fee_amt:g} {base_coin} (~{fmt_money(fee_usd)}$)"
@@ -1256,7 +1325,7 @@ async def scanner_task():
                     ]
                     if fee_candidates:
                         best = min(fee_candidates, key=lambda n: n["withdraw_fee"])
-                        fee_usd = best["withdraw_fee"] * buy_price
+                        fee_usd = withdraw_fee_usd = best["withdraw_fee"] * buy_price
                         fee_line = (
                             f"💸 Комиссия вывода с MEXC ({best['network']}): "
                             f"{best['withdraw_fee']:g} {base_coin} (~{fmt_money(fee_usd)}$)"
@@ -1281,6 +1350,20 @@ async def scanner_task():
                 ]
                 if fee_line:
                     lines.append(fee_line)
+
+                # Чистый спред: минус торговые комиссии на обеих биржах и минус
+                # комиссия вывода, размазанная по сумме, которую можно прокрутить.
+                # HTX часто не отдаёт комиссию вывода — тогда честно пишем, что не учтена.
+                trade_fees = settings["fee_htx_pct"] + settings["fee_mexc_pct"]
+                net = best_spread - trade_fees
+                if withdraw_fee_usd is not None and tradable_usd:
+                    net -= withdraw_fee_usd / tradable_usd * 100
+                    net_note = f"торговые {trade_fees:g}% и вывод ~{fmt_money(withdraw_fee_usd)}$ на {fmt_money(tradable_usd)}$"
+                elif withdraw_fee_usd is not None:
+                    net_note = f"торговые {trade_fees:g}%; вывод ~{fmt_money(withdraw_fee_usd)}$ не учтён — неизвестна сумма"
+                else:
+                    net_note = f"торговые {trade_fees:g}%; комиссия вывода неизвестна — не учтена"
+                lines.append(f"🧮 Чистый спред ≈ <b>{net:+.2f}%</b> (минус {net_note})")
 
                 # Контракт MEXC — реальные данные, если заданы MEXC_API_KEY/SECRET;
                 # HTX публичного источника контрактов не имеет.
@@ -1332,6 +1415,9 @@ BOT_COMMANDS = [
     BotCommand(command="cd", description="Пауза между повторными алертами"),
     BotCommand(command="ss", description="Мин. время стабильности спреда"),
     BotCommand(command="tr", description="Вкл/выкл фильтр доступности перевода"),
+    BotCommand(command="int", description="Как часто проверять спреды, сек"),
+    BotCommand(command="dir", description="Вкл/выкл сигналы MEXC→HTX"),
+    BotCommand(command="fee", description="Торговые комиссии для чистого спреда"),
     BotCommand(command="b", description="Добавить/убрать монету из ЧС"),
     BotCommand(command="bl", description="Показать список монет в ЧС"),
     BotCommand(command="mute", description="Временно замьютить монету"),

@@ -1578,6 +1578,7 @@ async def cmd_help(message: types.Message):
         "   если тикер на HTX другой: <code>htxcoin=ТИКЕР</code>, напр. /arb_add MON 1.5 monad htxcoin=MONAD\n"
         "/arb_del PEPE — убрать монету\n"
         "/arb_confirm PEPE — подтвердить контракт вручную, если HTX его не отдал\n"
+        "/arb_htx PEPE — что HTX реально отдаёт: сети, статусы, комиссии, контракты, лимиты, адресная книга\n"
         "/arb_chains PEPE — сети монеты на HTX и MEXC и что выбрал бот\n"
         "/arb_on · /arb_off — включить/выключить автоторговлю\n"
         "/arb_live on · /arb_live off — реальные сделки / тестовый режим\n"
@@ -1645,6 +1646,88 @@ async def cmd_add(message: types.Message, command: CommandObject):
     except Exception as e:
         text += f"\n⚠️ Проверка сетей: {e}"
     await message.answer(text, parse_mode="HTML")
+
+
+@router.message(Command("arb_htx"))
+async def cmd_htx_check(message: types.Message, command: CommandObject):
+    """Диагностика: что HTX реально отдаёт по монете (публично и через ключ)."""
+    if not await _guard(message):
+        return
+    coin = re.sub(r"[^A-Z0-9]", "", (command.args or "").upper())
+    if not coin:
+        await message.answer("Пример: /arb_htx PEPE  (тикер как на HTX, например MONAD)")
+        return
+    c = coin.lower()
+    out = [f"🔬 <b>HTX отдаёт по {coin}</b>"]
+
+    def contract_keys(d):
+        return {k: v for k, v in d.items() if v and ("contract" in k.lower() or k.lower() in ("ca", "address"))}
+
+    try:
+        data = await htx_req("GET", "/v2/reference/currencies", {"currency": c}, signed=False)
+        item = next((x for x in data or [] if str(x.get("currency", "")).lower() == c), None)
+        out.append("\n<b>1. Сети и статусы (публично):</b>")
+        if not item:
+            out.append("монета не найдена")
+        for ch in (item or {}).get("chains", []):
+            fee = htx_chain_fee(ch)
+            out.append(
+                f"• <code>{ch.get('chain')}</code> {ch.get('displayName') or ''} [{ch.get('baseChain') or ''}] "
+                f"вывод: {ch.get('withdrawStatus')}, ввод: {ch.get('depositStatus')}, "
+                f"комиссия: {ch.get('withdrawFeeType')} {fmt(fee) if fee else 'НЕТ ДАННЫХ'}, "
+                f"мин. {ch.get('minWithdrawAmt') or '—'}"
+                + (f", контракт: {contract_keys(ch)}" if contract_keys(ch) else ", контракта в ответе нет"))
+    except Exception as e:
+        out.append(f"1. ошибка: {e}")
+
+    try:
+        rows = await htx_req("GET", "/v1/settings/common/chains", {"currency": c}, signed=False)
+        out.append("\n<b>2. Контракты (публично, /v1/settings/common/chains):</b>")
+        if not rows:
+            out.append("пусто")
+        for row in rows or []:
+            ca = row.get("ca") or row.get("contractAddress") or row.get("contract")
+            out.append(f"• <code>{row.get('chain')}</code>: " + (f"<code>{ca}</code>" if ca else "контракта нет"))
+    except Exception as e:
+        out.append(f"\n2. ошибка: {e}")
+
+    try:
+        q = await htx_req("GET", "/v2/account/withdraw/quota", {"currency": c})
+        out.append("\n<b>3. Лимиты вывода по твоему ключу:</b>")
+        for ch in (q or {}).get("chains", []):
+            out.append(f"• <code>{ch.get('chain')}</code>: макс. за раз {ch.get('maxWithdrawAmt')}, "
+                       f"осталось на сегодня {ch.get('remainWithdrawQuotaPerDay')}")
+        if not (q or {}).get("chains"):
+            out.append("пусто")
+    except Exception as e:
+        out.append(f"\n3. ключ: {e}")
+
+    try:
+        addrs = await htx_req("GET", "/v2/account/withdraw/address", {"currency": c})
+        out.append("\n<b>4. Адресная книга вывода:</b>")
+        mine = set()
+        for net in NET_TITLES:
+            try:
+                mine.add(wallet_address(net).lower())
+            except Exception:
+                pass
+        for a in addrs or []:
+            addr = str(a.get("address", ""))
+            out.append(f"• <code>{a.get('chain')}</code> {addr} {'✅ кошелёк бота' if addr.lower() in mine else ''}")
+        if not addrs:
+            out.append("пусто — добавь адреса бота (/arb_wallet) в адресную книгу HTX")
+    except Exception as e:
+        out.append(f"\n4. ключ: {e}")
+
+    # Режем по строкам, а не посреди строки — иначе разорвётся HTML-тег.
+    chunk = ""
+    for line in out:
+        if len(chunk) + len(line) > 3800:
+            await message.answer(chunk, parse_mode="HTML")
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await message.answer(chunk, parse_mode="HTML")
 
 
 @router.message(Command("arb_confirm"))
@@ -1929,6 +2012,7 @@ BOT_COMMANDS = [
     ("arb_del", "Убрать монету из автоарбитража"),
     ("arb_chains", "Сети монеты на HTX и MEXC"),
     ("arb_confirm", "Подтвердить контракт монеты вручную"),
+    ("arb_htx", "Что HTX отдаёт по монете (проверка API)"),
     ("arb_net", "Свои EVM-сети: список / add / del"),
     ("arb_on", "Включить автоарбитраж"),
     ("arb_off", "Выключить автоарбитраж"),
