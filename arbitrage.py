@@ -1215,8 +1215,25 @@ async def note_once(key, text, every=1800):
         await notify(text)
 
 
+engine_state = {"last_pass": 0.0}
+
+STAGE_RU = {
+    "buy": "покупка на HTX", "withdraw": "вывод с HTX", "withdraw_check": "проверка вывода HTX",
+    "wallet_wait": "ждёт монеты на кошельке", "forwarding": "пересылка на MEXC",
+    "mexc_wait": "ждёт зачисления на MEXC", "sell": "продажа на MEXC", "done": "завершена",
+}
+
+
+def _ago(ts):
+    if not ts:
+        return "—"
+    sec = int(time.time() - ts)
+    return f"{sec} сек" if sec < 120 else f"{sec // 60} мин"
+
+
 async def engine_loop():
     while True:
+        engine_state["last_pass"] = time.time()
         try:
             if arb["enabled"] and deal is None and not rescues and arb["coins"]:
                 # Все монеты списка проверяются ПАРАЛЛЕЛЬНО: время прохода = одному
@@ -1803,13 +1820,86 @@ async def cmd_arb(message: types.Message):
         parse_mode="HTML")
 
 
+@router.message(Command("arb_status"))
+async def cmd_status(message: types.Message):
+    """Живой статус: спред по каждой монете прямо сейчас, сделка, балансы, тревоги."""
+    if not await _guard(message):
+        return
+    lines = [
+        "📡 <b>Статус автоарбитража</b>",
+        f"{'▶️ ВКЛ' if arb['enabled'] else '⏸ ВЫКЛ'} · "
+        f"{'🧪 тест' if arb['dry_run'] else '💸 реальные сделки'} · "
+        f"цикл был {_ago(engine_state['last_pass'])} назад (каждые {arb['poll_sec']:g} сек)",
+    ]
+
+    # --- Спреды сейчас (стаканы тянем заново, параллельно по всем монетам) ---
+    async def spread_now(coin, cfg):
+        if not cfg.get("htx_symbol"):
+            return coin, cfg, None, "пара на HTX ещё не найдена"
+        try:
+            (mbids, _), (_, hasks) = await asyncio.gather(mexc_depth(f"{coin}USDT"), htx_depth(hsym(coin, cfg)))
+            if not mbids or not hasks:
+                return coin, cfg, None, "пустой стакан"
+            return coin, cfg, (mbids[0][0] - hasks[0][0]) / hasks[0][0] * 100, None
+        except Exception as e:
+            return coin, cfg, None, str(e)[:80]
+
+    lines.append("\n<b>Спред HTX→MEXC сейчас:</b>")
+    if not arb["coins"]:
+        lines.append("— список пуст (/arb_add)")
+    for coin, cfg, sp, err in await asyncio.gather(*[spread_now(c, cfg) for c, cfg in arb["coins"].items()]):
+        pair = f" ({cfg['htx_coin']} на HTX)" if cfg.get("htx_coin") and cfg["htx_coin"] != coin else ""
+        if sp is None:
+            lines.append(f"• <b>{coin}</b>{pair}: ⚠️ {err}")
+        else:
+            mark = "🟢" if sp >= cfg["pct"] else "⚪"
+            lines.append(f"• {mark} <b>{coin}</b>{pair}: <b>{sp:+.2f}%</b> (порог {cfg['pct']}%)")
+
+    # --- Сделка ---
+    lines.append("\n<b>Сделка:</b>")
+    if not deal:
+        lines.append("нет — ждёт спред" if arb["enabled"] else "нет")
+    else:
+        d = deal
+        lines.append(f"<b>{d['coin']}</b> · {STAGE_RU.get(d['stage'], d['stage'])} · идёт {_ago(d.get('started'))}"
+                     + (" · проба" if d.get("phase") == "probe" else ""))
+        if D(d.get("qty") or 0) > 0:
+            lines.append(f"куплено и выведено: {fmt(d['qty'])} шт. за {fmt(d['cost'])}$ "
+                         f"(безубыток {fmt(D(d['cost']) / D(d['qty']))})")
+        elif d.get("cur_qty"):
+            lines.append(f"куплено: {fmt(d['cur_qty'])} шт. за {fmt(d['cur_cost'])}$")
+        if d.get("forwarded"):
+            lines.append(f"отправлено на MEXC: {fmt(d['forwarded'])} шт.")
+        if d.get("received"):
+            lines.append(f"зачислено на MEXC: {fmt(d['received'])} шт., выручка пока {fmt(d.get('proceeds') or 0)}$")
+    if rescues:
+        lines.append(f"⚠️ Аварийных продаж на HTX: {len(rescues)} ({', '.join(r['coin'] for r in rescues)})")
+    active_alarms = [a for a in alarms.values() if not a["acked"]]
+    if alarms:
+        lines.append(f"🚨 Тревог: {len(alarms)} (спамит: {len(active_alarms)})")
+
+    # --- Балансы ---
+    lines.append("\n<b>Балансы:</b>")
+    try:
+        lines.append(f"HTX: {fmt((await htx_balance('usdt'))[0])} USDT")
+    except Exception as e:
+        lines.append(f"HTX: ошибка — {str(e)[:80]}")
+    try:
+        lines.append(f"MEXC: {fmt(await mexc_free('USDT'))} USDT")
+    except Exception as e:
+        lines.append(f"MEXC: ошибка — {str(e)[:80]}")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @router.message(Command("arb_help"))
 async def cmd_help(message: types.Message):
     if not await _guard(message):
         return
     await message.answer(
         "📖 <b>Команды автоарбитража</b>\n"
-        "/arb — статус\n"
+        "/arb — настройки и список монет\n"
+        "/arb_status — живой статус: спред сейчас, сделка, балансы\n"
         "/arb_add PEPE 3 bsc — торговать PEPE от 3% в сети BNB, сразу на весь баланс\n"
         "/arb_add PEPE 3 bsc 150 — то же, но сперва проба на 150$, после успешного вывода — весь баланс\n"
         f"   сети: {nets_list_text()} (свои EVM-сети — /arb_net)\n"
@@ -2277,7 +2367,8 @@ async def start():
 
 
 BOT_COMMANDS = [
-    ("arb", "Автоарбитраж: статус"),
+    ("arb", "Автоарбитраж: настройки и монеты"),
+    ("arb_status", "Автоарбитраж: спред сейчас, сделка, балансы"),
     ("arb_help", "Автоарбитраж: помощь"),
     ("arb_add", "Добавить монету: PEPE 3 bsc [проба$]"),
     ("arb_del", "Убрать монету из автоарбитража"),
