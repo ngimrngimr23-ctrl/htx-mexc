@@ -388,7 +388,9 @@ async def htx_chains(coin):
         return hit[1]
     data = await htx_req("GET", "/v2/reference/currencies",
                          {"currency": coin.lower()}, signed=False)
-    chains = (data or [{}])[0].get("chains", []) if data else []
+    # Берём строго свою монету: на неизвестный тикер HTX может ответить чужими.
+    item = next((x for x in data or [] if str(x.get("currency", "")).lower() == coin.lower()), None)
+    chains = item.get("chains", []) if item else []
     _htx_chains_cache[coin] = (time.time(), chains)
     return chains
 
@@ -782,6 +784,8 @@ async def resolve_coin(coin, cfg):
     Возвращает dict или бросает ExchangeError с понятной причиной."""
     net = cfg["net"]
     chains = await htx_chains(coin)
+    if not chains:
+        raise NetworkMissing(f"монеты {coin} нет на HTX — проверь тикер (как в паре {coin}/USDT на бирже)")
     if cfg.get("htx_chain"):
         htx = [c for c in chains if c.get("chain") == cfg["htx_chain"]]
     else:
@@ -797,6 +801,8 @@ async def resolve_coin(coin, cfg):
     htx = htx[0]
 
     nets = await mexc_networks(coin)
+    if not nets:
+        raise NetworkMissing(f"монеты {coin} нет на MEXC — проверь тикер (как в паре {coin}/USDT на бирже)")
     if cfg.get("mexc_net"):
         mx = [n for n in nets if cfg["mexc_net"] in (n.get("netWork"), n.get("network"))]
     else:
