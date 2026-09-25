@@ -835,30 +835,54 @@ def hcoin(coin, cfg):
     return (cfg.get("htx_coin") or coin).upper()
 
 
+_htx_all_v1 = {"ts": 0.0, "rows": []}
+
+
+async def htx_all_v1_rows():
+    """Все сети всех монет HTX из /v1/settings/common/chains (с контрактами, ca).
+    Нужен, чтобы найти монету на HTX по адресу контракта. Кэш 10 минут."""
+    if time.time() - _htx_all_v1["ts"] > 600:
+        rows = await htx_req("GET", "/v1/settings/common/chains", signed=False)
+        _htx_all_v1.update(ts=time.time(), rows=rows or [])
+    return _htx_all_v1["rows"]
+
+
+def _net_chains(chains, net, cfg):
+    if cfg.get("htx_chain"):
+        return [c for c in chains if c.get("chain") == cfg["htx_chain"]]
+    return [c for c in chains if matches_net(
+        net, c.get("baseChain"), c.get("baseChainProtocol"), c.get("displayName"), c.get("chain"))]
+
+
+async def find_htx_ticker(coin, net, token, cfg):
+    """Как эта монета называется на HTX, если тикер отличается от MEXC.
+    Токен ищем по адресу контракта среди ВСЕХ монет HTX; нативную монету сети
+    (контракта у неё нет) — по названию сети (Monad: MEXC «MON», HTX «MONAD»).
+    Возвращает (тикер, как_нашли) или (None, None)."""
+    if token:
+        want = norm_contract(token)
+        hits = sorted({str(r.get("currency", "")).upper() for r in await htx_all_v1_rows()
+                       if r.get("ca") and norm_contract(r.get("ca")) == want})
+        for t in hits:
+            if t != coin.upper() and _net_chains(await htx_chains(t), net, cfg):
+                return t, "по адресу контракта"
+        return None, None
+    candidates = [net.upper(), NATIVE_COIN[net], re.sub(r"[^A-Z0-9]", "", NET_TITLES[net].upper())]
+    for t in dict.fromkeys(candidates):
+        if t != coin.upper() and _net_chains(await htx_chains(t), net, cfg):
+            return t, f"нативная монета сети {NET_TITLES[net]}"
+    return None, None
+
+
 async def resolve_coin(coin, cfg):
-    """Находит сеть монеты на обеих биржах и контракт токена.
+    """Находит монету и её сеть на обеих биржах и сверяет контракт.
+    Тикер на HTX бот находит сам: если под тем же тикером на HTX другая монета
+    (другой контракт или нет нужной сети), ищет её по контракту / по сети и
+    запоминает найденный тикер в cfg["htx_coin"].
     Возвращает dict или бросает ExchangeError с понятной причиной."""
     net = cfg["net"]
-    hc = hcoin(coin, cfg)
-    chains = await htx_chains(hc)
-    if not chains:
-        raise NetworkMissing(f"монеты {hc} нет на HTX — проверь тикер (как в паре {hc}/USDT на бирже); "
-                             f"если на HTX тикер другой: /arb_add {coin} {cfg['pct']} {net} htxcoin=ТИКЕР")
-    if cfg.get("htx_chain"):
-        htx = [c for c in chains if c.get("chain") == cfg["htx_chain"]]
-    else:
-        htx = [c for c in chains if matches_net(
-            net, c.get("baseChain"), c.get("baseChainProtocol"), c.get("displayName"), c.get("chain"))]
-    found = ", ".join(c.get("chain", "?") for c in chains) or "нет ни одной"
-    if not htx:
-        raise NetworkMissing(f"на HTX у {hc} нет сети {NET_TITLES[net]} (есть: {found}). Если это не та монета, "
-                             f"укажи тикер HTX: /arb_add {coin} {cfg['pct']} {net} htxcoin=ТИКЕР")
-    if len(htx) > 1:
-        raise ExchangeError(
-            f"HTX: не удалось однозначно найти сеть {NET_TITLES[net]} для {hc} "
-            f"(сети на HTX: {found}). Укажи вручную: /arb_add {coin} {cfg['pct']} {net} htx=<код>")
-    htx = htx[0]
 
+    # ---- MEXC: сеть и контракт — это «эталон», с которым сверяем HTX ----
     nets = await mexc_networks(coin)
     if not nets:
         raise NetworkMissing(f"монеты {coin} нет на MEXC — проверь тикер (как в паре {coin}/USDT на бирже)")
@@ -876,17 +900,55 @@ async def resolve_coin(coin, cfg):
     mx = mx[0]
 
     token = None
-    htx_ca = None
     if coin.upper() != NATIVE_COIN[net]:
         token = (mx.get("contract") or "").strip()
         if not token:
             raise ExchangeError(f"MEXC не отдал контракт {coin} в сети {NET_TITLES[net]}")
-        # Главная защита от «один тикер — две разные монеты»: сверяем контракт.
-        htx_ca = await htx_contract(hc, htx)
-        if htx_ca and norm_contract(htx_ca) != norm_contract(token):
-            raise ContractMismatch(
-                f"контракты разные — это РАЗНЫЕ монеты!\nHTX ({hc}): <code>{htx_ca}</code>\n"
-                f"MEXC ({coin}): <code>{token}</code>")
+
+    # ---- HTX: та же монета? ----
+    async def check_htx(ticker):
+        """(chains, htx_chain, htx_ca, problem) для тикера на HTX."""
+        chains = await htx_chains(ticker)
+        if not chains:
+            return chains, None, None, "нет"
+        cand = _net_chains(chains, net, cfg)
+        if not cand:
+            return chains, None, None, "нет сети"
+        if len(cand) > 1:
+            return chains, None, None, "много сетей"
+        ca = await htx_contract(ticker, cand[0]) if token else None
+        if token and ca and norm_contract(ca) != norm_contract(token):
+            return chains, cand[0], ca, "другой контракт"
+        return chains, cand[0], ca, None
+
+    auto_how = None
+    hc = hcoin(coin, cfg)
+    chains, htx, htx_ca, problem = await check_htx(hc)
+    if problem and problem != "много сетей" and not cfg.get("htx_coin"):
+        alt, how = await find_htx_ticker(coin, net, token, cfg)
+        if alt:
+            alt_res = await check_htx(alt)
+            if not alt_res[3]:
+                hc, (chains, htx, htx_ca, problem) = alt, alt_res
+                auto_how = how
+                cfg["htx_coin"] = alt  # запоминаем — дальше все запросы к HTX идут по нему
+
+    found = ", ".join(c.get("chain", "?") for c in chains) or "нет ни одной"
+    if problem == "нет":
+        raise NetworkMissing(f"монеты {coin} нет на HTX (ни под этим тикером, ни по контракту/сети)")
+    if problem == "нет сети":
+        raise NetworkMissing(f"на HTX у {hc} нет сети {NET_TITLES[net]} (есть: {found}), "
+                             f"и по {'контракту' if token else 'названию сети'} другой тикер не нашёлся")
+    if problem == "много сетей":
+        raise ExchangeError(
+            f"HTX: не удалось однозначно найти сеть {NET_TITLES[net]} для {hc} "
+            f"(сети на HTX: {found}). Укажи вручную: /arb_add {coin} {cfg['pct']} {net} htx=<код>")
+    if problem == "другой контракт":
+        raise ContractMismatch(
+            f"контракты разные — это РАЗНЫЕ монеты, а монеты с контрактом MEXC на HTX не нашлось.\n"
+            f"HTX ({hc}): <code>{htx_ca}</code>\nMEXC ({coin}): <code>{token}</code>")
+
+    if token:
         contract_status = "ok" if htx_ca else "unknown"
     else:
         contract_status = "native"
@@ -894,6 +956,8 @@ async def resolve_coin(coin, cfg):
             token = SUI_NATIVE_TYPE
 
     return {
+        "htx_ticker": hc,
+        "htx_ticker_auto": auto_how,
         "htx_chain": htx.get("chain"),
         # Вывод «открыт», только если ни один из двух источников HTX не говорит обратное.
         "htx_withdraw_ok": htx.get("withdrawStatus") == "allowed" and not v1_closed((await htx_v1_row(hc, htx)).get("we")),
@@ -1136,6 +1200,13 @@ async def try_start(coin, cfg, opp):
         return False
     except Exception as e:
         await note_once(f"cfg:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}% есть, но сделку начать нельзя:\n{e}")
+        return False
+    if res["htx_ticker_auto"]:
+        # Тикер на HTX только что найден — этот спред считался по ЧУЖОЙ монете
+        # с тем же тикером. Сохраняем и пересчитываем на следующем проходе.
+        await save()
+        await notify(f"🔎 <b>{coin}</b>: на HTX это монета <b>{res['htx_ticker']}</b> "
+                     f"(нашёл {res['htx_ticker_auto']}), дальше считаю по ней.")
         return False
     if not res["htx_withdraw_ok"]:
         await note_once(f"wd:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но HTX явно пишет, что вывод в сети {res['htx_chain']} закрыт — пропускаю.")
@@ -1743,6 +1814,9 @@ async def cmd_add(message: types.Message, command: CommandObject):
            (f"проба {cfg['probe']}$ → весь баланс" if cfg["probe"] else "сразу весь баланс")
     try:
         res = await resolve_coin(coin, cfg)
+        if res["htx_ticker_auto"]:
+            await save()
+            text += f"\n🔎 На HTX эта монета — <b>{res['htx_ticker']}</b> (нашёл сам: {res['htx_ticker_auto']})"
         text += (f"\nHTX сеть: <code>{res['htx_chain']}</code> (вывод {'открыт' if res['htx_withdraw_ok'] else 'ЗАКРЫТ'} по API)"
                  f"\nMEXC сеть: <code>{res['mexc_net'].get('netWork') or res['mexc_net'].get('network')}</code>"
                  f"\n{contract_line(coin, cfg, res)}")
