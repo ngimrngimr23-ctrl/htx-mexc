@@ -402,28 +402,35 @@ async def htx_chains(coin):
 _htx_ca_cache = {}
 
 
-async def htx_contract(coin, chain):
-    """Адрес контракта монеты в сети на HTX или None, если HTX его не отдал.
-    Основной источник — /v1/settings/common/chains (поле ca), запасной — поля
-    самой сети из /v2/reference/currencies."""
+async def htx_v1_row(coin, chain):
+    """Строка сети из второго источника HTX (/v1/settings/common/chains):
+    ca — контракт, we/de — вывод/ввод включены, withdraw-desc — причина
+    приостановки. Кэш 60 сек. {} если HTX не ответил."""
     key = (coin.lower(), chain.get("chain"))
     hit = _htx_ca_cache.get(key)
-    if hit and time.time() - hit[0] < 600:
+    if hit and time.time() - hit[0] < 60:
         return hit[1]
-    ca = None
+    found = {}
     try:
         rows = await htx_req("GET", "/v1/settings/common/chains",
                              {"currency": coin.lower()}, signed=False)
-        for row in rows or []:
-            if row.get("chain") == chain.get("chain"):
-                ca = row.get("ca") or row.get("contractAddress") or row.get("contract")
-                break
+        found = next((r for r in rows or [] if r.get("chain") == chain.get("chain")), {}) or {}
     except Exception as e:
         print(f"[arb] HTX chains {coin}: {e}", flush=True)
-    ca = ca or chain.get("contractAddress") or chain.get("contract") or chain.get("ca")
-    ca = str(ca).strip() if ca else None
-    _htx_ca_cache[key] = (time.time(), ca)
-    return ca
+    _htx_ca_cache[key] = (time.time(), found)
+    return found
+
+
+async def htx_contract(coin, chain):
+    """Адрес контракта монеты в сети на HTX или None, если HTX его не отдал."""
+    row = await htx_v1_row(coin, chain)
+    ca = row.get("ca") or row.get("contractAddress") or chain.get("contractAddress") or chain.get("ca")
+    return str(ca).strip() if ca else None
+
+
+def v1_closed(v):
+    """True, если флаг второго источника HTX явно говорит «выключено»."""
+    return v is not None and v != "" and str(v).strip().lower() in ("false", "0", "no", "off")
 
 
 def norm_contract(x):
@@ -885,7 +892,8 @@ async def resolve_coin(coin, cfg):
 
     return {
         "htx_chain": htx.get("chain"),
-        "htx_withdraw_ok": htx.get("withdrawStatus") == "allowed",
+        # Вывод «открыт», только если ни один из двух источников HTX не говорит обратное.
+        "htx_withdraw_ok": htx.get("withdrawStatus") == "allowed" and not v1_closed((await htx_v1_row(hc, htx)).get("we")),
         "htx_fee": htx_chain_fee(htx),
         "htx_min_withdraw": D(htx.get("minWithdrawAmt") or 0),
         "htx_withdraw_step": step_of(htx.get("withdrawPrecision", 8)),

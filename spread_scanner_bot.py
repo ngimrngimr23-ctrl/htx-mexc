@@ -650,6 +650,8 @@ async def debug_cmd(message: types.Message):
             f"   комиссия вывода: основной источник {pct(hd.get('v2_fee', 0))}, "
             f"второй источник добавил ещё {hd.get('v1_fee', 0)}",
             f"   контракт: {pct(hd.get('ca', 0))}",
+            f"   расхождения источников: вывод «открыт» в основном, но закрыт во втором — "
+            f"{hd.get('w_conflict', 0)}; то же по вводу — {hd.get('d_conflict', 0)} (считаются закрытыми)",
             f"   второй источник (/v1/settings/common/chains): "
             + ("✅ отвечает" if hd.get("v1_ok") else f"❌ {hd.get('v1_err', 'не отвечает')}"),
         ]
@@ -933,6 +935,13 @@ def _extract_withdraw_fee(chain):
     return None, None
 
 
+def _v1_flag(v):
+    """Флаг из второго источника HTX (de/we): True/False, или None, если поля нет."""
+    if v is None or v == "":
+        return None
+    return str(v).strip().lower() not in ("false", "0", "no", "off")
+
+
 def _v1_fee(row):
     """Комиссия вывода из второго источника HTX (/v1/settings/common/chains):
     ft — тип, fn — фиксированная сумма. None, если данных нет."""
@@ -978,7 +987,7 @@ async def get_htx_transfer_status():
         return htx_transfer_cache["data"]
 
     v1_rows = {}
-    stats = {"coins": 0, "chains": 0, "v2_fee": 0, "v1_fee": 0, "ca": 0,
+    stats = {"coins": 0, "chains": 0, "v2_fee": 0, "v1_fee": 0, "ca": 0, "w_conflict": 0, "d_conflict": 0,
              "v1_ok": not isinstance(v1, Exception), "v1_keys": ""}
     if not isinstance(v1, Exception):
         rows = v1.get("data") or []
@@ -1006,12 +1015,23 @@ async def get_htx_transfer_status():
                 ca = row.get("ca") or row.get("contractAddress") or ch.get("contractAddress")
                 if ca:
                     stats["ca"] += 1
+                w_ok = ch.get("withdrawStatus") == "allowed"
+                d_ok = ch.get("depositStatus") == "allowed"
+                if w_ok and _v1_flag(row.get("we")) is False:
+                    w_ok = False
+                    stats["w_conflict"] += 1
+                if d_ok and _v1_flag(row.get("de")) is False:
+                    d_ok = False
+                    stats["d_conflict"] += 1
                 chains.append({
                     "chain": ch.get("chain"),
                     "names": [ch.get("displayName"), ch.get("baseChain"),
                               ch.get("baseChainProtocol"), ch.get("chain")],
-                    "withdraw": ch.get("withdrawStatus") == "allowed",
-                    "deposit": ch.get("depositStatus") == "allowed",
+                    # Открыто, только если ОБА источника HTX не говорят «закрыто»:
+                    # второй источник (we/de) иногда знает о приостановке раньше.
+                    "withdraw": w_ok,
+                    "deposit": d_ok,
+                    "wdesc": (row.get("withdraw-desc") or "").strip(),
                     "fee": fee, "fee_type": ftype, "ca": ca,
                 })
             stats["coins"] += 1
@@ -1392,6 +1412,8 @@ async def scanner_task():
                     net_name = best["htx"]["names"][0] or best["htx"]["chain"]
                     transfer_lines.append(
                         f"🚚 Общая сеть: <b>{net_name}</b> — вывод {from_ex} ✅ · депозит {to_ex} ✅")
+                    if best["htx"].get("wdesc") and buy_ex == "HTX":
+                        transfer_lines.append(f"ℹ️ HTX о выводе: {best['htx']['wdesc'][:200].replace('<', '')}")
                     if best["fee"] is not None:
                         withdraw_fee_usd = best["fee"] * buy_price
                         transfer_lines.append(
