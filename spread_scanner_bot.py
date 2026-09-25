@@ -1187,14 +1187,14 @@ async def load_state():
 # ================= ОСНОВНОЙ ЦИКЛ =================
 
 def _withdraw_fee_usd(c):
-    """Комиссия вывода в $ для кандидата: по выбранной общей сети, а если сети
-    сопоставить не удалось — по самой дешёвой открытой сети HTX. None = неизвестна."""
+    """Комиссия вывода в $ для кандидата — только по определённой общей сети.
+    None = сеть не определена или комиссия неизвестна."""
     route, price = c["route"], c["buy_price"]
     best = route.get("best")
     if route["state"] == "open" and best and best.get("fee") is not None:
         return best["fee"] * price
     hs = c.get("htx_coin_status")
-    if c["buy_ex"] == "HTX" and route["state"] in ("nodata", "nomatch") and hs and hs.get("fee") is not None:
+    if c["buy_ex"] == "HTX" and route["state"] == "nodata" and hs and hs.get("fee") is not None:
         return hs["fee"] * price
     return None
 
@@ -1500,7 +1500,7 @@ async def scanner_task():
                 elif route["state"] == "closed":
                     transfer_lines.append(f"🚚 ❌ Нет общей сети, где открыт вывод {from_ex} и депозит {to_ex}")
                 elif route["state"] == "nomatch":
-                    transfer_lines.append("🚚 ⚠️ Сети бирж не удалось сопоставить по названиям — проверь вручную")
+                    transfer_lines.append("🚚 ⚠️ Не удалось получить данные о выводе и комиссии — проверь вручную")
                 else:
                     hs = c["htx_coin_status"]
                     leg = "вывод" if buy_ex == "HTX" else "ввод"
