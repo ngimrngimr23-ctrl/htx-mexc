@@ -100,6 +100,10 @@ settings = {
     # 0 = выключено (фильтр не применяется, сумма просто показывается в алерте).
     "min_turnover_usd": 0,
 
+    # Мин. ЧИСТАЯ прибыль сделки в $ (после торговых комиссий и комиссии вывода)
+    # на объёме, который можно прокрутить. 0 = не фильтровать (/mp).
+    "min_profit_usd": 0,
+
     # ВЕРХНЯЯ отсечка спреда, %. Если тикер на биржах совпал, а актив по факту
     # разный (разная деноминация — классика 1000SATS против SATS; или тикер
     # переиспользован после ребренда токена), спред считается в сотни-тысячи
@@ -214,6 +218,7 @@ debug_stats = {
     "blocked_by_contract": 0,
     "route_unmatched": 0,
     "blocked_by_net": 0,
+    "blocked_by_profit": 0,
     # Что HTX реально отдал по сетям (заполняет get_htx_transfer_status)
     "htx_data": {},
 }
@@ -302,6 +307,8 @@ async def start_cmd(message: types.Message):
         f"/v 100000 — мин. объём торгов за 24ч в $, обязателен на ОБЕИХ биржах сразу (фильтр ликвидности/фантомных спредов)\n"
         f"   └ сейчас: <b>{settings['min_volume']:,}$</b>\n"
         f"/mt 500 — мин. сумма в $, которую реально можно прокрутить по глубине стакана (0 = не фильтровать, просто показывать)\n"
+        f"/mp 5 — мин. чистая прибыль сделки в $ после всех комиссий (0 = не фильтровать)\n"
+        f"   └ сейчас: <b>{settings['min_profit_usd']:g}$</b>\n"
         f"   └ сейчас: <b>{turnover_display}</b>\n"
         f"/cd 10 — пауза между повторными алертами по одной и той же паре, в минутах\n"
         f"   └ сейчас: <b>{settings['cooldown_min']} мин</b>\n"
@@ -440,6 +447,21 @@ async def set_min_turnover(message: types.Message, command: CommandObject):
         schedule_save()
     else:
         await message.answer("❌ Ошибка. Пример: /mt 500 (0 = выключить)")
+
+
+@dp.message(Command("mp"))
+async def set_min_profit(message: types.Message, command: CommandObject):
+    try:
+        val = max(0.0, float((command.args or "").replace(",", ".").replace("$", "")))
+    except Exception:
+        await message.answer("❌ Пример: /mp 5 — присылать только сигналы с чистой прибылью от 5$ (0 = выключить)")
+        return
+    settings["min_profit_usd"] = val
+    await message.answer(
+        "✅ Фильтр мин. прибыли <b>ВЫКЛЮЧЕН</b>" if val == 0 else
+        f"✅ Сигналы только с чистой прибылью от <b>{val:g}$</b> (после торговых комиссий и вывода)",
+        parse_mode="HTML")
+    schedule_save()
 
 
 @dp.message(Command("cd"))
@@ -588,6 +610,7 @@ async def status_cmd(message: types.Message):
         f"🔀 Верхняя отсечка спреда: <b>{spmax_display}</b>\n"
         f"💰 Мин. объём 24ч (обе биржи): <b>{settings['min_volume']:,}$</b>\n"
         f"📦 Мин. сумма для прокрутки: <b>{turnover_display}</b>\n"
+        f"💵 Мин. чистая прибыль: <b>{'Выкл' if not settings['min_profit_usd'] else str(settings['min_profit_usd']) + '$'}</b>\n"
         f"⏱ Пауза между повторными алертами: <b>{settings['cooldown_min']} мин</b>\n"
         f"⏳ Стабильность спреда перед алертом: <b>{stable_display}</b>\n"
         f"🚚 Фильтр перевода (только HTX-плечо): <b>{'Вкл' if settings['require_transferable'] else 'Выкл'}</b>\n"
@@ -641,6 +664,7 @@ async def debug_cmd(message: types.Message):
         f"8️⃣ Прошли фильтр мин. оборота по стакану (/mt): {debug_stats['passed_turnover_filter']} "
         f"(без данных о стакане: {debug_stats['blocked_by_unknown_depth']}, "
         f"стакан не загрузился: {debug_stats['depth_fallback']})",
+        f"9️⃣ Чистая прибыль ≥ /mp {settings['min_profit_usd']:g}$: отсеяно {debug_stats['blocked_by_profit']}",
         f"📨 Алертов отправлено за этот проход: {debug_stats['alerts_sent']}",
     ]
 
@@ -1256,7 +1280,8 @@ async def scanner_task():
                       "passed_turnover_filter", "passed_transfer_check", "blocked_by_transfer",
                       "passed_cooldown", "alerts_sent", "skipped_mexc", "skipped_htx",
                       "skipped_htx_transfer", "blocked_by_sanity", "blocked_by_unknown_depth",
-                      "depth_fallback", "blocked_by_contract", "route_unmatched", "blocked_by_net"):
+                      "depth_fallback", "blocked_by_contract", "route_unmatched", "blocked_by_net",
+                      "blocked_by_profit"):
                 debug_stats[k] = 0
 
             if not mexc_data or not huobi_data:
@@ -1466,6 +1491,13 @@ async def scanner_task():
                         continue
                 debug_stats["passed_turnover_filter"] += 1
 
+                # ============ ФИЛЬТР МИН. ЧИСТОЙ ПРИБЫЛИ В $ (/mp) ============
+                if settings["min_profit_usd"] > 0:
+                    profit = (tradable_usd or 0) * (c["net"] or 0) / 100
+                    if profit < settings["min_profit_usd"]:
+                        debug_stats["blocked_by_profit"] += 1
+                        continue
+
                 if avg_spread is None:
                     depth_line = (f"📦 Прокрутить с чистым спредом ≥ {c['threshold']:g}%: ~{fmt_money(tradable_usd)}$ "
                                   f"(только лучшая цена — стакан не загрузился)")
@@ -1585,6 +1617,7 @@ BOT_COMMANDS = [
     BotCommand(command="spmax", description="Верхняя отсечка спреда (анти-мусор)"),
     BotCommand(command="v", description="Мин. объём 24ч на обеих биржах"),
     BotCommand(command="mt", description="Мин. сумма для прокрутки по стакану"),
+    BotCommand(command="mp", description="Мин. чистая прибыль сделки в $"),
     BotCommand(command="cd", description="Пауза между повторными алертами"),
     BotCommand(command="ss", description="Мин. время стабильности спреда"),
     BotCommand(command="tr", description="Вкл/выкл фильтр общей открытой сети"),
