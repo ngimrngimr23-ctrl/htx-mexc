@@ -71,7 +71,7 @@ RPC_URLS = {
 }
 NET_TITLES = {"eth": "Ethereum", "bsc": "BNB Chain", "monad": "Monad", "sui": "Sui"}
 NATIVE_COIN = {"eth": "ETH", "bsc": "BNB", "monad": "MON", "sui": "SUI"}
-EVM_NETS = ("eth", "bsc", "monad")
+BUILTIN_NETS = ("eth", "bsc", "monad", "sui")
 # Как сеть может называться у бирж. Сравниваем по отдельным словам названия
 # ("BEP20(BSC)" → BEP20, BSC), а не подстрокой — иначе ETH совпал бы с ETHW.
 NET_ALIASES = {
@@ -81,6 +81,24 @@ NET_ALIASES = {
     "sui": {"SUI"},
 }
 SUI_NATIVE_TYPE = "0x2::sui::SUI"
+
+
+def register_net(name, rpc_url, native, aliases):
+    """Добавляет пользовательскую EVM-сеть (/arb_net add) в общие справочники —
+    дальше она работает во всех этапах сделки так же, как встроенные."""
+    RPC_URLS[name] = rpc_url
+    NET_TITLES[name] = name.upper()
+    NATIVE_COIN[name] = native.upper()
+    NET_ALIASES[name] = {a.upper() for a in aliases} | {name.upper()}
+
+
+def unregister_net(name):
+    for table in (RPC_URLS, NET_TITLES, NATIVE_COIN, NET_ALIASES):
+        table.pop(name, None)
+
+
+def nets_list_text():
+    return ", ".join(f"<code>{n}</code>" for n in NET_TITLES)
 
 HTX_HOST = "api.huobi.pro"
 HTX_HEADERS = {
@@ -95,6 +113,8 @@ arb = {
     "dry_run": True,      # тестовый режим: только сообщает, что сделал бы
     # "PEPE": {"pct": 3.0, "net": "bsc", "probe": 0, "htx_chain": None, "mexc_net": None}
     "coins": {},
+    # Свои EVM-сети: "mapo": {"rpc": "https://...", "native": "MAPO", "aliases": ["MAPO", "MAP"]}
+    "networks": {},
     "step_pct": 0.3,       # шаг снижения лимитки на MEXC, % от безубытка
     "step_sec": 120,       # как часто снижать, сек
     "floor_pct": 1.2,      # ниже безубытка минус этот % не опускаемся
@@ -886,6 +906,8 @@ async def load():
     try:
         if isinstance(raw_cfg, str):
             arb.update(json.loads(raw_cfg))
+            for name, n in arb.get("networks", {}).items():
+                register_net(name, n["rpc"], n["native"], n.get("aliases", []))
         if isinstance(raw_deal, str):
             deal = json.loads(raw_deal)
         if isinstance(raw_resc, str):
@@ -1442,7 +1464,7 @@ async def cmd_help(message: types.Message):
         "/arb — статус\n"
         "/arb_add PEPE 3 bsc — торговать PEPE от 3% в сети BNB, сразу на весь баланс\n"
         "/arb_add PEPE 3 bsc 150 — то же, но сперва проба на 150$, после успешного вывода — весь баланс\n"
-        "   сети: <code>eth</code>, <code>bsc</code>, <code>monad</code>, <code>sui</code>\n"
+        f"   сети: {nets_list_text()} (свои EVM-сети — /arb_net)\n"
         "   если бот не нашёл сеть сам: добавь <code>htx=код</code> и/или <code>mexc=имя</code> (см. /arb_chains)\n"
         "/arb_del PEPE — убрать монету\n"
         "/arb_chains PEPE — сети монеты на HTX и MEXC и что выбрал бот\n"
@@ -1450,6 +1472,9 @@ async def cmd_help(message: types.Message):
         "/arb_live on · /arb_live off — реальные сделки / тестовый режим\n"
         "/arb_set step 0.3 · interval 120 · floor 1.2 · check 60 — параметры\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
+        "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
+        "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
+        "/arb_net — список сетей · /arb_net del mapo — удалить свою сеть\n"
         "/arb_reset — забыть зависшую сделку (после ручного разбора)\n"
         "/stop — остановить спам\n\n"
         "<b>Как идёт сделка</b>\n"
@@ -1493,7 +1518,7 @@ async def cmd_add(message: types.Message, command: CommandObject):
                 cfg["probe"] = abs(float(a.replace(",", ".")))
     except Exception:
         await message.answer("❌ Пример: /arb_add PEPE 3 bsc  или  /arb_add PEPE 3 bsc 150\n"
-                             "Сети: eth, bsc, monad, sui")
+                             f"Сети: {nets_list_text()}", parse_mode="HTML")
         return
     arb["coins"][coin] = cfg
     await save()
@@ -1560,6 +1585,78 @@ async def cmd_chains(message: types.Message, command: CommandObject):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+@router.message(Command("arb_net"))
+async def cmd_net(message: types.Message, command: CommandObject):
+    if not await _guard(message):
+        return
+    args = (command.args or "").split()
+    action = args[0].lower() if args else "list"
+
+    if action == "add":
+        try:
+            name = args[1].lower()
+            rpc_url = args[2]
+            native = args[3].upper()
+            if not re.fullmatch(r"[a-z0-9_]{2,20}", name) or not rpc_url.startswith("http"):
+                raise ValueError
+            aliases = [a for a in (args[4].upper().split(",") if len(args) > 4 else []) if a]
+        except Exception:
+            await message.answer(
+                "Пример: /arb_net add mapo https://rpc.maplabs.io MAPO\n"
+                "или с названиями сети на биржах: /arb_net add mapo https://rpc.maplabs.io MAPO MAPO,MAP")
+            return
+        if name in BUILTIN_NETS:
+            await message.answer("❌ Это встроенная сеть, её менять не нужно.")
+            return
+        # Проверяем, что по адресу реально отвечает EVM-нода, до сохранения.
+        RPC_URLS[name] = rpc_url
+        try:
+            chain_id = int(await rpc(name, "eth_chainId", []), 16)
+        except Exception as e:
+            if name not in arb["networks"]:
+                RPC_URLS.pop(name, None)
+            else:
+                RPC_URLS[name] = arb["networks"][name]["rpc"]
+            await message.answer(f"❌ Нода не отвечает как EVM-сеть: {e}")
+            return
+        arb["networks"][name] = {"rpc": rpc_url, "native": native, "aliases": aliases}
+        register_net(name, rpc_url, native, aliases)
+        await save()
+        addr = ""
+        try:
+            addr = f"\nАдрес кошелька бота в ней: <code>{evm_account().address}</code> (тот же, что в ETH/BNB)"
+        except Exception:
+            pass
+        await message.answer(
+            f"✅ Сеть <b>{name}</b> добавлена (chain id {chain_id}, газ в {native}).\n"
+            f"Ищу её на биржах по названиям: {', '.join(sorted(NET_ALIASES[name]))}{addr}\n"
+            f"Теперь: /arb_add МОНЕТА 3 {name}  ·  проверить сети монеты: /arb_chains МОНЕТА",
+            parse_mode="HTML")
+        return
+
+    if action == "del":
+        name = args[1].lower() if len(args) > 1 else ""
+        if name not in arb["networks"]:
+            await message.answer("❌ Такой своей сети нет. Список: /arb_net")
+            return
+        used = [c for c, cfg in arb["coins"].items() if cfg["net"] == name]
+        if used:
+            await message.answer(f"❌ Сеть используют монеты: {', '.join(used)}. Сначала /arb_del.")
+            return
+        arb["networks"].pop(name)
+        unregister_net(name)
+        await save()
+        await message.answer(f"🗑 Сеть <b>{name}</b> удалена", parse_mode="HTML")
+        return
+
+    lines = ["🌐 <b>Сети</b>"]
+    for name in NET_TITLES:
+        kind = "встроенная" if name in BUILTIN_NETS else "своя EVM"
+        lines.append(f"• <code>{name}</code> — {kind}, газ {NATIVE_COIN[name]}, нода {RPC_URLS[name]}")
+    lines.append("\nДобавить: /arb_net add mapo https://rpc.maplabs.io MAPO")
+    await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
 @router.message(Command("arb_on"))
 async def cmd_on(message: types.Message):
     if not await _guard(message):
@@ -1621,7 +1718,7 @@ async def cmd_wallet(message: types.Message):
     if not await _guard(message):
         return
     lines = [_keys_text(), ""]
-    for net in ("eth", "bsc", "monad", "sui"):
+    for net in list(NET_TITLES):
         try:
             bal = await wallet_balance(net, None)
             dec = 9 if net == "sui" else 18
@@ -1692,6 +1789,7 @@ BOT_COMMANDS = [
     ("arb_add", "Добавить монету: PEPE 3 bsc [проба$]"),
     ("arb_del", "Убрать монету из автоарбитража"),
     ("arb_chains", "Сети монеты на HTX и MEXC"),
+    ("arb_net", "Свои EVM-сети: список / add / del"),
     ("arb_on", "Включить автоарбитраж"),
     ("arb_off", "Выключить автоарбитраж"),
     ("arb_live", "Реальные сделки on / тест off"),
