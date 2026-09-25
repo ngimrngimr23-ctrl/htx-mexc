@@ -167,6 +167,10 @@ class ExchangeError(Exception):
     pass
 
 
+class NetworkMissing(ExchangeError):
+    """Нужной сети у монеты на бирже просто нет — не ошибка, а повод пропустить монету."""
+
+
 # ================= ЧИСЛА =================
 
 def D(x):
@@ -783,8 +787,10 @@ async def resolve_coin(coin, cfg):
     else:
         htx = [c for c in chains if matches_net(
             net, c.get("baseChain"), c.get("baseChainProtocol"), c.get("displayName"), c.get("chain"))]
-    if len(htx) != 1:
-        found = ", ".join(c.get("chain", "?") for c in chains) or "нет"
+    found = ", ".join(c.get("chain", "?") for c in chains) or "нет ни одной"
+    if not htx:
+        raise NetworkMissing(f"на HTX у {coin} нет сети {NET_TITLES[net]} (есть: {found})")
+    if len(htx) > 1:
         raise ExchangeError(
             f"HTX: не удалось однозначно найти сеть {NET_TITLES[net]} для {coin} "
             f"(сети на HTX: {found}). Укажи вручную: /arb_add {coin} {cfg['pct']} {net} htx=<код>")
@@ -795,8 +801,10 @@ async def resolve_coin(coin, cfg):
         mx = [n for n in nets if cfg["mexc_net"] in (n.get("netWork"), n.get("network"))]
     else:
         mx = [n for n in nets if matches_net(net, n.get("netWork"), n.get("network"))]
-    if len(mx) != 1:
-        found = ", ".join(str(n.get("netWork") or n.get("network")) for n in nets) or "нет"
+    found = ", ".join(str(n.get("netWork") or n.get("network")) for n in nets) or "нет ни одной"
+    if not mx:
+        raise NetworkMissing(f"на MEXC у {coin} нет сети {NET_TITLES[net]} (есть: {found})")
+    if len(mx) > 1:
         raise ExchangeError(
             f"MEXC: не удалось однозначно найти сеть {NET_TITLES[net]} для {coin} "
             f"(сети на MEXC: {found}). Укажи вручную: /arb_add {coin} {cfg['pct']} {net} mexc=<имя>")
@@ -990,6 +998,10 @@ async def try_start(coin, cfg, opp):
     try:
         res = await resolve_coin(coin, cfg)
         wallet_address(cfg["net"])
+    except NetworkMissing as e:
+        await note_once(f"nonet:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {e} — пропускаю.",
+                        every=3 * 3600)
+        return False
     except Exception as e:
         await note_once(f"cfg:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}% есть, но сделку начать нельзя:\n{e}")
         return False
