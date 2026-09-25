@@ -1212,14 +1212,28 @@ async def stage_withdraw(d):
         d["wallet_baseline"] = await wallet_balance(cfg["net"], res["token"])
 
     free, _ = await htx_balance(hcoin(coin, cfg))
-    amount = round_down(free - res["htx_fee"], res["htx_withdraw_step"])
+    base = free - res["htx_fee"]
+    amount = round_down(base, res["htx_withdraw_step"])
     if amount <= 0 or amount < res["htx_min_withdraw"]:
         await start_rescue(d, f"сумма к выводу {fmt(amount)} меньше минимума HTX {fmt(res['htx_min_withdraw'])}")
         return
-    try:
-        wid = await htx_withdraw(wallet_address(cfg["net"]), hcoin(coin, cfg), amount, res["htx_chain"], res["htx_fee"])
-    except ExchangeError as e:
-        await start_rescue(d, f"HTX отклонил заявку на вывод: {e}")
+    # HTX часто не отдаёт комиссию вывода (или отдаёт неверную), и тогда заявка на
+    # весь баланс отклоняется из-за нехватки на комиссию. Поэтому при отказе
+    # пробуем ещё раз с запасом 1% / 3% / 5% — и только потом считаем вывод закрытым.
+    wid, errors = None, []
+    for share in ("1", "0.99", "0.97", "0.95"):
+        amount = round_down(base * D(share), res["htx_withdraw_step"])
+        if amount < res["htx_min_withdraw"]:
+            break
+        try:
+            wid = await htx_withdraw(wallet_address(cfg["net"]), hcoin(coin, cfg), amount,
+                                     res["htx_chain"], res["htx_fee"])
+            break
+        except ExchangeError as e:
+            errors.append(str(e))
+            await asyncio.sleep(1)
+    if wid is None:
+        await start_rescue(d, "HTX отклонил заявку на вывод: " + (errors[-1] if errors else "сумма меньше минимума"))
         return
     d["withdraw_id"], d["withdraw_at"], d["cur_withdraw"] = str(wid), time.time(), str(amount)
     d["stage"] = "withdraw_check"
