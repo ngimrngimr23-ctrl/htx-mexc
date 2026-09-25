@@ -1759,24 +1759,6 @@ async def _guard(message: types.Message):
     return True
 
 
-def _coins_text():
-    if not arb["coins"]:
-        return "— список пуст (/arb_add)"
-    rows = []
-    for coin, c in sorted(arb["coins"].items()):
-        extra = f", проба {c['probe']}$" if c.get("probe") else ", сразу весь баланс"
-        manual = []
-        if c.get("htx_chain"):
-            manual.append(f"htx={c['htx_chain']}")
-        if c.get("mexc_net"):
-            manual.append(f"mexc={c['mexc_net']}")
-        if c.get("htx_coin"):
-            manual.append(f"на HTX тикер {c['htx_coin']}")
-        rows.append(f"• <b>{coin}</b> — от {c['pct']}%, {NET_TITLES[c['net']]}{extra}"
-                    + (f" ({' '.join(manual)})" if manual else ""))
-    return "\n".join(rows)
-
-
 def _keys_text():
     def mark(ok):
         return "✅" if ok else "❌"
@@ -1797,36 +1779,12 @@ def _keys_text():
 
 @router.message(Command("arb"))
 async def cmd_arb(message: types.Message):
-    if not await _guard(message):
-        return
-    if deal:
-        deal_text = f"{deal['coin']} — этап «{deal['stage']}», фаза {deal['phase']}"
-    else:
-        deal_text = "нет"
-    await message.answer(
-        "🤖 <b>Автоарбитраж HTX → кошелёк → MEXC</b>\n"
-        f"Состояние: <b>{'ВКЛ' if arb['enabled'] else 'ВЫКЛ'}</b> · "
-        f"режим: <b>{'🧪 ТЕСТ (ничего не покупает)' if arb['dry_run'] else '💸 РЕАЛЬНЫЕ СДЕЛКИ'}</b>\n"
-        f"Активная сделка: {deal_text}\n"
-        f"Аварийных продаж на HTX: {len(rescues)} · тревог: {len(alarms)}\n\n"
-        f"<b>Монеты:</b>\n{_coins_text()}\n\n"
-        f"<b>Продажа на MEXC:</b> шаг −{arb['step_pct']}% каждые {arb['step_sec']} сек., "
-        f"пол −{arb['floor_pct']}% от безубытка\n"
-        f"<b>Проверка вывода HTX:</b> через {arb['check_sec']} сек.\n"
-        f"<b>Проверка спреда:</b> каждые {arb['poll_sec']:g} сек., стакан MEXC при покупке: "
-        f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}\n\n"
-        f"{_keys_text()}\n\n"
-        "Команды: /arb_help",
-        parse_mode="HTML")
-
-
-@router.message(Command("arb_status"))
-async def cmd_status(message: types.Message):
-    """Живой статус: спред по каждой монете прямо сейчас, сделка, балансы, тревоги."""
+    """Всё об автоарбитраже одной командой: живой спред по каждой монете,
+    текущая сделка, балансы, тревоги и настройки."""
     if not await _guard(message):
         return
     lines = [
-        "📡 <b>Статус автоарбитража</b>",
+        "🤖 <b>Автоарбитраж HTX → кошелёк → MEXC</b>",
         f"{'▶️ ВКЛ' if arb['enabled'] else '⏸ ВЫКЛ'} · "
         f"{'🧪 тест' if arb['dry_run'] else '💸 реальные сделки'} · "
         f"цикл был {_ago(engine_state['last_pass'])} назад (каждые {arb['poll_sec']:g} сек)",
@@ -1853,7 +1811,9 @@ async def cmd_status(message: types.Message):
             lines.append(f"• <b>{coin}</b>{pair}: ⚠️ {err}")
         else:
             mark = "🟢" if sp >= cfg["pct"] else "⚪"
-            lines.append(f"• {mark} <b>{coin}</b>{pair}: <b>{sp:+.2f}%</b> (порог {cfg['pct']}%)")
+            lines.append(f"• {mark} <b>{coin}</b>{pair}: <b>{sp:+.2f}%</b> (порог {cfg['pct']}%, "
+                         f"{NET_TITLES.get(cfg['net'], cfg['net'])}"
+                         + (f", проба {cfg['probe']:g}$" if cfg.get("probe") else "") + ")")
 
     # --- Сделка ---
     lines.append("\n<b>Сделка:</b>")
@@ -1889,6 +1849,18 @@ async def cmd_status(message: types.Message):
     except Exception as e:
         lines.append(f"MEXC: ошибка — {str(e)[:80]}")
 
+    # --- Настройки ---
+    lines += [
+        "",
+        "<b>Настройки:</b>",
+        f"продажа на MEXC: шаг −{arb['step_pct']}% каждые {arb['step_sec']} сек., пол −{arb['floor_pct']}% от безубытка",
+        f"проверка вывода HTX через {arb['check_sec']} сек. · стакан MEXC при покупке: "
+        f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}",
+        "",
+        _keys_text(),
+        "",
+        "Команды: /arb_help",
+    ]
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -1898,8 +1870,7 @@ async def cmd_help(message: types.Message):
         return
     await message.answer(
         "📖 <b>Команды автоарбитража</b>\n"
-        "/arb — настройки и список монет\n"
-        "/arb_status — живой статус: спред сейчас, сделка, балансы\n"
+        "/arb — статус: спред по монетам сейчас, сделка, балансы, настройки\n"
         "/arb_add PEPE 3 bsc — торговать PEPE от 3% в сети BNB, сразу на весь баланс\n"
         "/arb_add PEPE 3 bsc 150 — то же, но сперва проба на 150$, после успешного вывода — весь баланс\n"
         f"   сети: {nets_list_text()} (свои EVM-сети — /arb_net)\n"
@@ -2367,8 +2338,7 @@ async def start():
 
 
 BOT_COMMANDS = [
-    ("arb", "Автоарбитраж: настройки и монеты"),
-    ("arb_status", "Автоарбитраж: спред сейчас, сделка, балансы"),
+    ("arb", "Автоарбитраж: статус, спред, сделка, балансы"),
     ("arb_help", "Автоарбитраж: помощь"),
     ("arb_add", "Добавить монету: PEPE 3 bsc [проба$]"),
     ("arb_del", "Убрать монету из автоарбитража"),
