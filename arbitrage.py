@@ -120,7 +120,10 @@ arb = {
     "floor_pct": 1.2,      # ниже безубытка минус этот % не опускаемся
     "check_sec": 60,       # через сколько после заявки на вывод смотреть баланс HTX
     "spam_sec": 1.0,       # период спама при аварии
-    "poll_sec": 2.0,       # как часто проверять спред по монетам из списка
+    "poll_sec": 1.0,       # как часто проверять спред по монетам из списка (/arb_set poll)
+    # Учитывать стакан MEXC при покупке: брать на HTX только столько, сколько на
+    # MEXC сейчас покупают с нужным %, а не ориентироваться на одну лучшую цену.
+    "mexc_depth": True,
 }
 
 deal = None       # активная сделка (одна за раз: покупка идёт на весь баланс)
@@ -340,7 +343,7 @@ async def htx_symbol(sym):
 
 async def htx_depth(sym):
     tick = await htx_req("GET", "/market/depth",
-                         {"symbol": sym.lower(), "type": "step0", "depth": 20}, signed=False)
+                         {"symbol": sym.lower(), "type": "step0"}, signed=False)
     asks = [(D(p), D(q)) for p, q in (tick or {}).get("asks", [])]
     bids = [(D(p), D(q)) for p, q in (tick or {}).get("bids", [])]
     return bids, asks
@@ -499,7 +502,7 @@ async def mexc_req(method, path, params=None, signed=True):
 
 
 async def mexc_depth(sym):
-    data = await mexc_req("GET", "/api/v3/depth", {"symbol": sym, "limit": 20}, signed=False)
+    data = await mexc_req("GET", "/api/v3/depth", {"symbol": sym, "limit": 100}, signed=False)
     bids = [(D(p), D(q)) for p, q in data.get("bids", [])]
     asks = [(D(p), D(q)) for p, q in data.get("asks", [])]
     return bids, asks
@@ -1032,23 +1035,43 @@ async def check_opportunity(coin, cfg):
     if hasks[0][0] > max_price:
         return None
     spread = (mexc_bid - hasks[0][0]) / hasks[0][0] * 100
-    return {"mexc_bid": mexc_bid, "max_price": max_price, "asks": hasks, "spread": spread}
+    return {"mexc_bid": mexc_bid, "max_price": max_price, "asks": hasks, "bids": mbids,
+            "spread": spread, "pct": D(cfg["pct"])}
 
 
-def plan_buy(asks, max_price, budget):
-    """Сколько монет можно купить по ордерам на продажу не дороже max_price на
-    сумму не больше budget. Возвращает (кол-во, примерная стоимость)."""
-    qty, cost = D(0), D(0)
+def plan_buy(asks, max_price, budget, bids=None, pct=None):
+    """Сколько монет купить по ордерам на продажу HTX не дороже max_price на
+    сумму не больше budget. Если переданы bids (стакан покупателей MEXC) и pct,
+    каждая порция берётся, только если на MEXC её прямо сейчас покупают с
+    выгодой не ниже pct — чтобы не выкупить на HTX больше, чем MEXC реально
+    примет по нужной цене. Возвращает (кол-во, стоимость, последняя цена HTX)."""
+    qty, cost, last = D(0), D(0), None
+    bi = 0
+    bid_left = bids[0][1] if bids else D(0)
     for price, level_qty in asks:
         if price > max_price:
             break
-        can = (budget - cost) / price
-        take = min(level_qty, can)
+        avail = level_qty
+        if bids is not None:
+            need = price * (1 + pct / 100)
+            matched = D(0)
+            while bi < len(bids) and bids[bi][0] >= need and matched < avail:
+                t = min(bid_left, avail - matched)
+                matched += t
+                bid_left -= t
+                if bid_left <= 0:
+                    bi += 1
+                    bid_left = bids[bi][1] if bi < len(bids) else D(0)
+            avail = matched
+        take = min(avail, (budget - cost) / price)
         if take <= 0:
             break
         qty += take
         cost += take * price
-    return qty, cost
+        last = price
+        if take < level_qty:
+            break
+    return qty, cost, last
 
 
 def ladder_price(breakeven, k, step_pct, floor_pct, best_other_ask, tick):
@@ -1078,9 +1101,19 @@ async def engine_loop():
     while True:
         try:
             if arb["enabled"] and deal is None and not rescues and arb["coins"]:
-                for coin, cfg in list(arb["coins"].items()):
-                    opp = await check_opportunity(coin, cfg)
-                    if opp and await try_start(coin, cfg, opp):
+                # Все монеты списка проверяются ПАРАЛЛЕЛЬНО: время прохода = одному
+                # запросу, а не сумме по монетам. Первой пробуем монету с большим спредом.
+                coins = list(arb["coins"].items())
+                opps = await asyncio.gather(*[check_opportunity(c, cfg) for c, cfg in coins],
+                                            return_exceptions=True)
+                found = []
+                for (coin, cfg), opp in zip(coins, opps):
+                    if isinstance(opp, Exception):
+                        await note_once(f"chk:{coin}", f"⚠️ <b>{coin}</b>: не удалось проверить спред: <code>{opp}</code>", every=1800)
+                    elif opp:
+                        found.append((opp["spread"], coin, cfg, opp))
+                for _, coin, cfg, opp in sorted(found, key=lambda x: x[0], reverse=True):
+                    if await try_start(coin, cfg, opp):
                         break
         except Exception as e:
             await note_once("engine_err", f"⚠️ Автоарбитраж: ошибка цикла: <code>{e}</code>", every=600)
@@ -1121,10 +1154,13 @@ async def try_start(coin, cfg, opp):
             usdt = fmt((await htx_balance("usdt"))[0])
         except Exception:
             pass
+        _, can_cost, _ = plan_buy(opp["asks"], opp["max_price"], D(10) ** 9,
+                                  opp["bids"] if arb.get("mexc_depth", True) else None, opp["pct"])
         await note_once(f"dry:{coin}", (
             f"🧪 <b>ТЕСТ</b> · <b>{coin}</b>: спред {opp['spread']:.2f}% (мин. {cfg['pct']}%)\n"
             f"Купил бы на HTX по цене не выше {fmt(opp['max_price'])} "
             f"(MEXC bid {fmt(opp['mexc_bid'])}), USDT на HTX: {usdt}\n"
+            f"С соблюдением {cfg['pct']}% по стаканам сейчас можно купить на ~{fmt(can_cost)}$\n"
             f"{'Проба ' + str(cfg['probe']) + '$, потом весь баланс' if cfg.get('probe') else 'Сразу на весь баланс'}\n"
             f"Сеть: HTX <code>{res['htx_chain']}</code> → кошелёк "
             f"<code>{wallet_address(cfg['net'])}</code> → MEXC "
@@ -1173,6 +1209,11 @@ async def run_deal():
 async def stage_buy(d):
     coin, cfg = d["coin"], d["cfg"]
     sym = f"{hcoin(coin, cfg)}USDT"
+    # Повторный вход после сбоя (обрыв связи, рестарт) уже ПОСЛЕ отправки ордера:
+    # не покупаем второй раз, а дочитываем результат того же ордера.
+    if d.get("buy_order"):
+        await finish_buy(d, d["buy_order"], None)
+        return
     budget, _ = await htx_balance("usdt")
     if d["phase"] == "probe":
         budget = min(budget, D(cfg["probe"]))
@@ -1190,14 +1231,42 @@ async def stage_buy(d):
 
     info = await htx_symbol(sym)
     price = round_down(opp["max_price"], info["tick"])
-    qty, _ = plan_buy(opp["asks"], price, budget)
+    if arb.get("mexc_depth", True):
+        qty, _, last = plan_buy(opp["asks"], price, budget, opp["bids"], opp["pct"])
+        if last is not None:
+            price = min(price, round_up(last, info["tick"]))
+    else:
+        qty, _, _ = plan_buy(opp["asks"], price, budget)
     qty = round_down(qty, info["step"])
     if qty <= 0 or qty < info["min_qty"] or qty * price < info["min_value"]:
         d["stage"] = "wallet_wait" if D(d["expected"]) > 0 else "done"
         return
 
-    order_id = await htx_place(sym, "buy-ioc", qty, price)
+    d["buy_order"] = "pending"
+    await save()
+    try:
+        order_id = await htx_place(sym, "buy-ioc", qty, price)
+    except ExchangeError:
+        # HTX явно ответил отказом — ордера нет, можно спокойно пробовать снова.
+        d["buy_order"] = None
+        raise
+    d["buy_order"] = order_id
+    await save()
+    await finish_buy(d, order_id, opp)
+
+
+async def finish_buy(d, order_id, opp):
+    coin = d["coin"]
+    if order_id == "pending":
+        # Упали между отправкой ордера и получением его номера — номера нет,
+        # узнать исполнение нельзя. Безопаснее не покупать повторно и отдать человеку.
+        d["buy_order"] = None
+        d["stage"] = "wallet_wait" if D(d["expected"]) > 0 else "done"
+        await notify(f"⚠️ <b>{coin}</b>: сбой в момент отправки ордера на покупку — проверь HTX вручную. "
+                     f"Повторно бот не покупает.")
+        return
     o = await htx_wait_final(order_id)
+    d["buy_order"] = None
     if o["filled"] <= 0:
         await notify(f"ℹ️ <b>{coin}</b>: ордер на HTX не исполнился (цены ушли).")
         d["stage"] = "wallet_wait" if D(d["expected"]) > 0 else "done"
@@ -1207,7 +1276,7 @@ async def stage_buy(d):
     await notify(
         f"🟢 <b>{coin}</b> {'проба' if d['phase'] == 'probe' else 'покупка'} на HTX: "
         f"{fmt(o['filled'])} шт. на {fmt(o['cash'])}$ · ср. цена {fmt(avg)} "
-        f"(спред был {opp['spread']:.2f}%)")
+        + (f"(спред был {opp['spread']:.2f}%)" if opp else "(дочитан после сбоя)"))
     d["stage"] = "withdraw"
 
 
@@ -1240,6 +1309,15 @@ async def stage_withdraw(d):
         except ExchangeError as e:
             errors.append(str(e))
             await asyncio.sleep(1)
+        except Exception:
+            # Обрыв связи: заявка могла и уйти. Если монеты на HTX уже заморожены —
+            # считаем, что ушла, и не подаём вторую.
+            await asyncio.sleep(3)
+            now_free, _ = await htx_balance(hcoin(coin, cfg))
+            if now_free < free * D("0.1"):
+                wid = "unknown"
+                break
+            raise
     if wid is None:
         await start_rescue(d, "HTX отклонил заявку на вывод: " + (errors[-1] if errors else "сумма меньше минимума"))
         return
@@ -1580,7 +1658,9 @@ async def cmd_arb(message: types.Message):
         f"<b>Монеты:</b>\n{_coins_text()}\n\n"
         f"<b>Продажа на MEXC:</b> шаг −{arb['step_pct']}% каждые {arb['step_sec']} сек., "
         f"пол −{arb['floor_pct']}% от безубытка\n"
-        f"<b>Проверка вывода HTX:</b> через {arb['check_sec']} сек.\n\n"
+        f"<b>Проверка вывода HTX:</b> через {arb['check_sec']} сек.\n"
+        f"<b>Проверка спреда:</b> каждые {arb['poll_sec']:g} сек., стакан MEXC при покупке: "
+        f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}\n\n"
         f"{_keys_text()}\n\n"
         "Команды: /arb_help",
         parse_mode="HTML")
@@ -1604,7 +1684,8 @@ async def cmd_help(message: types.Message):
         "/arb_chains PEPE — сети монеты на HTX и MEXC и что выбрал бот\n"
         "/arb_on · /arb_off — включить/выключить автоторговлю\n"
         "/arb_live on · /arb_live off — реальные сделки / тестовый режим\n"
-        "/arb_set step 0.3 · interval 120 · floor 1.2 · check 60 — параметры\n"
+        "/arb_set step 0.3 · interval 120 · floor 1.2 · check 60 · poll 1 — параметры\n"
+        "/arb_set depth on|off — учитывать стакан MEXC при покупке (по умолчанию on)\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
@@ -1948,14 +2029,21 @@ async def cmd_set(message: types.Message, command: CommandObject):
         return
     keys = {"step": ("step_pct", float), "interval": ("step_sec", int),
             "floor": ("floor_pct", float), "check": ("check_sec", int),
-            "spam": ("spam_sec", float)}
+            "spam": ("spam_sec", float), "poll": ("poll_sec", float)}
     args = (command.args or "").split()
+    if len(args) == 2 and args[0].lower() == "depth" and args[1].lower() in ("on", "off"):
+        arb["mexc_depth"] = args[1].lower() == "on"
+        await save()
+        await message.answer(f"✅ Стакан MEXC при покупке: {'учитывается' if arb['mexc_depth'] else 'только лучшая цена'}")
+        return
     try:
         key, conv = keys[args[0].lower()]
         arb[key] = abs(conv(float(args[1].replace(",", "."))))
+        if key == "poll_sec":
+            arb[key] = max(0.5, arb[key])
     except Exception:
         await message.answer("Пример: /arb_set step 0.3 · /arb_set interval 120 · "
-                             "/arb_set floor 1.2 · /arb_set check 60 · /arb_set spam 1")
+                             "/arb_set floor 1.2 · /arb_set check 60 · /arb_set spam 1 · /arb_set poll 1")
         return
     await save()
     await message.answer(f"✅ {args[0]} = {arb[key]}")
