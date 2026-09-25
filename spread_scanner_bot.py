@@ -627,7 +627,8 @@ async def debug_cmd(message: types.Message):
         f"📡 HTX (bid/ask + объём): {huobi_status}",
         f"📡 HTX (статус ввода/вывода): {htx_transfer_status}",
         f"📡 MEXC (контракты монет): {contracts_status}",
-        f"1️⃣ Общих USDT-пар на обеих биржах: {debug_stats['common_pairs']}",
+        f"1️⃣ Общих USDT-пар на обеих биржах: {debug_stats['common_pairs']} "
+        f"(из них с разным тикером, но тем же контрактом: {debug_stats.get('pairs_by_contract', 0)})",
         f"2️⃣ Прошли мин. объём 24ч на обеих биржах (/v): {debug_stats['passed_volume_floor']}",
         f"3️⃣ Пар с грязным спредом по лучшей цене ≥ {settings['spread_percent']:g}%: {debug_stats['passed_spread_filter']} "
         f"(отсечено как неправдоподобно большой спред > /spmax: {debug_stats['blocked_by_sanity']})",
@@ -1198,6 +1199,49 @@ def _withdraw_fee_usd(c):
     return None
 
 
+def build_pair_map(mexc_data, huobi_data, htx_transfer, mexc_contracts):
+    """Какую пару MEXC с какой парой HTX сравнивать: {"ABCUSDT": "ABCNEWUSDT", ...}.
+
+    По умолчанию — одинаковые тикеры, как раньше. Если монета на MEXC и монета
+    на HTX с ТЕМ ЖЕ адресом контракта торгуются под разными тикерами —
+    сравниваем их. Где хоть одна биржа контракта не отдала, остаётся сравнение
+    по тикеру. Контракты уже лежат в кэше (два общих запроса на все монеты),
+    так что сверка идёт в памяти, без запросов по каждой монете."""
+    pair_map = {p: p for p in set(mexc_data) & set(huobi_data)}
+
+    ca_to_htx = {}
+    for cur, st in htx_transfer.items():
+        if f"{cur}USDT" not in huobi_data:
+            continue
+        for ch in st.get("chains", []):
+            ca = sq.norm_contract(ch.get("ca"))
+            if ca:
+                ca_to_htx.setdefault(ca, set()).add(cur)
+
+    by_contract = 0
+    for coin, nets in mexc_contracts.items():
+        mp = f"{coin}USDT"
+        if mp not in mexc_data:
+            continue
+        hits = set()
+        for n in nets:
+            ca = sq.norm_contract(n.get("contract"))
+            if ca:
+                hits |= ca_to_htx.get(ca, set())
+        if coin in hits or len(hits) != 1:
+            continue  # тот же тикер подтверждён контрактом, или сверить не по чему
+        hc = hits.pop()
+        m, h = mexc_data[mp], huobi_data[f"{hc}USDT"]
+        m_mid, h_mid = (m["bid"] + m["ask"]) / 2, (h["bid"] + h["ask"]) / 2
+        # Тот же контракт, но цена в разы другая — скорее всего другая деноминация
+        # пары (1000X против X); такое не сравниваем.
+        if m_mid > 0 and h_mid > 0 and abs(m_mid / h_mid - 1) <= 0.5:
+            pair_map[mp] = f"{hc}USDT"
+            by_contract += 1
+    debug_stats["pairs_by_contract"] = by_contract
+    return pair_map
+
+
 async def scanner_task():
     while True:
         try:
@@ -1219,7 +1263,8 @@ async def scanner_task():
                 await asyncio.sleep(settings["check_interval"])
                 continue
 
-            common = (set(mexc_data) & set(huobi_data)) - blacklist
+            pair_map = build_pair_map(mexc_data, huobi_data, htx_transfer, mexc_contracts)
+            common = set(pair_map) - blacklist
             debug_stats["common_pairs"] = len(common)
 
             now = time.time()
@@ -1241,7 +1286,7 @@ async def scanner_task():
                     del muted_until[pair]  # мут истёк — снимаем и чистим память
 
                 m = mexc_data[pair]
-                hpair = pair
+                hpair = pair_map[pair]  # пара на HTX (тикер может отличаться, если совпал контракт)
                 h = huobi_data[hpair]
 
                 if m["vol"] < settings["min_volume"] or h["vol"] < settings["min_volume"]:
@@ -1486,7 +1531,9 @@ async def scanner_task():
                     net_note = f"торговые {trade_fees:g}%; комиссия вывода неизвестна — не учтена"
 
                 lines = [
-                    f"🔀 <b>СПРЕД: <code>{base_coin}</code></b>",
+                    f"🔀 <b>СПРЕД: <code>{base_coin}</code></b>"
+                    + (f" (на HTX: <code>{c['htx_base']}</code>, тот же контракт)"
+                       if c["htx_base"] != base_coin else ""),
                     "",
                     f"💹 <b>{best_spread:+.2f}%</b> по лучшей цене · Купить на <b>{buy_ex}</b> ({fmt_price(buy_price)}) "
                     f"→ Продать на <b>{sell_ex}</b> ({fmt_price(sell_price)})",
