@@ -627,8 +627,7 @@ async def debug_cmd(message: types.Message):
         f"📡 HTX (bid/ask + объём): {huobi_status}",
         f"📡 HTX (статус ввода/вывода): {htx_transfer_status}",
         f"📡 MEXC (контракты монет): {contracts_status}",
-        f"1️⃣ Общих USDT-пар на обеих биржах: {debug_stats['common_pairs']} "
-        f"(из них с разным тикером, сопоставлено по контракту/сети: {debug_stats.get('pairs_by_contract', 0)})",
+        f"1️⃣ Общих USDT-пар на обеих биржах: {debug_stats['common_pairs']}",
         f"2️⃣ Прошли мин. объём 24ч на обеих биржах (/v): {debug_stats['passed_volume_floor']}",
         f"3️⃣ Пар с грязным спредом по лучшей цене ≥ {settings['spread_percent']:g}%: {debug_stats['passed_spread_filter']} "
         f"(отсечено как неправдоподобно большой спред > /spmax: {debug_stats['blocked_by_sanity']})",
@@ -1199,77 +1198,6 @@ def _withdraw_fee_usd(c):
     return None
 
 
-def _nets_overlap(htx_status, mexc_nets):
-    """Есть ли у монеты на HTX хоть одна сеть, совпадающая по названию с сетями MEXC."""
-    for h in (htx_status or {}).get("chains", []):
-        h_ids = sq.net_ids(*h.get("names", []))
-        if any(h_ids & sq.net_ids(*m.get("names", [])) for m in mexc_nets):
-            return True
-    return False
-
-
-def build_pair_map(mexc_data, huobi_data, htx_transfer, mexc_contracts):
-    """Какую пару MEXC с какой парой HTX сравнивать: {"MONUSDT": "MONADUSDT", ...}.
-
-    База — одинаковые тикеры. Поверх — сопоставление по АДРЕСУ КОНТРАКТА: если
-    на HTX монета с тем же контрактом торгуется под другим тикером, сравниваем с
-    ней (и находим монеты, которые по тикеру не сопоставились бы вовсе, и
-    заменяем ложную пару «тот же тикер — другая монета»). Нативные монеты сетей
-    (контракта нет) — по названию сети (MON на MEXC ↔ MONAD на HTX)."""
-    pair_map = {p: p for p in set(mexc_data) & set(huobi_data)}
-
-    ca_to_htx = {}
-    for cur, st in htx_transfer.items():
-        for ch in st.get("chains", []):
-            ca = sq.norm_contract(ch.get("ca"))
-            if ca:
-                ca_to_htx.setdefault(ca, set()).add(cur)
-
-    def similar_price(mp, hp, tol):
-        """Одна и та же монета не может стоить на двух биржах в разы по-разному."""
-        m, h = mexc_data[mp], huobi_data[hp]
-        m_mid, h_mid = (m["bid"] + m["ask"]) / 2, (h["bid"] + h["ask"]) / 2
-        return m_mid > 0 and h_mid > 0 and abs(m_mid / h_mid - 1) <= tol
-
-    by_contract = 0
-    for coin, nets in mexc_contracts.items():
-        mp = f"{coin}USDT"
-        if mp not in mexc_data:
-            continue
-        hits = set()
-        for n in nets:
-            ca = sq.norm_contract(n.get("contract"))
-            if ca:
-                hits |= ca_to_htx.get(ca, set())
-        hits = {h for h in hits if f"{h}USDT" in huobi_data}
-        if len(hits) == 1:
-            hc = hits.pop()
-            if hc != coin and similar_price(mp, f"{hc}USDT", 0.5):
-                pair_map[mp] = f"{hc}USDT"
-                by_contract += 1
-        elif not hits and (mp not in pair_map or not _nets_overlap(htx_transfer.get(coin), nets)):
-            # Нативная монета сети: контракта нет — ищем на HTX монету, у которой
-            # есть сеть с тем же названием, что у сети MEXC, и которая сама
-            # называется как эта сеть (Monad: MEXC MON / сеть MONAD → HTX MONAD).
-            for n in nets:
-                if sq.norm_contract(n.get("contract")):
-                    continue
-                for name in n.get("names", []):
-                    cand = re.sub(r"[^A-Z0-9]", "", str(name or "").upper())
-                    # Эвристика по названию сети ненадёжна (у токена без контракта в
-                    # ответе сеть «SOL» — не значит, что это сам SOL), поэтому
-                    # принимаем её, только если цены на биржах почти одинаковые.
-                    if (cand and cand != coin and f"{cand}USDT" in huobi_data and cand in htx_transfer
-                            and similar_price(mp, f"{cand}USDT", 0.1)):
-                        pair_map[mp] = f"{cand}USDT"
-                        by_contract += 1
-                        break
-                if mp in pair_map:
-                    break
-    debug_stats["pairs_by_contract"] = by_contract
-    return pair_map
-
-
 async def scanner_task():
     while True:
         try:
@@ -1291,8 +1219,7 @@ async def scanner_task():
                 await asyncio.sleep(settings["check_interval"])
                 continue
 
-            pair_map = build_pair_map(mexc_data, huobi_data, htx_transfer, mexc_contracts)
-            common = set(pair_map) - blacklist
+            common = (set(mexc_data) & set(huobi_data)) - blacklist
             debug_stats["common_pairs"] = len(common)
 
             now = time.time()
@@ -1314,7 +1241,7 @@ async def scanner_task():
                     del muted_until[pair]  # мут истёк — снимаем и чистим память
 
                 m = mexc_data[pair]
-                hpair = pair_map[pair]  # пара на HTX (тикер может отличаться)
+                hpair = pair
                 h = huobi_data[hpair]
 
                 if m["vol"] < settings["min_volume"] or h["vol"] < settings["min_volume"]:
@@ -1559,9 +1486,7 @@ async def scanner_task():
                     net_note = f"торговые {trade_fees:g}%; комиссия вывода неизвестна — не учтена"
 
                 lines = [
-                    f"🔀 <b>СПРЕД: <code>{base_coin}</code></b>"
-                    + (f" (на HTX: <code>{c['htx_base']}</code>, сопоставлено по контракту/сети)"
-                       if c["htx_base"] != base_coin else ""),
+                    f"🔀 <b>СПРЕД: <code>{base_coin}</code></b>",
                     "",
                     f"💹 <b>{best_spread:+.2f}%</b> по лучшей цене · Купить на <b>{buy_ex}</b> ({fmt_price(buy_price)}) "
                     f"→ Продать на <b>{sell_ex}</b> ({fmt_price(sell_price)})",
