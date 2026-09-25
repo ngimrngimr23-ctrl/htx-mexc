@@ -1538,7 +1538,9 @@ async def scanner_task():
                     f"💹 <b>{best_spread:+.2f}%</b> по лучшей цене · Купить на <b>{buy_ex}</b> ({fmt_price(buy_price)}) "
                     f"→ Продать на <b>{sell_ex}</b> ({fmt_price(sell_price)})",
                     depth_line,
-                    f"🧮 Чистый спред ≈ <b>{net:+.2f}%</b> (минус {net_note})",
+                    f"🧮 Чистый спред ≈ <b>{net:+.2f}%</b>"
+                    + (f" = <b>{tradable_usd * net / 100:+,.2f}$</b> с {fmt_money(tradable_usd)}$" if tradable_usd else "")
+                    + f" (минус {net_note})",
                     "",
                     f"📥 MEXC: bid {fmt_price(m['bid'])} / ask {fmt_price(m['ask'])}",
                     f"📤 HTX: bid {fmt_price(h['bid'])} / ask {fmt_price(h['ask'])}",
