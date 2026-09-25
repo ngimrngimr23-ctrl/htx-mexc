@@ -174,6 +174,10 @@ class NetworkMissing(ExchangeError):
     """Нужной сети у монеты на бирже просто нет — не ошибка, а повод пропустить монету."""
 
 
+class CoinNotOnMexc(NetworkMissing):
+    """Монеты с таким тикером на MEXC нет — добавлять её в список бессмысленно."""
+
+
 class ContractMismatch(ExchangeError):
     """Контракты на HTX и MEXC разные — это две разные монеты с одним тикером."""
 
@@ -885,7 +889,7 @@ async def resolve_coin(coin, cfg):
     # ---- MEXC: сеть и контракт — это «эталон», с которым сверяем HTX ----
     nets = await mexc_networks(coin)
     if not nets:
-        raise NetworkMissing(f"монеты {coin} нет на MEXC — проверь тикер (как в паре {coin}/USDT на бирже)")
+        raise CoinNotOnMexc(f"монеты {coin} нет на MEXC — проверь тикер (как в паре {coin}/USDT на бирже)")
     if cfg.get("mexc_net"):
         mx = [n for n in nets if cfg["mexc_net"] in (n.get("netWork"), n.get("network"))]
     else:
@@ -1808,10 +1812,24 @@ async def cmd_add(message: types.Message, command: CommandObject):
         await message.answer("❌ Пример: /arb_add PEPE 3 bsc  или  /arb_add PEPE 3 bsc 150\n"
                              f"Сети: {nets_list_text()}", parse_mode="HTML")
         return
-    arb["coins"][coin] = cfg
-    await save()
     text = f"✅ <b>{coin}</b>: от {pct}% · {NET_TITLES[net]} · " + \
            (f"проба {cfg['probe']}$ → весь баланс" if cfg["probe"] else "сразу весь баланс")
+    try:
+        # Тикер пишется как на MEXC (там продаём). Нет пары на MEXC — не добавляем.
+        pair_ok = True
+        try:
+            await mexc_symbol(f"{coin}USDT")
+        except ExchangeError:
+            pair_ok = False
+        if not pair_ok:
+            raise CoinNotOnMexc(f"пары {coin}/USDT нет на MEXC")
+    except CoinNotOnMexc as e:
+        await message.answer(f"❌ <b>{coin}</b> не добавлена: {e}.\n"
+                             f"Пиши тикер как на MEXC — если на HTX он другой, бот найдёт его сам.",
+                             parse_mode="HTML")
+        return
+    arb["coins"][coin] = cfg
+    await save()
     try:
         res = await resolve_coin(coin, cfg)
         if res["htx_ticker_auto"]:
