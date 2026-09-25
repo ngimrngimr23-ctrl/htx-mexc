@@ -833,6 +833,37 @@ async def wallet_send_all(net, token, to):
 
 # ================= СОПОСТАВЛЕНИЕ СЕТЕЙ =================
 
+_htx_pairs = {"ts": 0.0, "by_base": {}}
+
+
+async def htx_usdt_pair(currency):
+    """Настоящее имя спотовой пары монеты к USDT на HTX (например «monadusdt»)
+    по коду монеты — из общего списка пар HTX, а не склейкой строк. None, если
+    такой пары нет. Список кэшируется на час."""
+    if time.time() - _htx_pairs["ts"] > 3600 or not _htx_pairs["by_base"]:
+        by_base = {}
+        try:
+            rows = await htx_req("GET", "/v1/settings/common/market-symbols", signed=False)
+            for r in rows or []:
+                if str(r.get("qc", "")).lower() == "usdt" and r.get("state", "online") == "online":
+                    by_base[str(r.get("bc", "")).lower()] = r.get("symbol")
+        except ExchangeError:
+            pass
+        if not by_base:
+            rows = await htx_req("GET", "/v1/common/symbols", signed=False)
+            for r in rows or []:
+                if str(r.get("quote-currency", "")).lower() == "usdt" and r.get("state", "online") == "online":
+                    by_base[str(r.get("base-currency", "")).lower()] = r.get("symbol")
+        _htx_pairs.update(ts=time.time(), by_base=by_base)
+    return _htx_pairs["by_base"].get(currency.lower())
+
+
+def hsym(coin, cfg):
+    """Имя пары на HTX для запросов стакана/ордеров: найденное и сохранённое при
+    сверке монеты (cfg["htx_symbol"]), иначе — по тикеру."""
+    return (cfg.get("htx_symbol") or f"{hcoin(coin, cfg)}usdt").lower()
+
+
 def hcoin(coin, cfg):
     """Тикер монеты на HTX. Обычно совпадает с MEXC, но не всегда: Monad на HTX —
     MONAD, на MEXC — MON (а MON на HTX — вообще другая монета, PixelMon)."""
@@ -915,6 +946,8 @@ async def resolve_coin(coin, cfg):
         chains = await htx_chains(ticker)
         if not chains:
             return chains, None, None, "нет"
+        if not await htx_usdt_pair(ticker):  # есть ли у этой монеты спотовая пара с USDT
+            return chains, None, None, "нет пары"
         cand = _net_chains(chains, net, cfg)
         if not cand:
             return chains, None, None, "нет сети"
@@ -928,7 +961,7 @@ async def resolve_coin(coin, cfg):
     auto_how = None
     hc = hcoin(coin, cfg)
     chains, htx, htx_ca, problem = await check_htx(hc)
-    if problem and problem != "много сетей" and not cfg.get("htx_coin"):
+    if problem and problem not in ("много сетей",) and not cfg.get("htx_coin_manual"):
         alt, how = await find_htx_ticker(coin, net, token, cfg)
         if alt:
             alt_res = await check_htx(alt)
@@ -940,6 +973,8 @@ async def resolve_coin(coin, cfg):
     found = ", ".join(c.get("chain", "?") for c in chains) or "нет ни одной"
     if problem == "нет":
         raise NetworkMissing(f"монеты {coin} нет на HTX (ни под этим тикером, ни по контракту/сети)")
+    if problem == "нет пары":
+        raise NetworkMissing(f"на HTX нет торговой пары {hc}/USDT (монета {hc} есть, но торговать её там нельзя)")
     if problem == "нет сети":
         raise NetworkMissing(f"на HTX у {hc} нет сети {NET_TITLES[net]} (есть: {found}), "
                              f"и по {'контракту' if token else 'названию сети'} другой тикер не нашёлся")
@@ -952,6 +987,15 @@ async def resolve_coin(coin, cfg):
             f"контракты разные — это РАЗНЫЕ монеты, а монеты с контрактом MEXC на HTX не нашлось.\n"
             f"HTX ({hc}): <code>{htx_ca}</code>\nMEXC ({coin}): <code>{token}</code>")
 
+    # Запоминаем найденную монету и НАСТОЯЩЕЕ имя пары на HTX — дальше стакан и
+    # ордера идут строго по ним, а не по тикеру с MEXC.
+    pair = await htx_usdt_pair(hc)
+    if cfg.get("htx_symbol") != pair or (hc != coin.upper() and cfg.get("htx_coin") != hc):
+        cfg["htx_symbol"] = pair
+        if hc != coin.upper():
+            cfg["htx_coin"] = hc
+        auto_how = auto_how or "обновлена пара"
+
     if token:
         contract_status = "ok" if htx_ca else "unknown"
     else:
@@ -961,6 +1005,7 @@ async def resolve_coin(coin, cfg):
 
     return {
         "htx_ticker": hc,
+        "htx_pair": pair,
         "htx_ticker_auto": auto_how,
         "htx_chain": htx.get("chain"),
         # Вывод «открыт», только если ни один из двух источников HTX не говорит обратное.
@@ -1095,7 +1140,12 @@ async def load():
 async def check_opportunity(coin, cfg):
     """Спред HTX→MEXC по лучшим ценам. None, если ниже минимума."""
     sym = f"{coin}USDT"
-    (mbids, _), (_, hasks) = await asyncio.gather(mexc_depth(sym), htx_depth(f"{hcoin(coin, cfg)}USDT"))
+    hpair = hsym(coin, cfg)
+    try:
+        (mbids, _), (_, hasks) = await asyncio.gather(mexc_depth(sym), htx_depth(hpair))
+    except ExchangeError as e:
+        # Чтобы из ошибки было видно, по какой именно паре спрашивали каждую биржу.
+        raise ExchangeError(f"MEXC {sym} / HTX {hpair}: {e}")
     if not mbids or not hasks:
         return None
     mexc_bid = mbids[0][0]
@@ -1171,7 +1221,19 @@ async def engine_loop():
             if arb["enabled"] and deal is None and not rescues and arb["coins"]:
                 # Все монеты списка проверяются ПАРАЛЛЕЛЬНО: время прохода = одному
                 # запросу, а не сумме по монетам. Первой пробуем монету с большим спредом.
-                coins = list(arb["coins"].items())
+                # Сначала — монеты, для которых ещё не найдена настоящая пара на HTX:
+                # без этого спред считался бы по чужой монете с тем же тикером.
+                for coin, cfg in list(arb["coins"].items()):
+                    if not cfg.get("htx_symbol"):
+                        try:
+                            res = await resolve_coin(coin, cfg)
+                            await save()
+                            await notify(f"🔎 <b>{coin}</b>: на HTX это <b>{res['htx_ticker']}</b>, пара "
+                                         f"<code>{res['htx_pair']}</code> — дальше считаю спред по ней.")
+                        except Exception as e:
+                            await note_once(f"res:{coin}", f"⚠️ <b>{coin}</b>: не удалось найти монету на HTX: {e}",
+                                            every=1800)
+                coins = [(c, cfg) for c, cfg in arb["coins"].items() if cfg.get("htx_symbol")]
                 opps = await asyncio.gather(*[check_opportunity(c, cfg) for c, cfg in coins],
                                             return_exceptions=True)
                 found = []
@@ -1209,8 +1271,8 @@ async def try_start(coin, cfg, opp):
         # Тикер на HTX только что найден — этот спред считался по ЧУЖОЙ монете
         # с тем же тикером. Сохраняем и пересчитываем на следующем проходе.
         await save()
-        await notify(f"🔎 <b>{coin}</b>: на HTX это монета <b>{res['htx_ticker']}</b> "
-                     f"(нашёл {res['htx_ticker_auto']}), дальше считаю по ней.")
+        await notify(f"🔎 <b>{coin}</b>: на HTX это <b>{res['htx_ticker']}</b>, пара "
+                     f"<code>{res['htx_pair']}</code> — пересчитаю спред по ней.")
         return False
     if not res["htx_withdraw_ok"]:
         await note_once(f"wd:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но HTX явно пишет, что вывод в сети {res['htx_chain']} закрыт — пропускаю.")
@@ -1283,7 +1345,7 @@ async def run_deal():
 
 async def stage_buy(d):
     coin, cfg = d["coin"], d["cfg"]
-    sym = f"{hcoin(coin, cfg)}USDT"
+    sym = hsym(coin, cfg)
     # Повторный вход после сбоя (обрыв связи, рестарт) уже ПОСЛЕ отправки ордера:
     # не покупаем второй раз, а дочитываем результат того же ордера.
     if d.get("buy_order"):
@@ -1431,7 +1493,7 @@ async def start_rescue(d, reason):
     либо завершается (если это была проба/единственная покупка), либо едет
     дальше только с тем, что уже успешно выведено."""
     r = {
-        "id": uuid.uuid4().hex[:8], "coin": hcoin(d["coin"], d["cfg"]),
+        "id": uuid.uuid4().hex[:8], "coin": hcoin(d["coin"], d["cfg"]), "symbol": hsym(d["coin"], d["cfg"]),
         "breakeven": str(D(d["cur_cost"]) / D(d["cur_qty"])),
         "reason": reason, "order_id": None, "created": time.time(),
     }
@@ -1446,7 +1508,7 @@ async def start_rescue(d, reason):
 
 
 async def run_rescue(r):
-    coin, sym = r["coin"], f"{r['coin']}USDT"
+    coin, sym = r["coin"], r.get("symbol") or f"{r['coin']}usdt"
     aid = None
     try:
         info = await htx_symbol(sym)
@@ -1802,6 +1864,7 @@ async def cmd_add(message: types.Message, command: CommandObject):
         for a in args[3:]:
             if a.lower().startswith("htxcoin="):
                 cfg["htx_coin"] = re.sub(r"[^A-Z0-9]", "", a[8:].upper()) or None
+                cfg["htx_coin_manual"] = bool(cfg["htx_coin"])
             elif a.lower().startswith("htx="):
                 cfg["htx_chain"] = a[4:]
             elif a.lower().startswith("mexc="):
@@ -1834,7 +1897,9 @@ async def cmd_add(message: types.Message, command: CommandObject):
         res = await resolve_coin(coin, cfg)
         if res["htx_ticker_auto"]:
             await save()
-            text += f"\n🔎 На HTX эта монета — <b>{res['htx_ticker']}</b> (нашёл сам: {res['htx_ticker_auto']})"
+            if res["htx_ticker"] != coin:
+                text += f"\n🔎 На HTX эта монета — <b>{res['htx_ticker']}</b> (нашёл сам: {res['htx_ticker_auto']})"
+        text += f"\nПара на HTX: <code>{res['htx_pair']}</code> · на MEXC: <code>{coin}USDT</code>"
         text += (f"\nHTX сеть: <code>{res['htx_chain']}</code> (вывод {'открыт' if res['htx_withdraw_ok'] else 'ЗАКРЫТ'} по API)"
                  f"\nMEXC сеть: <code>{res['mexc_net'].get('netWork') or res['mexc_net'].get('network')}</code>"
                  f"\n{contract_line(coin, cfg, res)}")
