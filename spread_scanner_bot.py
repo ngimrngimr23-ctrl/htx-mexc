@@ -630,7 +630,8 @@ async def debug_cmd(message: types.Message):
         f"1️⃣ Общих USDT-пар на обеих биржах: {debug_stats['common_pairs']} "
         f"(из них с разным тикером, сопоставлено по контракту/сети: {debug_stats.get('pairs_by_contract', 0)})",
         f"2️⃣ Прошли мин. объём 24ч на обеих биржах (/v): {debug_stats['passed_volume_floor']}",
-        f"3️⃣ Грязный спред по лучшей цене ≥ /sp: {debug_stats['passed_spread_filter']} (отсечено сверху /spmax: {debug_stats['blocked_by_sanity']})",
+        f"3️⃣ Пар с грязным спредом по лучшей цене ≥ {settings['spread_percent']:g}%: {debug_stats['passed_spread_filter']} "
+        f"(отсечено как неправдоподобно большой спред > /spmax: {debug_stats['blocked_by_sanity']})",
         f"4️⃣ Прошли фильтр стабильности (/ss): {debug_stats['passed_stability']}",
         f"5️⃣ Прошли сверку контракта и общую сеть (/tr): {debug_stats['passed_transfer_check']} "
         f"(разные контракты: {debug_stats['blocked_by_contract']}, нет открытой общей сети: {debug_stats['blocked_by_transfer']}, "
@@ -1224,6 +1225,12 @@ def build_pair_map(mexc_data, huobi_data, htx_transfer, mexc_contracts):
             if ca:
                 ca_to_htx.setdefault(ca, set()).add(cur)
 
+    def similar_price(mp, hp, tol):
+        """Одна и та же монета не может стоить на двух биржах в разы по-разному."""
+        m, h = mexc_data[mp], huobi_data[hp]
+        m_mid, h_mid = (m["bid"] + m["ask"]) / 2, (h["bid"] + h["ask"]) / 2
+        return m_mid > 0 and h_mid > 0 and abs(m_mid / h_mid - 1) <= tol
+
     by_contract = 0
     for coin, nets in mexc_contracts.items():
         mp = f"{coin}USDT"
@@ -1237,7 +1244,7 @@ def build_pair_map(mexc_data, huobi_data, htx_transfer, mexc_contracts):
         hits = {h for h in hits if f"{h}USDT" in huobi_data}
         if len(hits) == 1:
             hc = hits.pop()
-            if hc != coin:
+            if hc != coin and similar_price(mp, f"{hc}USDT", 0.5):
                 pair_map[mp] = f"{hc}USDT"
                 by_contract += 1
         elif not hits and (mp not in pair_map or not _nets_overlap(htx_transfer.get(coin), nets)):
@@ -1249,7 +1256,11 @@ def build_pair_map(mexc_data, huobi_data, htx_transfer, mexc_contracts):
                     continue
                 for name in n.get("names", []):
                     cand = re.sub(r"[^A-Z0-9]", "", str(name or "").upper())
-                    if cand and cand != coin and f"{cand}USDT" in huobi_data and cand in htx_transfer:
+                    # Эвристика по названию сети ненадёжна (у токена без контракта в
+                    # ответе сеть «SOL» — не значит, что это сам SOL), поэтому
+                    # принимаем её, только если цены на биржах почти одинаковые.
+                    if (cand and cand != coin and f"{cand}USDT" in huobi_data and cand in htx_transfer
+                            and similar_price(mp, f"{cand}USDT", 0.1)):
                         pair_map[mp] = f"{cand}USDT"
                         by_contract += 1
                         break
