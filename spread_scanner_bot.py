@@ -213,6 +213,7 @@ debug_stats = {
     "depth_fallback": 0,
     "blocked_by_contract": 0,
     "route_unmatched": 0,
+    "blocked_by_net": 0,
     # Что HTX реально отдал по сетям (заполняет get_htx_transfer_status)
     "htx_data": {},
 }
@@ -292,7 +293,7 @@ async def start_cmd(message: types.Message):
         "в обе стороны — берётся направление с большим спредом.\n\n"
 
         "⚙️ <b>Команды</b>\n"
-        f"/sp 1.5 — мин. % спреда, чтобы сработал алерт (ПЕРВИЧНЫЙ критерий, общий для обоих направлений)\n"
+        f"/sp 1.5 — мин. ЧИСТЫЙ % спреда (после торговых комиссий и комиссии вывода), общий для обоих направлений\n"
         f"   └ сейчас: <b>{settings['spread_percent']}%</b>\n"
         f"/spm 2 — отдельный порог именно для направления MEXC→HTX (0 = использовать общий /sp)\n"
         f"   └ сейчас: <b>{spm_display}</b>\n"
@@ -358,7 +359,7 @@ async def set_spread(message: types.Message, command: CommandObject):
     try:
         val = abs(float(command.args.replace(',', '.')))
         settings["spread_percent"] = val
-        await message.answer(f"✅ Мин. % спреда для алерта: <b>{val}%</b>", parse_mode="HTML")
+        await message.answer(f"✅ Мин. ЧИСТЫЙ % спреда для алерта (после всех комиссий): <b>{val}%</b>", parse_mode="HTML")
         schedule_save()
     except Exception:
         await message.answer("❌ Ошибка. Пример: /sp 1.5")
@@ -629,13 +630,14 @@ async def debug_cmd(message: types.Message):
         f"1️⃣ Общих USDT-пар на обеих биржах: {debug_stats['common_pairs']} "
         f"(из них с разным тикером, сопоставлено по контракту/сети: {debug_stats.get('pairs_by_contract', 0)})",
         f"2️⃣ Прошли мин. объём 24ч на обеих биржах (/v): {debug_stats['passed_volume_floor']}",
-        f"3️⃣ Прошли порог спреда (/sp): {debug_stats['passed_spread_filter']} (отсечено сверху /spmax: {debug_stats['blocked_by_sanity']})",
+        f"3️⃣ Грязный спред по лучшей цене ≥ /sp: {debug_stats['passed_spread_filter']} (отсечено сверху /spmax: {debug_stats['blocked_by_sanity']})",
         f"4️⃣ Прошли фильтр стабильности (/ss): {debug_stats['passed_stability']}",
         f"5️⃣ Прошли сверку контракта и общую сеть (/tr): {debug_stats['passed_transfer_check']} "
         f"(разные контракты: {debug_stats['blocked_by_contract']}, нет открытой общей сети: {debug_stats['blocked_by_transfer']}, "
         f"сети не сопоставились: {debug_stats['route_unmatched']})",
         f"6️⃣ Прошли анти-спам (кулдаун /cd): {debug_stats['passed_cooldown']}",
-        f"7️⃣ Прошли фильтр мин. оборота по стакану (/mt): {debug_stats['passed_turnover_filter']} "
+        f"7️⃣ Чистый спред ≥ /sp после всех комиссий: отсеяно {debug_stats['blocked_by_net']}",
+        f"8️⃣ Прошли фильтр мин. оборота по стакану (/mt): {debug_stats['passed_turnover_filter']} "
         f"(без данных о стакане: {debug_stats['blocked_by_unknown_depth']}, "
         f"стакан не загрузился: {debug_stats['depth_fallback']})",
         f"📨 Алертов отправлено за этот проход: {debug_stats['alerts_sent']}",
@@ -1183,6 +1185,19 @@ async def load_state():
 
 # ================= ОСНОВНОЙ ЦИКЛ =================
 
+def _withdraw_fee_usd(c):
+    """Комиссия вывода в $ для кандидата: по выбранной общей сети, а если сети
+    сопоставить не удалось — по самой дешёвой открытой сети HTX. None = неизвестна."""
+    route, price = c["route"], c["buy_price"]
+    best = route.get("best")
+    if route["state"] == "open" and best and best.get("fee") is not None:
+        return best["fee"] * price
+    hs = c.get("htx_coin_status")
+    if c["buy_ex"] == "HTX" and route["state"] in ("nodata", "nomatch") and hs and hs.get("fee") is not None:
+        return hs["fee"] * price
+    return None
+
+
 def _nets_overlap(htx_status, mexc_nets):
     """Есть ли у монеты на HTX хоть одна сеть, совпадающая по названию с сетями MEXC."""
     for h in (htx_status or {}).get("chains", []):
@@ -1258,7 +1273,7 @@ async def scanner_task():
                       "passed_turnover_filter", "passed_transfer_check", "blocked_by_transfer",
                       "passed_cooldown", "alerts_sent", "skipped_mexc", "skipped_htx",
                       "skipped_htx_transfer", "blocked_by_sanity", "blocked_by_unknown_depth",
-                      "depth_fallback", "blocked_by_contract", "route_unmatched"):
+                      "depth_fallback", "blocked_by_contract", "route_unmatched", "blocked_by_net"):
                 debug_stats[k] = 0
 
             if not mexc_data or not huobi_data:
@@ -1408,20 +1423,30 @@ async def scanner_task():
                   for c in candidates],
                 return_exceptions=True,
             )
+            # Порог /sp — это ЧИСТЫЙ спред: после торговых комиссий обеих бирж и
+            # комиссии вывода. Сигнал проходит, только если есть объём, на котором
+            # чистый спред не ниже порога; этот объём и чистый спред и показываем.
+            trade_fees = settings["fee_htx_pct"] + settings["fee_mexc_pct"]
+            passed = []
             for c, res in zip(candidates, books):
                 htx_book, mexc_book = (None, None) if isinstance(res, Exception) else res
-                c["tradable_usd"] = c["avg_spread"] = None
+                c["tradable_usd"] = c["avg_spread"] = c["net"] = None
                 c["depth_capped"] = False
+                c["withdraw_fee_usd"] = _withdraw_fee_usd(c)
+                fee_usd = c["withdraw_fee_usd"] or 0.0
                 if htx_book and mexc_book:
                     if c["buy_ex"] == "HTX":
                         asks, bids = htx_book[1], mexc_book[0]
                     else:
                         asks, bids = mexc_book[1], htx_book[0]
-                    cost, avg, capped = sq.arb_volume(asks, bids, c["threshold"])
+                    r = sq.arb_volume_net(asks, bids, trade_fees, fee_usd, c["threshold"])
+                    if r["cost"] is None:
+                        debug_stats["blocked_by_net"] += 1
+                        continue
+                    c["tradable_usd"], c["avg_spread"], c["net"] = r["cost"], r["gross"], r["net"]
                     # «Стакан глубже загруженного» — только если упёрлись в лимит
                     # загрузки (100+ уровней), а не в настоящий конец тонкого стакана.
-                    capped = capped and max(len(asks), len(bids)) >= 100
-                    c["tradable_usd"], c["avg_spread"], c["depth_capped"] = cost, avg, capped
+                    c["depth_capped"] = r["capped"] and max(len(asks), len(bids)) >= 100
                 else:
                     debug_stats["depth_fallback"] += 1
                     # Запасной вариант — объём только на лучшей цене из bulk-ответов.
@@ -1429,8 +1454,14 @@ async def scanner_task():
                         bq, sq_ = c["m"].get("ask_qty"), c["h"].get("bid_qty")
                     else:
                         bq, sq_ = c["h"].get("ask_qty"), c["m"].get("bid_qty")
-                    if bq is not None and sq_ is not None:
+                    if bq is not None and sq_ is not None and bq * sq_ > 0:
                         c["tradable_usd"] = min(bq, sq_) * c["buy_price"]
+                        c["net"] = c["best_spread"] - trade_fees - fee_usd / c["tradable_usd"] * 100
+                    if c["net"] is None or c["net"] < c["threshold"]:
+                        debug_stats["blocked_by_net"] += 1
+                        continue
+                passed.append(c)
+            candidates = passed
 
             # ===== ФАЗА 3: фильтр мин. оборота + сборка сообщений =====
             messages = []  # [(chat_id_или_channel, текст), ...] — отправим все разом в конце
@@ -1452,14 +1483,13 @@ async def scanner_task():
                         continue
                 debug_stats["passed_turnover_filter"] += 1
 
-                if tradable_usd is None:
-                    depth_line = "📦 Сколько можно прокрутить: посчитать не удалось (стакан не загрузился)"
-                elif avg_spread is None:
-                    depth_line = f"📦 Прокрутить по стакану со спредом ≥ {c['threshold']:g}%: ~{fmt_money(tradable_usd)}$ (только лучшая цена)"
+                if avg_spread is None:
+                    depth_line = (f"📦 Прокрутить с чистым спредом ≥ {c['threshold']:g}%: ~{fmt_money(tradable_usd)}$ "
+                                  f"(только лучшая цена — стакан не загрузился)")
                 else:
-                    depth_line = (f"📦 Прокрутить со спредом ≥ {c['threshold']:g}%: <b>~{fmt_money(tradable_usd)}$</b>"
+                    depth_line = (f"📦 Прокрутить с чистым спредом ≥ {c['threshold']:g}%: <b>~{fmt_money(tradable_usd)}$</b>"
                                   f"{'+ (стакан глубже загруженного)' if c['depth_capped'] else ''}, "
-                                  f"средний спред на этот объём <b>{avg_spread:+.2f}%</b>")
+                                  f"грязный спред на этот объём {avg_spread:+.2f}%")
 
                 alert_memory[pair] = {
                     "time": prev["time"] if prev else now,
@@ -1469,7 +1499,7 @@ async def scanner_task():
                 debug_stats["alerts_sent"] += 1
 
                 # ----- Перевод: какая сеть и что с ней -----
-                withdraw_fee_usd = None
+                withdraw_fee_usd = c["withdraw_fee_usd"]
                 from_ex, to_ex = buy_ex, sell_ex
                 transfer_lines = []
                 best = route.get("best")
@@ -1480,7 +1510,6 @@ async def scanner_task():
                     if best["htx"].get("wdesc") and buy_ex == "HTX":
                         transfer_lines.append(f"ℹ️ HTX о выводе: {best['htx']['wdesc'][:200].replace('<', '')}")
                     if best["fee"] is not None:
-                        withdraw_fee_usd = best["fee"] * buy_price
                         transfer_lines.append(
                             f"💸 Комиссия вывода с {from_ex}: {best['fee']:g} {base_coin} (~{fmt_money(withdraw_fee_usd)}$)")
                     else:
@@ -1498,7 +1527,6 @@ async def scanner_task():
                         ok = hs.get("withdraw" if buy_ex == "HTX" else "deposit")
                         transfer_lines.append(f"🚚 HTX ({leg}): {'✅ открыт' if ok else '❌ закрыт'} в какой-то сети · MEXC: нет данных (нужен ключ)")
                     if buy_ex == "HTX" and hs and hs.get("fee") is not None:
-                        withdraw_fee_usd = hs["fee"] * buy_price
                         transfer_lines.append(f"💸 Комиссия вывода с HTX ({hs.get('fee_chain') or '?'}): {hs['fee']:g} {base_coin} (~{fmt_money(withdraw_fee_usd)}$)")
 
                 if route["contract"] == "ok":
@@ -1510,14 +1538,9 @@ async def scanner_task():
                     contract_line = ("🔗 Контракт: ⚠️ не сверен (HTX не отдал) — MEXC: "
                                      + (", ".join(mexc_cas[:2]) if mexc_cas else "нет данных"))
 
-                # ----- Чистый спред -----
-                # Средний спред по стакану на прокручиваемый объём, минус торговые
-                # комиссии обеих бирж, минус комиссия вывода, размазанная по этому объёму.
-                trade_fees = settings["fee_htx_pct"] + settings["fee_mexc_pct"]
-                base_spread = avg_spread if avg_spread is not None else best_spread
-                net = base_spread - trade_fees
+                # ----- Чистый спред (уже посчитан в фазе 2 по стакану) -----
+                net = c["net"]
                 if withdraw_fee_usd is not None and tradable_usd:
-                    net -= withdraw_fee_usd / tradable_usd * 100
                     net_note = f"торговые {trade_fees:g}% и вывод ~{fmt_money(withdraw_fee_usd)}$ на {fmt_money(tradable_usd)}$"
                 elif withdraw_fee_usd is not None:
                     net_note = f"торговые {trade_fees:g}%; вывод ~{fmt_money(withdraw_fee_usd)}$ не учтён — неизвестен объём"
@@ -1572,7 +1595,7 @@ BOT_COMMANDS = [
     BotCommand(command="start", description="Инфо и список команд"),
     BotCommand(command="s", description="Текущий статус настроек"),
     BotCommand(command="debug", description="Диагностика последнего прохода сканера"),
-    BotCommand(command="sp", description="Мин. % спреда для алерта"),
+    BotCommand(command="sp", description="Мин. ЧИСТЫЙ % спреда для алерта"),
     BotCommand(command="spm", description="Порог спреда именно MEXC→HTX"),
     BotCommand(command="spmax", description="Верхняя отсечка спреда (анти-мусор)"),
     BotCommand(command="v", description="Мин. объём 24ч на обеих биржах"),

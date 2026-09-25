@@ -178,3 +178,51 @@ def arb_volume(asks, bids, min_spread_pct):
             rest_b = bids[j][1] if j < len(bids) else 0.0
     # Стакан закончился раньше, чем спред упал ниже порога: реальный объём больше.
     return cost, ((proceeds - cost) / cost * 100 if cost else None), bool(asks and bids)
+
+
+def arb_volume_net(asks, bids, trade_fee_pct, withdraw_fee_usd, min_net_pct):
+    """
+    Сколько прокрутить, чтобы ЧИСТЫЙ спред (после торговых комиссий обеих бирж и
+    фиксированной комиссии вывода) был не ниже min_net_pct.
+
+    Идём по стаканам, пока очередная порция вообще окупает торговые комиссии, и
+    после каждой порции считаем чистый спред на весь набранный объём:
+        чистый = (выручка − затраты) / затраты − торговые − вывод / затраты.
+    Комиссия вывода фиксированная, поэтому на маленьком объёме она съедает всё,
+    а с ростом объёма «размазывается». Берём САМЫЙ БОЛЬШОЙ объём, на котором
+    чистый спред ещё ≥ min_net_pct.
+
+    Возвращает dict {cost, gross, net} для этого объёма или None, если такого
+    объёма нет; плюс best_net — лучший чистый спред, который вообще был (для /debug).
+    """
+    i = j = 0
+    rest_a = asks[0][1] if asks else 0.0
+    rest_b = bids[0][1] if bids else 0.0
+    cost = proceeds = 0.0
+    best = None
+    best_net = None
+    while i < len(asks) and j < len(bids):
+        a, b = asks[i][0], bids[j][0]
+        if a <= 0 or (b - a) / a * 100 <= trade_fee_pct:
+            break  # дальше каждая порция уже в минус по торговым комиссиям
+        q = min(rest_a, rest_b)
+        cost += q * a
+        proceeds += q * b
+        rest_a -= q
+        rest_b -= q
+        gross = (proceeds - cost) / cost * 100
+        net = gross - trade_fee_pct - (withdraw_fee_usd or 0) / cost * 100
+        if best_net is None or net > best_net:
+            best_net = net
+        if net >= min_net_pct:
+            best = {"cost": cost, "gross": gross, "net": net}
+        if rest_a <= 1e-12:
+            i += 1
+            rest_a = asks[i][1] if i < len(asks) else 0.0
+        if rest_b <= 1e-12:
+            j += 1
+            rest_b = bids[j][1] if j < len(bids) else 0.0
+    if best is not None:
+        best["best_net"] = best_net
+        best["capped"] = i >= len(asks) or j >= len(bids)
+    return best if best is not None else {"cost": None, "best_net": best_net}
