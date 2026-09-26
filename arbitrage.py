@@ -831,6 +831,25 @@ async def wallet_send_all(net, token, to):
     return await (sui_send_all(token, to) if net == "sui" else evm_send_all(net, token, to))
 
 
+async def htx_address_saved(currency, chain, address):
+    """Есть ли адрес в адресной книге вывода HTX для этой монеты и сети.
+    Через API HTX выводит ТОЛЬКО на сохранённые адреса (иначе ошибка
+    api-not-support-temp-addr). None — проверить не удалось (ключ/ошибка API)."""
+    try:
+        rows = await htx_req("GET", "/v2/account/withdraw/address", {"currency": currency.lower()})
+    except Exception as e:
+        print(f"[arb] адресная книга HTX {currency}: {e}", flush=True)
+        return None
+    addr = address.lower()
+    return any(str(r.get("address", "")).lower() == addr and (not chain or r.get("chain") == chain)
+               for r in rows or [])
+
+
+def address_book_hint(coin_htx, chain, address):
+    return (f"Добавь адрес бота в адресную книгу вывода HTX: монета <b>{coin_htx}</b>, сеть <code>{chain}</code>, "
+            f"адрес <code>{address}</code>. Через API HTX выводит только на сохранённые адреса.")
+
+
 # ================= СОПОСТАВЛЕНИЕ СЕТЕЙ =================
 
 _htx_pairs = {"ts": 0.0, "by_base": {}}
@@ -1297,6 +1316,14 @@ async def try_start(coin, cfg, opp):
     if not res["mexc_deposit_ok"]:
         await note_once(f"dep:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но на MEXC закрыт депозит в этой сети — пропускаю.")
         return False
+    if not arb["dry_run"]:
+        addr = wallet_address(cfg["net"])
+        saved = await htx_address_saved(res["htx_ticker"], res["htx_chain"], addr)
+        if saved is False:
+            await note_once(f"book:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но не покупаю — "
+                                            f"HTX не даст вывести.\n{address_book_hint(res['htx_ticker'], res['htx_chain'], addr)}",
+                            every=3 * 3600)
+            return False
     if not arb["dry_run"] and not contract_confirmed(cfg, res):
         await note_once(f"unconf:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но контракт не сверен.\n"
                                           f"{contract_line(coin, cfg, res)}", every=3 * 3600)
@@ -1473,7 +1500,10 @@ async def stage_withdraw(d):
                 break
             raise
     if wid is None:
-        await start_rescue(d, "HTX отклонил заявку на вывод: " + (errors[-1] if errors else "сумма меньше минимума"))
+        reason = "HTX отклонил заявку на вывод: " + (errors[-1] if errors else "сумма меньше минимума")
+        if errors and "temp-addr" in errors[-1]:
+            reason += "\n" + address_book_hint(hcoin(coin, cfg), res["htx_chain"], wallet_address(cfg["net"]))
+        await start_rescue(d, reason)
         return
     d["withdraw_id"], d["withdraw_at"], d["cur_withdraw"] = str(wid), time.time(), str(amount)
     d["stage"] = "withdraw_check"
@@ -1964,6 +1994,18 @@ async def cmd_add(message: types.Message, command: CommandObject):
         text += (f"\nHTX сеть: <code>{res['htx_chain']}</code> (вывод {'открыт' if res['htx_withdraw_ok'] else 'ЗАКРЫТ'} по API)"
                  f"\nMEXC сеть: <code>{res['mexc_net'].get('netWork') or res['mexc_net'].get('network')}</code>"
                  f"\n{contract_line(coin, cfg, res)}")
+        try:
+            addr = wallet_address(net)
+            saved = await htx_address_saved(res["htx_ticker"], res["htx_chain"], addr)
+            if saved is True:
+                text += f"\n✅ Адрес бота есть в адресной книге вывода HTX"
+            elif saved is False:
+                text += "\n⛔ " + address_book_hint(res["htx_ticker"], res["htx_chain"], addr) + \
+                        " Пока адреса нет, бот по этой монете не покупает."
+            else:
+                text += "\n❔ Адресную книгу HTX проверить не удалось (ключ HTX?)"
+        except Exception as e:
+            text += f"\n❔ Адрес бота: {e}"
     except Exception as e:
         text += f"\n⚠️ Проверка сетей: {e}"
     await message.answer(text, parse_mode="HTML")
