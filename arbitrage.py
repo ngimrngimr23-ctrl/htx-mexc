@@ -124,6 +124,11 @@ arb = {
     # Учитывать стакан MEXC при покупке: брать на HTX только столько, сколько на
     # MEXC сейчас покупают с нужным %, а не ориентироваться на одну лучшую цену.
     "mexc_depth": True,
+    # Если продавцов в пределах % нет — ставить свой ордер на покупку первым в
+    # стакане HTX и держать его, переставляя под цену MEXC (/arb_set maker on|off).
+    "maker": True,
+    # С какой суммы купленного сразу выводить партию, не снимая ордер (/arb_set batch).
+    "batch_usd": 15.0,
 }
 
 deal = None       # активная сделка (одна за раз: покупка идёт на весь баланс)
@@ -1161,7 +1166,7 @@ async def check_opportunity(coin, cfg):
     sym = f"{coin}USDT"
     hpair = hsym(coin, cfg)
     try:
-        (mbids, _), (_, hasks) = await asyncio.gather(mexc_depth(sym), htx_depth(hpair))
+        (mbids, _), (hbids, hasks) = await asyncio.gather(mexc_depth(sym), htx_depth(hpair))
     except ExchangeError as e:
         # Чтобы из ошибки было видно, по какой именно паре спрашивали каждую биржу.
         raise ExchangeError(f"MEXC {sym} / HTX {hpair}: {e}")
@@ -1169,11 +1174,18 @@ async def check_opportunity(coin, cfg):
         return None
     mexc_bid = mbids[0][0]
     max_price = mexc_bid / (1 + D(cfg["pct"]) / 100)
-    if hasks[0][0] > max_price:
-        return None
-    spread = (mexc_bid - hasks[0][0]) / hasks[0][0] * 100
-    return {"mexc_bid": mexc_bid, "max_price": max_price, "asks": hasks, "bids": mbids,
-            "spread": spread, "pct": D(cfg["pct"])}
+    base = {"mexc_bid": mexc_bid, "max_price": max_price, "asks": hasks, "bids": mbids, "pct": D(cfg["pct"])}
+    if hasks[0][0] <= max_price:
+        # Продавцы в пределах процента — можно выкупать сразу.
+        return dict(base, mode="taker", spread=(mexc_bid - hasks[0][0]) / hasks[0][0] * 100)
+    if arb.get("maker", True) and hbids:
+        # Своим ордером первым в стакане покупателей: на тик выше лучшего чужого,
+        # но не дороже цены с нужным % и ниже лучшего продавца.
+        tick = (await htx_symbol(hpair))["tick"]
+        want = hbids[0][0] + tick
+        if want <= min(round_down(max_price, tick), hasks[0][0] - tick):
+            return dict(base, mode="maker", maker_price=want, spread=(mexc_bid - want) / want * 100)
+    return None
 
 
 def plan_buy(asks, max_price, budget, bids=None, pct=None):
@@ -1235,13 +1247,6 @@ async def note_once(key, text, every=1800):
 
 
 engine_state = {"last_pass": 0.0}
-
-STAGE_RU = {
-    "buy": "покупка на HTX", "withdraw": "вывод с HTX", "withdraw_check": "проверка вывода HTX",
-    "wallet_wait": "ждёт монеты на кошельке", "forwarding": "пересылка на MEXC",
-    "mexc_wait": "ждёт зачисления на MEXC", "sell": "продажа на MEXC", "done": "завершена",
-}
-
 
 def _ago(ts):
     if not ts:
@@ -1335,13 +1340,18 @@ async def try_start(coin, cfg, opp):
             usdt = fmt((await htx_balance("usdt"))[0])
         except Exception:
             pass
-        _, can_cost, _ = plan_buy(opp["asks"], opp["max_price"], D(10) ** 9,
-                                  opp["bids"] if arb.get("mexc_depth", True) else None, opp["pct"])
+        if opp["mode"] == "taker":
+            _, can_cost, _ = plan_buy(opp["asks"], opp["max_price"], D(10) ** 9,
+                                      opp["bids"] if arb.get("mexc_depth", True) else None, opp["pct"])
+            how = (f"Выкупил бы продавцов на HTX по цене не выше {fmt(opp['max_price'])} — "
+                   f"с соблюдением {cfg['pct']}% сейчас на ~{fmt(can_cost)}$")
+        else:
+            how = (f"Поставил бы ордер на покупку на HTX первым в стакане по {fmt(opp['maker_price'])} "
+                   f"(макс. {fmt(opp['max_price'])}) и держал его под цену MEXC; "
+                   f"вывод партиями от {arb['batch_usd']:g}$")
         await note_once(f"dry:{coin}", (
             f"🧪 <b>ТЕСТ</b> · <b>{coin}</b>: спред {opp['spread']:.2f}% (мин. {cfg['pct']}%)\n"
-            f"Купил бы на HTX по цене не выше {fmt(opp['max_price'])} "
-            f"(MEXC bid {fmt(opp['mexc_bid'])}), USDT на HTX: {usdt}\n"
-            f"С соблюдением {cfg['pct']}% по стаканам сейчас можно купить на ~{fmt(can_cost)}$\n"
+            f"{how}\nMEXC bid {fmt(opp['mexc_bid'])}, USDT на HTX: {usdt}\n"
             f"{'Проба ' + str(cfg['probe']) + '$, потом весь баланс' if cfg.get('probe') else 'Сразу на весь баланс'}\n"
             f"Сеть: HTX <code>{res['htx_chain']}</code> → кошелёк "
             f"<code>{wallet_address(cfg['net'])}</code> → MEXC "
@@ -1350,209 +1360,534 @@ async def try_start(coin, cfg, opp):
             f"<i>Реальные сделки: /arb_live on</i>"), every=300)
         return False
 
-    deal = {
-        "id": uuid.uuid4().hex[:8], "coin": coin, "cfg": dict(cfg),
-        "phase": "probe" if cfg.get("probe") else "full",
-        "stage": "buy", "started": time.time(),
-        "qty": "0", "cost": "0",        # купленное, чей вывод прошёл
-        "expected": "0",               # сколько монет ждём на кошельке
-        "wallet_baseline": None, "decimals": None, "token": res["token"],
-    }
+    deal = new_deal(coin, cfg, res)
     await save()
     spawn(run_deal())
     return True
 
 
-# ================= СДЕЛКА =================
+# ================= СДЕЛКА (поток) =================
+#
+# Сделка по монете — это поток, а не одна покупка:
+#   * покупатель на HTX: выкупает продавцов в пределах процента, а если их нет —
+#     держит СВОЙ ордер на покупку первым в стакане (на тик выше лучшего чужого,
+#     но не дороже цены, дающей заданный % к MEXC) и переставляет его, как только
+#     меняется цена на MEXC или его перебивают; остаток ордера не снимается;
+#   * партии: как только куплено на batch_usd (15$) — сразу вывод на кошелёк, ордер
+#     при этом продолжает стоять и покупать; через check_sec сек. проверяем, ушла ли
+#     партия (свободный баланс монеты на HTX не должен содержать её);
+#   * кошелёк: каждую дошедшую партию пересылаем на депозит MEXC;
+#   * MEXC: всё зачисленное сразу продаём по ордерам на покупку, пока цена даёт
+#     заданный %; остаток — лесенка от безубытка вниз со спамом.
+# Все шаги крутятся в одном цикле по очереди — без гонок между ними, и после
+# рестарта цикл просто продолжает с сохранённого состояния.
+
+def _dd(d, k):
+    return D(d.get(k) or 0)
+
+
+def _add(d, k, v):
+    d[k] = str(_dd(d, k) + D(v))
+
+
+def new_deal(coin, cfg, res):
+    return {
+        "v": 2, "id": uuid.uuid4().hex[:8], "coin": coin, "cfg": dict(cfg),
+        "started": time.time(), "token": res["token"], "decimals": None,
+        "buying": True, "idle_since": None,
+        # Проба: сколько ещё $ можно купить, пока первая партия не подтвердилась.
+        "probe_left": str(cfg["probe"]) if cfg.get("probe") else None,
+        "order": None,                      # стоящий ордер на покупку на HTX
+        "ioc": None,                        # «pending» / id ордера-выкупа (защита от двойной покупки)
+        "bought_qty": "0", "bought_cost": "0",   # всего куплено на HTX
+        "unw_qty": "0", "unw_cost": "0",         # куплено, ещё не выведено
+        "batches": [],                      # партии: вывод подан, ждёт проверки / едет
+        "qty": "0", "cost": "0",            # успешно выведено (для безубытка)
+        "forwarded": "0", "forwarding": False,
+        "mexc_baseline": None, "sold_qty": "0", "proceeds": "0",
+        "sell": None, "ladder_since": None, "sell_manual": False,
+        "last_wallet_check": 0.0, "last_mexc_check": 0.0,
+    }
+
+
+def deal_breakeven(d):
+    return _dd(d, "cost") / _dd(d, "qty") if _dd(d, "qty") > 0 else None
+
 
 async def run_deal():
     global deal
     d = deal
-    handlers = {
-        "buy": stage_buy, "withdraw": stage_withdraw, "withdraw_check": stage_withdraw_check,
-        "wallet_wait": stage_wallet_wait, "forwarding": stage_forward, "mexc_wait": stage_mexc_wait,
-        "sell": stage_sell,
-    }
-    while d["stage"] != "done":
+    alarm = {"id": None}
+    while True:
         try:
-            await handlers[d["stage"]](d)
+            if d["mexc_baseline"] is None:
+                d["mexc_baseline"] = str(await mexc_free(d["coin"]))
+            if d["decimals"] is None:
+                d["decimals"] = await wallet_decimals(d["cfg"]["net"], d["token"])
+            if d["buying"]:
+                await buy_step(d)
+            await check_batches(d)
+            await transport_step(d)
+            await sell_step(d, alarm)
             await save()
+            if deal_finished(d):
+                break
         except Exception as e:
-            print(f"[arb] сделка {d['coin']} этап {d['stage']}: {traceback.format_exc()}", flush=True)
-            await note_once(f"deal_err:{d['id']}:{d['stage']}",
-                            f"⚠️ <b>{d['coin']}</b>, этап «{d['stage']}»: <code>{e}</code>\nПовторю через 15 сек.",
-                            every=300)
+            print(f"[arb] сделка {d['coin']}: {traceback.format_exc()}", flush=True)
+            await note_once(f"deal_err:{d['id']}", f"⚠️ <b>{d['coin']}</b>: ошибка в сделке: <code>{e}</code>\n"
+                                                    f"Повторю через 15 сек.", every=300)
             await asyncio.sleep(15)
+            continue
+        await asyncio.sleep(arb["poll_sec"] if d["buying"] or d["sell"] else 3)
+    if alarm["id"]:
+        alarm_end(alarm["id"])
+    await finish_deal(d)
     deal = None
     await save()
 
 
-async def stage_buy(d):
+def deal_finished(d):
+    if d["buying"] or d["order"] or d["ioc"] or d["sell"] or d["forwarding"]:
+        return False
+    if any(not b["ok"] for b in d["batches"]):
+        return False
+    if d["sell_manual"]:
+        return True
+    if any(not b["fwd"] for b in d["batches"]):
+        return False
+    # Всё отправленное на MEXC продано (с допуском на комиссии) — сделка закончена.
+    return _dd(d, "sold_qty") >= _dd(d, "forwarded") * D("0.97")
+
+
+# ---------- покупка на HTX ----------
+
+async def _sync_order(d):
+    """Учитывает новые исполнения стоящего ордера на покупку."""
+    o = d["order"]
+    if not o:
+        return
+    st = await htx_order(o["id"])
+    dq, dc = st["filled"] - D(o["filled"]), st["cash"] - D(o["cash"])
+    if dq > 0:
+        o["filled"], o["cash"] = str(st["filled"]), str(st["cash"])
+        _add(d, "unw_qty", dq)
+        _add(d, "unw_cost", dc)
+        _add(d, "bought_qty", dq)
+        _add(d, "bought_cost", dc)
+        if d["probe_left"] is not None:
+            d["probe_left"] = str(D(d["probe_left"]) - dc)
+    if st["state"] in ("filled", "canceled", "partial-canceled"):
+        d["order"] = None
+
+
+async def _cancel_order(d):
+    o = d["order"]
+    if not o:
+        return
+    await htx_cancel(o["id"])
+    for _ in range(10):
+        st = await htx_order(o["id"])
+        if st["state"] in ("filled", "canceled", "partial-canceled"):
+            break
+        await asyncio.sleep(0.5)
+    await _sync_order(d)
+    d["order"] = None
+
+
+async def buy_step(d):
     coin, cfg = d["coin"], d["cfg"]
-    sym = hsym(coin, cfg)
-    # Повторный вход после сбоя (обрыв связи, рестарт) уже ПОСЛЕ отправки ордера:
-    # не покупаем второй раз, а дочитываем результат того же ордера.
-    if d.get("buy_order"):
-        await finish_buy(d, d["buy_order"], None)
+    hpair = hsym(coin, cfg)
+    info = await htx_symbol(hpair)
+    tick = info["tick"]
+
+    # Дочитываем выкуп, прерванный сбоем, — второй раз не покупаем.
+    if d["ioc"]:
+        if d["ioc"] == "pending":
+            d["ioc"] = None
+            d["buying"] = False
+            await notify(f"⚠️ <b>{coin}</b>: сбой в момент отправки ордера на покупку — проверь HTX вручную. "
+                         f"Дальше бот не покупает.")
+            return
+        st = await htx_wait_final(d["ioc"])
+        _add(d, "unw_qty", st["filled"])
+        _add(d, "unw_cost", st["cash"])
+        _add(d, "bought_qty", st["filled"])
+        _add(d, "bought_cost", st["cash"])
+        if d["probe_left"] is not None:
+            d["probe_left"] = str(D(d["probe_left"]) - st["cash"])
+        d["ioc"] = None
+
+    await _sync_order(d)
+
+    (mbids, _), (hbids, hasks) = await asyncio.gather(mexc_depth(f"{coin}USDT"), htx_depth(hpair))
+    if not mbids:
         return
-    budget, _ = await htx_balance("usdt")
-    if d["phase"] == "probe":
-        budget = min(budget, D(cfg["probe"]))
-    budget *= D("0.995")  # запас на округления
-    opp = await check_opportunity(coin, cfg)
-    if budget < 5 or not opp:
-        if d["phase"] == "full" and D(d["expected"]) > 0:
-            await notify(f"ℹ️ <b>{coin}</b>: докупка на весь баланс не состоялась "
-                         f"({'спред ушёл' if not opp else 'мало USDT'}), везу только пробу.")
-            d["stage"] = "wallet_wait"
+    pct = D(cfg["pct"])
+    max_price = round_down(mbids[0][0] / (1 + pct / 100), tick)
+
+    free_usdt, _ = await htx_balance("usdt")
+    o = d["order"]
+    locked = (D(o["amount"]) - D(o["filled"])) * D(o["price"]) if o else D(0)
+    budget = (free_usdt + locked) * D("0.995")
+    if d["probe_left"] is not None:
+        budget = min(budget, D(d["probe_left"]))
+
+    # Партия набралась — выводим сразу, ордер при этом продолжает стоять.
+    if _dd(d, "unw_cost") >= D(arb["batch_usd"]):
+        await withdraw_batch(d)
+        if not d["buying"]:
+            return
+
+    if budget < 5:
+        # Деньги кончились. Стоит ордер — ждём его исполнения; идёт проба — ждём,
+        # пока подтвердится её вывод (тогда откроется весь баланс); иначе всё.
+        if not d["order"] and d["probe_left"] is None:
+            await _stop_buying(d, "весь баланс USDT на HTX потрачен")
+        return
+
+    # 1) Есть продавцы в пределах процента — выкупаем сразу.
+    if hasks and hasks[0][0] <= max_price:
+        await _cancel_order(d)
+        free_usdt, _ = await htx_balance("usdt")
+        budget = free_usdt * D("0.995")
+        if d["probe_left"] is not None:
+            budget = min(budget, D(d["probe_left"]))
+        if arb.get("mexc_depth", True):
+            qty, _, last = plan_buy(hasks, max_price, budget, mbids, pct)
+            price = min(max_price, round_up(last, tick)) if last is not None else max_price
         else:
-            await notify(f"ℹ️ <b>{coin}</b>: покупка отменена — {'спред ушёл' if not opp else 'на HTX меньше 5 USDT'}.")
-            d["stage"] = "done"
-        return
+            qty, _, _ = plan_buy(hasks, max_price, budget)
+            price = max_price
+        qty = round_down(qty, info["step"])
+        if qty > 0 and qty >= info["min_qty"] and qty * price >= info["min_value"]:
+            d["ioc"] = "pending"
+            await save()
+            try:
+                d["ioc"] = await htx_place(hpair, "buy-ioc", qty, price)
+            except ExchangeError:
+                d["ioc"] = None
+                raise
+            await save()
+            st = await htx_wait_final(d["ioc"])
+            d["ioc"] = None
+            if st["filled"] > 0:
+                _add(d, "unw_qty", st["filled"])
+                _add(d, "unw_cost", st["cash"])
+                _add(d, "bought_qty", st["filled"])
+                _add(d, "bought_cost", st["cash"])
+                if d["probe_left"] is not None:
+                    d["probe_left"] = str(D(d["probe_left"]) - st["cash"])
+                await notify(f"🟢 <b>{coin}</b>: выкупил на HTX {fmt(st['filled'])} шт. на {fmt(st['cash'])}$ "
+                             f"(ср. {fmt(st['cash'] / st['filled'])}, MEXC bid {fmt(mbids[0][0])})")
+            d["idle_since"] = None
+            return
 
-    info = await htx_symbol(sym)
-    price = round_down(opp["max_price"], info["tick"])
-    if arb.get("mexc_depth", True):
-        qty, _, last = plan_buy(opp["asks"], price, budget, opp["bids"], opp["pct"])
-        if last is not None:
-            price = min(price, round_up(last, info["tick"]))
-    else:
-        qty, _, _ = plan_buy(opp["asks"], price, budget)
-    qty = round_down(qty, info["step"])
-    if qty <= 0 or qty < info["min_qty"] or qty * price < info["min_value"]:
-        d["stage"] = "wallet_wait" if D(d["expected"]) > 0 else "done"
+    # 2) Свой ордер первым в стакане покупателей.
+    if not arb.get("maker", True):
+        await _idle(d, "спред ушёл")
         return
-
-    d["buy_order"] = "pending"
+    my_price = D(d["order"]["price"]) if d["order"] else None
+    my_rest = (D(d["order"]["amount"]) - D(d["order"]["filled"])) if d["order"] else D(0)
+    # Чужие ордера: всё, кроме нашего; если на нашей цене объёма больше нашего —
+    # там стоит ещё кто-то, и эта цена тоже «чужая» (встанем на тик выше).
+    others = [p for p, q in hbids if p != my_price or q > my_rest * D("1.001")]
+    cap = max_price
+    if hasks:
+        cap = min(cap, hasks[0][0] - tick)
+    want = (others[0] + tick) if others else None
+    if want is None or want > cap:
+        # Первым с нужным % встать нельзя — снимаем ордер и ждём.
+        if d["order"]:
+            await _cancel_order(d)
+            await notify(f"⏸ <b>{coin}</b>: первым в стакане HTX с {cfg['pct']}% к MEXC уже не встать — "
+                         f"ордер снят (MEXC bid {fmt(mbids[0][0])}, макс. цена {fmt(max_price)}).")
+        await _idle(d, "спред ушёл")
+        return
+    d["idle_since"] = None
+    if my_price == want:
+        return  # стоим первыми по нужной цене
+    await _cancel_order(d)
+    free_usdt, _ = await htx_balance("usdt")
+    budget = free_usdt * D("0.995")
+    if d["probe_left"] is not None:
+        budget = min(budget, D(d["probe_left"]))
+    amount = round_down(budget / want, info["step"])
+    if amount <= 0 or amount < info["min_qty"] or amount * want < info["min_value"]:
+        return
+    oid = await htx_place(hpair, "buy-limit-maker", amount, want)
+    first = my_price is None
+    d["order"] = {"id": oid, "price": str(want), "amount": str(amount), "filled": "0", "cash": "0"}
     await save()
-    try:
-        order_id = await htx_place(sym, "buy-ioc", qty, price)
-    except ExchangeError:
-        # HTX явно ответил отказом — ордера нет, можно спокойно пробовать снова.
-        d["buy_order"] = None
-        raise
-    d["buy_order"] = order_id
-    await save()
-    await finish_buy(d, order_id, opp)
+    spread = (mbids[0][0] - want) / want * 100
+    if first:
+        await notify(f"📌 <b>{coin}</b>: поставил ордер на покупку на HTX первым: {fmt(amount)} шт. по {fmt(want)} "
+                     f"(на {fmt(amount * want)}$, спред к MEXC {spread:.2f}%). Слежу за ценой.")
 
 
-async def finish_buy(d, order_id, opp):
-    coin = d["coin"]
-    if order_id == "pending":
-        # Упали между отправкой ордера и получением его номера — номера нет,
-        # узнать исполнение нельзя. Безопаснее не покупать повторно и отдать человеку.
-        d["buy_order"] = None
-        d["stage"] = "wallet_wait" if D(d["expected"]) > 0 else "done"
-        await notify(f"⚠️ <b>{coin}</b>: сбой в момент отправки ордера на покупку — проверь HTX вручную. "
-                     f"Повторно бот не покупает.")
-        return
-    o = await htx_wait_final(order_id)
-    d["buy_order"] = None
-    if o["filled"] <= 0:
-        await notify(f"ℹ️ <b>{coin}</b>: ордер на HTX не исполнился (цены ушли).")
-        d["stage"] = "wallet_wait" if D(d["expected"]) > 0 else "done"
-        return
-    avg = o["cash"] / o["filled"]
-    d["cur_qty"], d["cur_cost"] = str(o["filled"]), str(o["cash"])
-    await notify(
-        f"🟢 <b>{coin}</b> {'проба' if d['phase'] == 'probe' else 'покупка'} на HTX: "
-        f"{fmt(o['filled'])} шт. на {fmt(o['cash'])}$ · ср. цена {fmt(avg)} "
-        + (f"(спред был {opp['spread']:.2f}%)" if opp else "(дочитан после сбоя)"))
-    d["stage"] = "withdraw"
+async def _idle(d, why):
+    """Нет возможности купить: даём минуту подождать, потом заканчиваем покупку."""
+    if d["idle_since"] is None:
+        d["idle_since"] = time.time()
+    elif time.time() - d["idle_since"] > 60:
+        await _stop_buying(d, why)
 
 
-async def stage_withdraw(d):
+async def _stop_buying(d, why):
+    await _cancel_order(d)
+    d["buying"] = False
+    unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
+    if unw_q > 0:
+        if unw_c >= D(arb["batch_usd"]):
+            await withdraw_batch(d)
+        else:
+            await notify(f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}); остаток {fmt(unw_q)} шт. "
+                         f"на {fmt(unw_c)}$ меньше {arb['batch_usd']}$ — остаётся на HTX, уйдёт со следующим выводом.")
+            d["unw_qty"] = d["unw_cost"] = "0"
+            return
+    if _dd(d, "bought_qty") > 0:
+        await notify(f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}). Всего куплено "
+                     f"{fmt(d['bought_qty'])} шт. на {fmt(d['bought_cost'])}$, дальше довожу до продажи.")
+
+
+# ---------- вывод партий ----------
+
+async def withdraw_batch(d):
     coin, cfg = d["coin"], d["cfg"]
     res = await resolve_coin(coin, cfg)
-    if d["decimals"] is None:
-        d["decimals"] = await wallet_decimals(cfg["net"], res["token"])
-    if d["wallet_baseline"] is None:
-        d["wallet_baseline"] = await wallet_balance(cfg["net"], res["token"])
-
-    free, _ = await htx_balance(hcoin(coin, cfg))
+    hc = hcoin(coin, cfg)
+    free, _ = await htx_balance(hc)
     base = free - res["htx_fee"]
-    amount = round_down(base, res["htx_withdraw_step"])
-    if amount <= 0 or amount < res["htx_min_withdraw"]:
-        await start_rescue(d, f"сумма к выводу {fmt(amount)} меньше минимума HTX {fmt(res['htx_min_withdraw'])}")
-        return
-    # HTX часто не отдаёт комиссию вывода (или отдаёт неверную), и тогда заявка на
-    # весь баланс отклоняется из-за нехватки на комиссию. Поэтому при отказе
-    # пробуем ещё раз с запасом 1% / 3% / 5% — и только потом считаем вывод закрытым.
-    wid, errors = None, []
+    unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
+    breakeven = unw_c / unw_q if unw_q > 0 else None
+    wid, errors, amount = None, [], D(0)
+    # HTX часто не отдаёт (или отдаёт неверно) комиссию вывода — при отказе
+    # пробуем ещё раз с запасом 1% / 3% / 5%.
     for share in ("1", "0.99", "0.97", "0.95"):
         amount = round_down(base * D(share), res["htx_withdraw_step"])
-        if amount < res["htx_min_withdraw"]:
+        if amount <= 0 or amount < res["htx_min_withdraw"]:
             break
         try:
-            wid = await htx_withdraw(wallet_address(cfg["net"]), hcoin(coin, cfg), amount,
-                                     res["htx_chain"], res["htx_fee"])
+            wid = await htx_withdraw(wallet_address(cfg["net"]), hc, amount, res["htx_chain"], res["htx_fee"])
             break
         except ExchangeError as e:
             errors.append(str(e))
             await asyncio.sleep(1)
         except Exception:
-            # Обрыв связи: заявка могла и уйти. Если монеты на HTX уже заморожены —
-            # считаем, что ушла, и не подаём вторую.
             await asyncio.sleep(3)
-            now_free, _ = await htx_balance(hcoin(coin, cfg))
+            now_free, _ = await htx_balance(hc)
             if now_free < free * D("0.1"):
                 wid = "unknown"
                 break
             raise
     if wid is None:
-        reason = "HTX отклонил заявку на вывод: " + (errors[-1] if errors else "сумма меньше минимума")
+        if not errors and amount < res["htx_min_withdraw"]:
+            return  # меньше минимума HTX — копим дальше
+        reason = "HTX отклонил заявку на вывод: " + (errors[-1] if errors else "?")
         if errors and "temp-addr" in errors[-1]:
-            reason += "\n" + address_book_hint(hcoin(coin, cfg), res["htx_chain"], wallet_address(cfg["net"]))
-        await start_rescue(d, reason)
+            reason += "\n" + address_book_hint(hc, res["htx_chain"], wallet_address(cfg["net"]))
+        await _batch_failed(d, breakeven, reason)
         return
-    d["withdraw_id"], d["withdraw_at"], d["cur_withdraw"] = str(wid), time.time(), str(amount)
-    d["stage"] = "withdraw_check"
-    await notify(f"📤 <b>{coin}</b>: заявка на вывод {fmt(amount)} с HTX (сеть {res['htx_chain']}) "
-                 f"принята, проверю баланс через {arb['check_sec']} сек.")
+    d["batches"].append({"id": str(wid), "at": time.time(), "amount": str(amount),
+                         "qty": str(unw_q), "cost": str(unw_c), "ok": False, "fwd": False})
+    d["unw_qty"] = d["unw_cost"] = "0"
+    await save()
+    await notify(f"📤 <b>{coin}</b>: вывожу партию {fmt(amount)} шт. (куплено на {fmt(unw_c)}$) "
+                 f"в сети {res['htx_chain']}; проверю через {arb['check_sec']} сек."
+                 + (" Ордер на покупку продолжает стоять." if d["order"] else ""))
 
 
-async def stage_withdraw_check(d):
-    coin = d["coin"]
-    wait = d["withdraw_at"] + arb["check_sec"] - time.time()
-    if wait > 0:
-        await asyncio.sleep(wait)
-    free, frozen = await htx_balance(hcoin(coin, d["cfg"]))
-    cur_withdraw = D(d["cur_withdraw"])
-    avg = D(d["cur_cost"]) / D(d["cur_qty"])
-    if free >= cur_withdraw * D("0.05") and free * avg >= 1:
-        await start_rescue(d, f"через {arb['check_sec']} сек. свободный баланс {coin} на HTX не обнулился "
-                              f"({fmt(free)} шт.) — вывод не прошёл")
-        return
-    d["qty"] = str(D(d["qty"]) + D(d["cur_qty"]))
-    d["cost"] = str(D(d["cost"]) + D(d["cur_cost"]))
-    d["expected"] = str(D(d["expected"]) + cur_withdraw)
-    await notify(f"✅ <b>{coin}</b>: вывод ушёл (на HTX свободно {fmt(free)}, заморожено {fmt(frozen)}).")
-    if d["phase"] == "probe":
-        d["phase"] = "full"
-        d["stage"] = "buy"
-    else:
-        d["stage"] = "wallet_wait"
-        d["wallet_wait_since"] = time.time()
-
-
-async def start_rescue(d, reason):
-    """Вывод не удался: продаём остаток монеты на HTX в ноль. Сделка при этом
-    либо завершается (если это была проба/единственная покупка), либо едет
-    дальше только с тем, что уже успешно выведено."""
-    r = {
-        "id": uuid.uuid4().hex[:8], "coin": hcoin(d["coin"], d["cfg"]), "symbol": hsym(d["coin"], d["cfg"]),
-        "breakeven": str(D(d["cur_cost"]) / D(d["cur_qty"])),
-        "reason": reason, "order_id": None, "created": time.time(),
-    }
+async def _batch_failed(d, breakeven, reason):
+    """Вывод не прошёл: покупку прекращаем, монеты на HTX продаём в ноль."""
+    await _cancel_order(d)
+    d["buying"] = False
+    d["unw_qty"] = d["unw_cost"] = "0"
+    r = {"id": uuid.uuid4().hex[:8], "coin": hcoin(d["coin"], d["cfg"]), "symbol": hsym(d["coin"], d["cfg"]),
+         "breakeven": str(breakeven or 0), "reason": reason, "order_id": None, "created": time.time()}
     rescues.append(r)
     await save()
     spawn(run_rescue(r))
-    if D(d["expected"]) > 0:
-        d["stage"] = "wallet_wait"
-        d["wallet_wait_since"] = time.time()
-    else:
-        d["stage"] = "done"
 
+
+async def check_batches(d):
+    pending = [b for b in d["batches"] if not b["ok"]]
+    if not pending:
+        return
+    coin = d["coin"]
+    for b in pending:
+        if time.time() < b["at"] + arb["check_sec"]:
+            continue
+        free, frozen = await htx_balance(hcoin(coin, d["cfg"]))
+        # Свободно сейчас = новые покупки после вывода + то, что НЕ ушло.
+        stuck = free - _dd(d, "unw_qty")
+        amount = D(b["amount"])
+        be = D(b["cost"]) / D(b["qty"]) if D(b["qty"]) > 0 else D(0)
+        if stuck >= amount * D("0.05") and stuck * be >= 1:
+            d["batches"].remove(b)
+            await _batch_failed(d, be, f"через {arb['check_sec']} сек. партия {fmt(amount)} шт. всё ещё "
+                                       f"свободна на HTX — вывод не прошёл")
+            return
+        b["ok"] = True
+        _add(d, "qty", b["qty"])
+        _add(d, "cost", b["cost"])
+        d["probe_left"] = None  # первая партия дошла до вывода — проба пройдена
+        await notify(f"✅ <b>{coin}</b>: партия {fmt(amount)} шт. ушла с HTX (заморожено {fmt(frozen)}).")
+
+
+# ---------- кошелёк → MEXC ----------
+
+async def transport_step(d):
+    if time.time() - d["last_wallet_check"] < 10:
+        return
+    d["last_wallet_check"] = time.time()
+    waiting = [b for b in d["batches"] if b["ok"] and not b["fwd"]]
+    if not waiting and not d["forwarding"]:
+        return
+    coin, net = d["coin"], d["cfg"]["net"]
+    scale = D(10) ** d["decimals"]
+    bal = D(await wallet_balance(net, d["token"])) / scale
+
+    if d["forwarding"]:
+        # Рестарт посреди пересылки: монет на кошельке почти нет — значит ушли.
+        oldest = D(waiting[0]["amount"]) if waiting else D(0)
+        if bal < oldest * D("0.1"):
+            for b in waiting:
+                b["fwd"] = True
+                _add(d, "forwarded", b["amount"])
+            d["forwarding"] = False
+            return
+        d["forwarding"] = False
+
+    if bal < D(waiting[0]["amount"]) * D("0.9"):
+        if time.time() - waiting[0]["at"] > 1800 and not waiting[0].get("warned"):
+            waiting[0]["warned"] = True
+            await notify(f"⏳ <b>{coin}</b>: за 30 минут партия так и не пришла на кошелёк "
+                         f"<code>{wallet_address(net)}</code> ({NET_TITLES[net]}). Продолжаю ждать.")
+        return
+
+    res = await resolve_coin(coin, d["cfg"])
+    address = await mexc_deposit_address(coin, res["mexc_net"])
+    d["forwarding"] = True
+    await save()
+    tx, sent_raw = await wallet_send_all(net, d["token"], address)
+    sent = D(sent_raw) / scale
+    d["forwarding"] = False
+    # Помечаем партии, которые покрывает эта отправка (могли прийти сразу несколько).
+    covered = D(0)
+    for b in waiting:
+        if covered + D(b["amount"]) * D("0.9") <= sent:
+            covered += D(b["amount"])
+            b["fwd"] = True
+    _add(d, "forwarded", sent)
+    await notify(f"🚚 <b>{coin}</b>: отправил {fmt(sent)} шт. на MEXC\ntx: <code>{tx}</code>")
+
+
+# ---------- продажа на MEXC ----------
+
+async def sell_step(d, alarm):
+    if d["sell_manual"] or _dd(d, "qty") <= 0:
+        return
+    if not d["sell"] and time.time() - d["last_mexc_check"] < 3:
+        return
+    d["last_mexc_check"] = time.time()
+    coin, cfg = d["coin"], d["cfg"]
+    sym = f"{coin}USDT"
+    info = await mexc_symbol(sym)
+    breakeven = deal_breakeven(d)
+    target = breakeven * (1 + D(cfg["pct"]) / 100)
+
+    # Учёт исполнений стоящей лесенки.
+    s = d["sell"]
+    if s:
+        o = await mexc_order(sym, s["id"])
+        dq, dc = o["filled"] - D(s["filled"]), o["quote"] - D(s["quote"])
+        if dq > 0:
+            s["filled"], s["quote"] = str(o["filled"]), str(o["quote"])
+            _add(d, "sold_qty", dq)
+            _add(d, "proceeds", dc)
+        if o["status"] == "FILLED":
+            d["sell"] = None
+        elif o["status"] in ("CANCELED", "PARTIALLY_CANCELED") and not s.get("self_cancel"):
+            d["sell"] = None
+            d["sell_manual"] = True
+            await notify(f"ℹ️ <b>{coin}</b>: ордер на продажу на MEXC отменён вручную — дальше продаёшь сам.")
+            return
+
+    free = await mexc_free(coin)
+    new = round_down(free - D(d["mexc_baseline"]), info["step"])
+    enough = lambda q, p: q > 0 and q * p >= info["min_value"]
+
+    # 1) Новое зачисление — сразу по ордерам на покупку, пока держится процент.
+    if enough(new, breakeven):
+        bids, _ = await mexc_depth(sym)
+        if bids and bids[0][0] >= target:
+            price = round_up(target, info["tick"])
+            oid = await mexc_place(sym, "SELL", "IMMEDIATE_OR_CANCEL", new, price)
+            o = await mexc_wait_final(sym, oid)
+            _add(d, "sold_qty", o["filled"])
+            _add(d, "proceeds", o["quote"])
+            new -= o["filled"]
+            if o["filled"] > 0:
+                await notify(f"💰 <b>{coin}</b>: продано на MEXC {fmt(o['filled'])} шт. на {fmt(o['quote'])}$ "
+                             f"(≥ {fmt(price)}, цель +{cfg['pct']}%).")
+
+    s = d["sell"]
+    has_more = enough(new, breakeven)
+    if not s and not has_more:
+        if d["ladder_since"] is not None:
+            d["ladder_since"] = None
+            if alarm["id"]:
+                alarm_end(alarm["id"])
+                alarm["id"] = None
+        return
+
+    # 2) Лесенка: безубыток, потом −step_pct% каждые step_sec, до пола; спам.
+    if d["ladder_since"] is None:
+        d["ladder_since"] = time.time()
+    k = int((time.time() - d["ladder_since"]) // arb["step_sec"])
+    _, asks = await mexc_depth(sym)
+    my_price = D(s["price"]) if s else None
+    others = [p for p, q in asks if p != my_price]
+    price, floor = ladder_price(breakeven, k, arb["step_pct"], arb["floor_pct"],
+                                others[0] if others else None, info["tick"])
+    if s and D(s["price"]) == price and not has_more:
+        return
+    qty = new
+    if s:
+        s["self_cancel"] = True
+        await mexc_cancel(sym, s["id"])
+        o = await mexc_wait_final(sym, s["id"], timeout=5)
+        dq, dc = o["filled"] - D(s["filled"]), o["quote"] - D(s["quote"])
+        _add(d, "sold_qty", dq)
+        _add(d, "proceeds", dc)
+        d["sell"] = None
+        qty = round_down(await mexc_free(coin) - D(d["mexc_baseline"]), info["step"])
+    if not enough(qty, price):
+        return
+    oid = await mexc_place(sym, "SELL", "LIMIT", qty, price)
+    d["sell"] = {"id": oid, "price": str(price), "qty": str(qty), "filled": "0", "quote": "0"}
+    await save()
+    text = (f"<b>{coin}</b>: не удалось продать на MEXC с плановой выгодой (цель {fmt(target)}). "
+            f"Лимитка {fmt(qty)} шт. по {fmt(price)} ({(price / breakeven - 1) * 100:+.2f}% к безубытку "
+            f"{fmt(breakeven)})" + (" — это пол, ниже не опускаю." if price <= floor else "."))
+    if alarm["id"] is None:
+        alarm["id"] = alarm_start(text)
+    else:
+        alarm_update(alarm["id"], text)
+
+
+async def finish_deal(d):
+    cost, proceeds = _dd(d, "cost"), _dd(d, "proceeds")
+    if _dd(d, "qty") <= 0:
+        return  # ничего не вывели (или вывод не прошёл — тогда итог даст аварийная продажа)
+    pnl = proceeds - cost
+    await notify(
+        f"🏁 <b>{d['coin']}</b>: сделка завершена.\n"
+        f"Куплено на HTX и выведено: {fmt(d['qty'])} шт. за {fmt(cost)}$\n"
+        f"Продано на MEXC: {fmt(d['sold_qty'])} шт. за {fmt(proceeds)}$\n"
+        f"Итог: <b>{pnl:+.2f}$</b> ({(pnl / cost * 100 if cost else 0):+.2f}%)")
+
+
+# ---------- аварийная продажа на HTX ----------
 
 async def run_rescue(r):
     coin, sym = r["coin"], r.get("symbol") or f"{r['coin']}usdt"
@@ -1597,176 +1932,6 @@ async def run_rescue(r):
         if r in rescues:
             rescues.remove(r)
         await save()
-
-
-async def stage_wallet_wait(d):
-    coin, net = d["coin"], d["cfg"]["net"]
-    need = int(D(d["expected"]) * D("0.95") * (D(10) ** d["decimals"]))
-    since = d.setdefault("wallet_wait_since", time.time())
-    warned = False
-    while True:
-        bal = await wallet_balance(net, d["token"])
-        if bal - d["wallet_baseline"] >= need:
-            await notify(f"👛 <b>{coin}</b>: монеты на кошельке ({fmt(D(bal) / (D(10) ** d['decimals']))}), пересылаю на MEXC.")
-            d["stage"] = "forwarding"
-            d["forward_sent"] = False
-            return
-        if not warned and time.time() - since > 1800:
-            warned = True
-            await notify(f"⏳ <b>{coin}</b>: за 30 минут монеты так и не пришли на кошелёк "
-                         f"<code>{wallet_address(net)}</code> ({NET_TITLES[net]}). Продолжаю ждать.")
-        await asyncio.sleep(10)
-
-
-async def stage_forward(d):
-    coin, net = d["coin"], d["cfg"]["net"]
-    scale = D(10) ** d["decimals"]
-    if d.get("forward_sent"):
-        # Рестарт посреди пересылки: если монет на кошельке уже почти нет —
-        # транзакция ушла, ждём зачисления; иначе отправляем заново.
-        bal = await wallet_balance(net, d["token"])
-        if D(bal) < D(d["expected"]) * scale * D("0.1"):
-            d.setdefault("forwarded", d["expected"])
-            d["stage"] = "mexc_wait"
-            return
-    res = await resolve_coin(coin, d["cfg"])
-    address = await mexc_deposit_address(coin, res["mexc_net"])
-    d["mexc_baseline"] = str(await mexc_free(coin))
-    d["forward_sent"] = True
-    await save()
-    tx, amount = await wallet_send_all(net, d["token"], address)
-    d["forwarded"] = str(D(amount) / scale)
-    d["stage"] = "mexc_wait"
-    d["mexc_wait_since"] = time.time()
-    await notify(f"🚚 <b>{coin}</b>: отправил {fmt(d['forwarded'])} на MEXC <code>{address}</code>\ntx: <code>{tx}</code>")
-
-
-async def stage_mexc_wait(d):
-    coin = d["coin"]
-    need = D(d["forwarded"]) * D("0.95")
-    since = d.setdefault("mexc_wait_since", time.time())
-    warned = False
-    while True:
-        free = await mexc_free(coin)
-        got = free - D(d["mexc_baseline"])
-        if got >= need:
-            d["received"] = str(got)
-            d["stage"] = "sell"
-            await notify(f"🏦 <b>{coin}</b>: зачислено на MEXC {fmt(got)} шт., продаю.")
-            return
-        if not warned and time.time() - since > 1800:
-            warned = True
-            await notify(f"⏳ <b>{coin}</b>: за 30 минут депозит на MEXC так и не зачислен. Продолжаю ждать.")
-        await asyncio.sleep(10)
-
-
-async def stage_sell(d):
-    coin, cfg = d["coin"], d["cfg"]
-    sym = f"{coin}USDT"
-    info = await mexc_symbol(sym)
-    breakeven = D(d["cost"]) / D(d["qty"])
-    target = breakeven * (1 + D(cfg["pct"]) / 100)
-    left = round_down(min(D(d["received"]), await mexc_free(coin)), info["step"])
-    proceeds = D(d.get("proceeds") or 0)
-
-    # Рестарт посреди продажи: снимаем свой висящий ордер, начинаем заново.
-    if d.get("sell_order"):
-        await mexc_cancel(sym, d["sell_order"])
-        o = await mexc_wait_final(sym, d["sell_order"], timeout=5)
-        proceeds += o["quote"]
-        d["sell_order"] = None
-        left = round_down(await mexc_free(coin), info["step"])
-
-    def done_enough(qty, price):
-        return qty <= 0 or qty * price < info["min_value"]
-
-    # 1) Моментально по ордерам на покупку, пока цена даёт минимальный %.
-    bids, _ = await mexc_depth(sym)
-    if bids and bids[0][0] >= target and not d.get("instant_done"):
-        price = round_up(target, info["tick"])
-        oid = await mexc_place(sym, "SELL", "IMMEDIATE_OR_CANCEL", left, price)
-        o = await mexc_wait_final(sym, oid)
-        left -= o["filled"]
-        proceeds += o["quote"]
-        await notify(f"💰 <b>{coin}</b>: продано сразу {fmt(o['filled'])} шт. на {fmt(o['quote'])}$ (≥ {fmt(price)}).")
-    d["instant_done"] = True
-    d["proceeds"] = str(proceeds)
-
-    if done_enough(left, breakeven):
-        await finish_deal(d, proceeds)
-        return
-
-    # 2) Лесенка + спам.
-    aid = alarm_start(f"<b>{coin}</b>: не удалось продать на MEXC с плановой выгодой "
-                      f"(цель {fmt(target)}, безубыток {fmt(breakeven)}). Осталось {fmt(left)} шт., "
-                      f"работает лесенка.")
-    k = 0
-    order_id, order_price = None, None
-    try:
-        while True:
-            _, asks = await mexc_depth(sym)
-            others = [p for p, q in asks if p != order_price]
-            best_other = others[0] if others else None
-            price, floor = ladder_price(breakeven, k, arb["step_pct"], arb["floor_pct"],
-                                        best_other, info["tick"])
-            if price != order_price:
-                if order_id:
-                    await mexc_cancel(sym, order_id)
-                    o = await mexc_wait_final(sym, order_id, timeout=5)
-                    left -= o["filled"]
-                    proceeds += o["quote"]
-                    d["proceeds"] = str(proceeds)
-                    order_id = d["sell_order"] = None
-                    if done_enough(left, breakeven):
-                        break
-                left = round_down(left, info["step"])
-                order_id = await mexc_place(sym, "SELL", "LIMIT", left, price)
-                order_price = price
-                d["sell_order"] = order_id
-                await save()
-                pct = (price / breakeven - 1) * 100
-                alarm_update(aid, f"<b>{coin}</b>: не удалось продать на MEXC с плановой выгодой "
-                                  f"(цель {fmt(target)}). Лимитка {fmt(left)} шт. по {fmt(price)} "
-                                  f"({pct:+.2f}% к безубытку {fmt(breakeven)})"
-                                  + (" — это пол, ниже не опускаю." if price <= floor else "."))
-            # Ждём step_sec, следя за исполнением.
-            deadline = time.time() + arb["step_sec"]
-            filled = False
-            while time.time() < deadline:
-                await asyncio.sleep(5)
-                o = await mexc_order(sym, order_id)
-                if o["status"] == "FILLED":
-                    left -= o["filled"]
-                    proceeds += o["quote"]
-                    filled = True
-                    break
-                if o["status"] in ("CANCELED", "PARTIALLY_CANCELED"):
-                    # Отменили руками на бирже — отдаём управление человеку.
-                    left -= o["filled"]
-                    proceeds += o["quote"]
-                    await notify(f"ℹ️ <b>{coin}</b>: ордер на MEXC отменён вручную, бот прекращает продажу.")
-                    filled = True
-                    break
-            if filled:
-                d["sell_order"] = None
-                break
-            if price > floor:
-                k += 1
-    finally:
-        alarm_end(aid)
-    d["proceeds"] = str(proceeds)
-    await finish_deal(d, proceeds)
-
-
-async def finish_deal(d, proceeds):
-    cost = D(d["cost"])
-    pnl = proceeds - cost
-    await notify(
-        f"🏁 <b>{d['coin']}</b>: сделка завершена.\n"
-        f"Куплено на HTX: {fmt(d['qty'])} шт. за {fmt(cost)}$\n"
-        f"Продано на MEXC за: {fmt(proceeds)}$\n"
-        f"Итог (без учёта остатков): <b>{pnl:+.2f}$</b> ({(pnl / cost * 100 if cost else 0):+.2f}%)")
-    d["stage"] = "done"
 
 
 # ================= КОМАНДЫ =================
@@ -1851,17 +2016,28 @@ async def cmd_arb(message: types.Message):
         lines.append("нет — ждёт спред" if arb["enabled"] else "нет")
     else:
         d = deal
-        lines.append(f"<b>{d['coin']}</b> · {STAGE_RU.get(d['stage'], d['stage'])} · идёт {_ago(d.get('started'))}"
-                     + (" · проба" if d.get("phase") == "probe" else ""))
-        if D(d.get("qty") or 0) > 0:
-            lines.append(f"куплено и выведено: {fmt(d['qty'])} шт. за {fmt(d['cost'])}$ "
-                         f"(безубыток {fmt(D(d['cost']) / D(d['qty']))})")
-        elif d.get("cur_qty"):
-            lines.append(f"куплено: {fmt(d['cur_qty'])} шт. за {fmt(d['cur_cost'])}$")
-        if d.get("forwarded"):
-            lines.append(f"отправлено на MEXC: {fmt(d['forwarded'])} шт.")
-        if d.get("received"):
-            lines.append(f"зачислено на MEXC: {fmt(d['received'])} шт., выручка пока {fmt(d.get('proceeds') or 0)}$")
+        lines.append(f"<b>{d['coin']}</b> · идёт {_ago(d.get('started'))}")
+        o = d.get("order")
+        if o:
+            lines.append(f"📌 ордер на покупку HTX: {fmt(o['amount'])} шт. по {fmt(o['price'])}, "
+                         f"исполнено {fmt(o['filled'])}")
+        elif d.get("buying"):
+            lines.append("покупка: ждёт возможности" + (f" (проба, осталось {fmt(d['probe_left'])}$)"
+                                                        if d.get("probe_left") is not None else ""))
+        else:
+            lines.append("покупка закончена")
+        lines.append(f"куплено всего: {fmt(d['bought_qty'])} шт. на {fmt(d['bought_cost'])}$; "
+                     f"ещё не выведено {fmt(d['unw_qty'])} шт.")
+        checking = [b for b in d["batches"] if not b["ok"]]
+        on_way = [b for b in d["batches"] if b["ok"] and not b["fwd"]]
+        if checking or on_way:
+            lines.append(f"партии: на проверке вывода {len(checking)}, идут на кошелёк {len(on_way)}")
+        be = deal_breakeven(d)
+        if be:
+            lines.append(f"выведено {fmt(d['qty'])} шт. (безубыток {fmt(be)}), на MEXC отправлено {fmt(d['forwarded'])}")
+        if _dd(d, "sold_qty") > 0 or d.get("sell"):
+            lines.append(f"продано на MEXC: {fmt(d['sold_qty'])} шт. на {fmt(d['proceeds'])}$"
+                         + (f"; лесенка {fmt(d['sell']['qty'])} шт. по {fmt(d['sell']['price'])}" if d.get("sell") else ""))
     if rescues:
         lines.append(f"⚠️ Аварийных продаж на HTX: {len(rescues)} ({', '.join(r['coin'] for r in rescues)})")
     active_alarms = [a for a in alarms.values() if not a["acked"]]
@@ -1886,6 +2062,8 @@ async def cmd_arb(message: types.Message):
         f"продажа на MEXC: шаг −{arb['step_pct']}% каждые {arb['step_sec']} сек., пол −{arb['floor_pct']}% от безубытка",
         f"проверка вывода HTX через {arb['check_sec']} сек. · стакан MEXC при покупке: "
         f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}",
+        f"свой ордер первым в стакане HTX: {'вкл' if arb.get('maker', True) else 'выкл'} · "
+        f"вывод партиями от {arb.get('batch_usd', 15):g}$",
         "",
         _keys_text(),
         "",
@@ -1914,6 +2092,8 @@ async def cmd_help(message: types.Message):
         "/arb_live on · /arb_live off — реальные сделки / тестовый режим\n"
         "/arb_set step 0.3 · interval 120 · floor 1.2 · check 60 · poll 1 — параметры\n"
         "/arb_set depth on|off — учитывать стакан MEXC при покупке (по умолчанию on)\n"
+        "/arb_set maker on|off — ставить свой ордер первым в стакане HTX (по умолчанию on)\n"
+        "/arb_set batch 15 — с какой суммы купленного сразу выводить партию\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
@@ -1921,14 +2101,17 @@ async def cmd_help(message: types.Message):
         "/arb_reset — забыть зависшую сделку (после ручного разбора)\n"
         "/stop — остановить спам\n\n"
         "<b>Как идёт сделка</b>\n"
-        "1. Спред (MEXC bid к HTX ask) ≥ заданного % → бот выкупает ордера на продажу на HTX "
-        "по цене не выше той, где спред ещё равен минимуму.\n"
-        "2. Вывод на кошелёк бота. HTX отклонил заявку или через минуту свободный баланс монеты "
-        "не обнулился → продажа на HTX в ноль; не продалось → спам.\n"
-        "3. Монеты на кошельке → пересылка на депозитный адрес MEXC.\n"
-        "4. На MEXC: сразу по ордерам на покупку, пока выгода ≥ минимума. Остаток — лимитка в безубыток "
-        "(или на тик ниже ближайшего продавца, если он стоит ниже), каждые 2 мин. −0,3%, до −1,2%. "
-        "Не удалось взять плановую выгоду → спам до /stop или до продажи.",
+        "1. Покупка на HTX: если есть продавцы по цене, дающей твой % к MEXC, — выкупает их сразу. "
+        "Если нет — ставит свой ордер на покупку первым в стакане (на тик выше лучшего чужого, но не дороже "
+        "цены с твоим %) и переставляет его, как только меняется цена на MEXC или его перебивают.\n"
+        "2. Как только куплено на 15$ (/arb_set batch) — сразу вывод этой партии на кошелёк бота; "
+        "ордер при этом продолжает стоять и покупать. HTX отклонил вывод или через минуту партия всё ещё "
+        "на балансе — покупка останавливается, монеты продаются на HTX в ноль, не продалось — спам.\n"
+        "3. Каждая дошедшая партия пересылается на депозит MEXC.\n"
+        "4. На MEXC: сразу по ордерам на покупку, пока выгода ≥ твоего %. Остаток — лимитка в безубыток "
+        "(или на тик ниже ближайшего продавца), каждые 2 мин. −0,3%, до −1,2%; спам до /stop или до продажи.\n"
+        "5. Ордер снимается, если первым с твоим % встать уже нельзя; через минуту без возможности покупка "
+        "заканчивается, сделка доводится до продажи.",
         parse_mode="HTML")
 
 
@@ -2289,8 +2472,14 @@ async def cmd_set(message: types.Message, command: CommandObject):
         return
     keys = {"step": ("step_pct", float), "interval": ("step_sec", int),
             "floor": ("floor_pct", float), "check": ("check_sec", int),
-            "spam": ("spam_sec", float), "poll": ("poll_sec", float)}
+            "spam": ("spam_sec", float), "poll": ("poll_sec", float),
+            "batch": ("batch_usd", float)}
     args = (command.args or "").split()
+    if len(args) == 2 and args[0].lower() == "maker" and args[1].lower() in ("on", "off"):
+        arb["maker"] = args[1].lower() == "on"
+        await save()
+        await message.answer(f"✅ Свой ордер на покупку первым в стакане HTX: {'вкл' if arb['maker'] else 'выкл'}")
+        return
     if len(args) == 2 and args[0].lower() == "depth" and args[1].lower() in ("on", "off"):
         arb["mexc_depth"] = args[1].lower() == "on"
         await save()
@@ -2370,9 +2559,14 @@ async def start():
     """Восстанавливает состояние и запускает фоновые задачи. Возвращает их список."""
     await load()
     tasks = [asyncio.create_task(spam_loop()), asyncio.create_task(engine_loop())]
-    if deal and deal.get("stage") != "done":
-        await notify(f"♻️ Бот перезапущен посреди сделки <b>{deal['coin']}</b> "
-                     f"(этап «{deal['stage']}») — продолжаю.")
+    global deal
+    if deal and deal.get("v") != 2:
+        await notify(f"⚠️ Незавершённая сделка <b>{deal.get('coin')}</b> из прошлой версии бота сброшена — "
+                     f"проверь HTX/кошелёк/MEXC вручную.")
+        deal = None
+        await save()
+    if deal:
+        await notify(f"♻️ Бот перезапущен посреди сделки <b>{deal['coin']}</b> — продолжаю.")
         tasks.append(spawn(run_deal()))
     for r in list(rescues):
         tasks.append(spawn(run_rescue(r)))
