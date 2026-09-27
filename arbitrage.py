@@ -1992,7 +1992,6 @@ async def engine_loop():
                         if await try_start(coin, cfg, opp, check_only=True):
                             buyer["preempt"] = (f"переключаюсь на {coin}: спред {spread:.2f}%"
                                                 + (" и есть продавцы по нужной цене" if opp["mode"] == "taker" else ""))
-                            await notify(f"🔀 <b>{buyer['coin']}</b>: снимаю ожидающий ордер — {buyer['preempt']}.")
                             break
         except Exception as e:
             await note_once("engine_err", f"⚠️ Автоарбитраж: ошибка цикла: <code>{e}</code>", every=600)
@@ -2365,8 +2364,6 @@ async def buy_step(d):
         # Первым с нужным % встать нельзя — снимаем ордер и ждём.
         if d["order"]:
             await _cancel_order(d)
-            await notify(f"⏸ <b>{coin}</b>: первым в стакане HTX с {cfg['pct']}% к MEXC уже не встать — "
-                         f"ордер снят (MEXC bid {fmt(mbids[0][0])}, макс. цена {fmt(max_price)}).")
         await _idle(d, "спред ушёл")
         return
     d["idle_since"] = None
@@ -2381,14 +2378,11 @@ async def buy_step(d):
     if amount <= 0 or amount < info["min_qty"] or amount * want < info["min_value"]:
         return
     oid = await htx_place(hpair, "buy-limit-maker", amount, want)
-    first = my_price is None
     d["order"] = {"id": oid, "price": str(want), "amount": str(amount), "filled": "0", "cash": "0"}
     await save()
     spread = (mbids[0][0] - want) / want * 100
     d["maker_spread"] = str(spread)
-    if first:
-        await notify(f"📌 <b>{coin}</b>: поставил ордер на покупку на HTX первым: {fmt(amount)} шт. по {fmt(want)} "
-                     f"(на {fmt(amount * want)}$, спред к MEXC {spread:.2f}%). Слежу за ценой.")
+    # Без уведомления: ордер переставляется часто, его видно в /arb. Пишем только о покупках.
 
 
 async def _idle(d, why):
