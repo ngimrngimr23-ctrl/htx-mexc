@@ -1481,6 +1481,54 @@ async def htx_book_address(currency, chain, address):
     return address.lower() if _is_evm_address(address) else address
 
 
+_probe_cache = {}
+
+
+async def htx_withdraw_probe(currency, chain, address, fee):
+    """Проверка адреса пробной заявкой на вывод, которая НЕ МОЖЕТ исполниться:
+    сумма заведомо больше всего баланса монеты. HTX откажет в любом случае, а по
+    тексту отказа видно, принял ли он адрес: «temp-addr» — нет, «не хватает
+    баланса» — да. Результат кэшируется на час, чтобы не дёргать вывод зря.
+    True — адрес принят, False — отвергнут как временный, None — не понять."""
+    key = (currency.lower(), chain, address.lower())
+    hit = _probe_cache.get(key)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    free, frozen = await htx_balance(currency)
+    amount = round_down((free + frozen + 1) * 1000, D("0.0001"))
+    result = None
+    try:
+        await htx_withdraw(address, currency, amount, chain, fee)
+        result = True  # не должно случиться: сумма больше баланса — но адрес точно принят
+    except ExchangeError as e:
+        msg = str(e).lower()
+        if "temp-addr" in msg or "temporary" in msg:
+            result = False
+        elif any(w in msg for w in ("insufficient", "balance", "not enough", "exceed", "余额")):
+            result = True
+    except Exception:
+        result = None
+    _probe_cache[key] = (time.time(), result)
+    return result
+
+
+async def htx_address_status(currency, chain, address, fee):
+    """(True/False/None, как проверено): книга → общий адрес → пробная заявка."""
+    try:
+        found, kind = await htx_find_saved(currency, chain, address)
+        if found:
+            return True, ("в адресной книге" if kind == "монета" else "общий адрес на сеть")
+    except Exception as e:
+        address_book_errors[currency.upper()] = str(e)[:200]
+    spelled = address.lower() if _is_evm_address(address) else address
+    probe = await htx_withdraw_probe(currency, chain, spelled, fee)
+    if probe is True:
+        return True, "пробная заявка на вывод: HTX адрес принял"
+    if probe is False:
+        return False, "пробная заявка на вывод: HTX считает адрес временным"
+    return None, "не удалось проверить (ни книга, ни пробная заявка)"
+
+
 def address_book_hint(coin_htx, chain, address):
     extra = (" Для EVM-адреса (0x…) можно один раз добавить его как общий адрес на сеть — бот его увидит."
              if _is_evm_address(address) else "")
@@ -1971,11 +2019,10 @@ async def try_start(coin, cfg, opp):
         return False
     if not arb["dry_run"]:
         addr = wallet_address(cfg["net"])
-        saved = await htx_address_saved(res["htx_ticker"], res["htx_chain"], addr)
+        saved, how = await htx_address_status(res["htx_ticker"], res["htx_chain"], addr, res["htx_fee"])
         if saved is not True:
-            # Не нашли адрес ИЛИ не смогли проверить — не покупаем: иначе купим и не выведем.
-            why = ("адреса бота нет в адресной книге вывода HTX" if saved is False else
-                   f"не удалось проверить адресную книгу HTX: {address_book_errors.get(res['htx_ticker'].upper(), '?')}")
+            # Адрес не принят ИЛИ проверить не удалось — не покупаем: иначе купим и не выведем.
+            why = f"адрес бота для вывода с HTX не подтверждён ({how})"
             await note_once(f"book:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но не покупаю — {why}.\n"
                                             f"{address_book_hint(res['htx_ticker'], res['htx_chain'], addr)}\n"
                                             f"Проверить: /arb_htx {res['htx_ticker']} (раздел 4)",
@@ -2012,7 +2059,25 @@ async def try_start(coin, cfg, opp):
             f"<i>Реальные сделки: /arb_live on</i>"), every=300)
         return False
 
+    # Комиссия вывода фиксированная: партия должна быть хотя бы в 20 раз больше,
+    # иначе вывод съест выгоду (у L3, например, 630 монет ≈ 19$ за вывод).
+    fee_usd = res["htx_fee"] * opp["max_price"]
+    min_batch = max(D(arb["batch_usd"]), fee_usd * 20)
+    try:
+        usdt_free = (await htx_balance("usdt"))[0]
+    except Exception:
+        usdt_free = D(0)
+    if min_batch > usdt_free:
+        await note_once(f"fee:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но комиссия вывода с HTX "
+                                       f"~{fmt(fee_usd)}$ — окупается только партия от {fmt(min_batch)}$, "
+                                       f"а на HTX {fmt(usdt_free)} USDT. Не покупаю.", every=3 * 3600)
+        return False
     deal = new_deal(coin, cfg, res)
+    deal["min_batch"] = str(min_batch)
+    if deal["probe_left"] is not None and D(deal["probe_left"]) < min_batch:
+        deal["probe_left"] = str(min_batch)
+        await notify(f"ℹ️ <b>{coin}</b>: комиссия вывода ~{fmt(fee_usd)}$, поэтому проба увеличена до "
+                     f"{fmt(min_batch)}$ (иначе её вывод съест выгоду).")
     await save()
     spawn(run_deal())
     return True
@@ -2192,7 +2257,7 @@ async def buy_step(d):
         budget = min(budget, D(d["probe_left"]))
 
     # Партия набралась — выводим сразу, ордер при этом продолжает стоять.
-    if _dd(d, "unw_cost") >= D(arb["batch_usd"]):
+    if _dd(d, "unw_cost") >= D(d.get("min_batch") or arb["batch_usd"]):
         await withdraw_batch(d)
         if not d["buying"]:
             return
@@ -2296,11 +2361,12 @@ async def _stop_buying(d, why):
     d["buying"] = False
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
     if unw_q > 0:
-        if unw_c >= D(arb["batch_usd"]):
+        min_batch = D(d.get("min_batch") or arb["batch_usd"])
+        if unw_c >= min_batch:
             await withdraw_batch(d)
         else:
             await notify(f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}); остаток {fmt(unw_q)} шт. "
-                         f"на {fmt(unw_c)}$ меньше {arb['batch_usd']}$ — остаётся на HTX, уйдёт со следующим выводом.")
+                         f"на {fmt(unw_c)}$ меньше партии {fmt(min_batch)}$ — остаётся на HTX, уйдёт со следующим выводом.")
             d["unw_qty"] = d["unw_cost"] = "0"
             return
     if _dd(d, "bought_qty") > 0:
@@ -3049,14 +3115,14 @@ async def add_coin(coin, cfg):
                  f"\n{contract_line(coin, cfg, res)}")
         try:
             addr = wallet_address(net)
-            saved = await htx_address_saved(res["htx_ticker"], res["htx_chain"], addr)
+            saved, how = await htx_address_status(res["htx_ticker"], res["htx_chain"], addr, res["htx_fee"])
             if saved is True:
-                text += f"\n✅ Адрес бота есть в адресной книге вывода HTX"
+                text += f"\n✅ Адрес бота для вывода с HTX подтверждён: {how}"
             elif saved is False:
                 text += "\n⛔ " + address_book_hint(res["htx_ticker"], res["htx_chain"], addr) + \
-                        " Пока адреса нет, бот по этой монете не покупает."
+                        f" ({how}). Пока так, бот по этой монете не покупает."
             else:
-                text += "\n❔ Адресную книгу HTX проверить не удалось (ключ HTX?)"
+                text += f"\n❔ Адрес для вывода с HTX: {how}"
         except Exception as e:
             text += f"\n❔ Адрес бота: {e}"
     except Exception as e:
@@ -3197,8 +3263,13 @@ async def cmd_htx_check(message: types.Message, command: CommandObject):
         try:
             evm = evm_account().address
             found, kind = await htx_find_saved(coin, None, evm)
-            out.append(f"EVM-адрес бота: " + (f"✅ найден ({kind}): <code>{found}</code>" if found else
-                                              "❌ не найден ни у монеты, ни как общий"))
+            out.append(f"EVM-адрес бота в книге: " + (f"✅ найден ({kind}): <code>{found}</code>" if found else
+                                                      "❌ через API не виден ни у монеты, ни как общий"))
+            if not found:
+                chains = await htx_chains(coin)
+                ch = chains[0] if chains else {}
+                ok, how = await htx_address_status(coin, ch.get("chain"), evm, htx_chain_fee(ch))
+                out.append(("✅ " if ok else "❌ " if ok is False else "❔ ") + how)
         except Exception as e:
             out.append(f"EVM-адрес бота: проверить не удалось: {e}")
     except Exception as e:
