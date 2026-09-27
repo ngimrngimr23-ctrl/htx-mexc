@@ -2067,6 +2067,14 @@ async def try_start(coin, cfg, opp):
                                        f"~{fmt(fee_usd)}$ — окупается только партия от {fmt(min_batch)}$, "
                                        f"а на HTX {fmt(usdt_free)} USDT. Не покупаю.", every=3 * 3600)
         return False
+    # Ключ MEXC должен видеть балансы — иначе сделка встанет на первом же шаге.
+    try:
+        await mexc_free(coin)
+    except ExchangeError as e:
+        await note_once("mexc_perm", f"⛔ Не начинаю сделки: ключ MEXC не видит баланс — <code>{e}</code>\n"
+                                     f"Включи ключу на MEXC право «Аккаунт: просмотр информации об аккаунте» "
+                                     f"(и «Спот: торговля», «Кошелёк: просмотр депозитов»).", every=1800)
+        return False
     deal = new_deal(coin, cfg, res)
     deal["min_batch"] = str(min_batch)
     if deal["probe_left"] is not None and D(deal["probe_left"]) < min_batch:
