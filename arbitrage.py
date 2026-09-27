@@ -2486,8 +2486,11 @@ async def withdraw_batch(d):
     res = await resolve_coin(coin, cfg)
     hc = hcoin(coin, cfg)
     free, _ = await htx_balance(hc)
-    base = free - res["htx_fee"]
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
+    # Выводим только то, что купила эта сделка (HTX уже удержал из него торговую
+    # комиссию монетами), а не весь баланс: чужие монеты без цены покупки
+    # исказили бы безубыток. Комиссию вывода HTX берёт сверху суммы.
+    base = min(free, unw_q) - res["htx_fee"]
     breakeven = unw_c / unw_q if unw_q > 0 else None
     wid, errors, amount = None, [], D(0)
     to_addr = await htx_book_address(hc, res["htx_chain"], wallet_address(cfg["net"]))
@@ -2520,11 +2523,14 @@ async def withdraw_batch(d):
             await save()
         await _batch_failed(d, breakeven, reason)
         return
+    # qty партии — сколько РЕАЛЬНО ушло с HTX: по нему считается безубыток.
     d["batches"].append({"id": str(wid), "at": time.time(), "amount": str(amount),
-                         "qty": str(unw_q), "cost": str(unw_c), "ok": False, "fwd": False})
+                         "qty": str(amount), "bought": str(unw_q), "cost": str(unw_c), "ok": False, "fwd": False})
     d["unw_qty"] = d["unw_cost"] = "0"
     await save()
-    await notify(f"📤 <b>{coin}</b>: вывожу партию {fmt(amount)} шт. (куплено на {fmt(unw_c)}$) "
+    await notify(f"📤 <b>{coin}</b>: вывожу партию {fmt(amount)} шт. (куплено {fmt(unw_q)} шт. на {fmt(unw_c)}$, "
+                 f"остальное — торговая комиссия и комиссия вывода {fmt(res['htx_fee'])} шт.; "
+                 f"безубыток {fmt(unw_c / amount)}) "
                  f"в сети {res['htx_chain']}; проверю через {arb['check_sec']} сек."
                  + (" Ордер на покупку продолжает стоять." if d["order"] else ""))
 
@@ -2790,7 +2796,9 @@ async def finish_deal(d):
     pnl = proceeds - cost
     await notify(
         f"🏁 <b>{d['coin']}</b>: сделка завершена.\n"
-        f"Куплено на HTX и выведено: {fmt(d['qty'])} шт. за {fmt(cost)}$\n"
+        f"Куплено на HTX: {fmt(sum(D(b.get('bought', b['qty'])) for b in d['batches'] if b['ok']))} шт. "
+        f"за {fmt(cost)}$\n"
+        f"Выведено с HTX (после комиссий): {fmt(d['qty'])} шт., дошло до MEXC: {fmt(d['forwarded'])} шт.\n"
         f"Продано на MEXC: {fmt(d['sold_qty'])} шт. за {fmt(proceeds)}$\n"
         f"Итог: <b>{pnl:+.2f}$</b> ({(pnl / cost * 100 if cost else 0):+.2f}%)")
 
