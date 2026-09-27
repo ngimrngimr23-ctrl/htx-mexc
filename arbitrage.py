@@ -165,9 +165,21 @@ arb = {
     "carry": {},
 }
 
-# Партию выводим, только когда комиссия вывода съедает не больше этой доли
-# ожидаемой выгоды: при спреде 1.5% и комиссии 2.2$ это партия от ~450$.
-FEE_MAX_SHARE = Decimal("0.33")
+
+
+def net_pct(qty, cost, fee_qty, mexc_bid):
+    """Выгода партии в % ЧИСТЫМИ — после комиссии вывода с HTX (в монетах):
+    на MEXC дойдёт qty − fee_qty монет, продать их можно по mexc_bid."""
+    if qty <= 0 or cost <= 0:
+        return None
+    return ((qty - fee_qty) * mexc_bid - cost) / cost * 100
+
+
+def fee_extra_pct(fee_qty, mexc_bid, batch_cost):
+    """Сколько % спреда съест комиссия вывода, размазанная на партию batch_cost $."""
+    if batch_cost <= 0:
+        return Decimal(10) ** 6
+    return fee_qty * mexc_bid / batch_cost * 100
 
 # Сделки по монетам: {монета: сделка}. Покупать может только одна (весь USDT в
 # ней), остальные в это время доводят свои партии до продажи.
@@ -2082,7 +2094,7 @@ async def try_start(coin, cfg, opp, check_only=False):
         else:
             how = (f"Поставил бы ордер на покупку на HTX первым в стакане по {fmt(opp['maker_price'])} "
                    f"(макс. {fmt(opp['max_price'])}) и держал его под цену MEXC; "
-                   f"вывод одной партией, когда комиссия вывода ≤ {int(FEE_MAX_SHARE * 100)}% выгоды")
+                   f"вывод, когда после комиссии вывода чистыми остаётся {cfg['pct']}%")
         await note_once(f"dry:{coin}", (
             f"🧪 <b>ТЕСТ</b> · <b>{coin}</b>: спред {opp['spread']:.2f}% (мин. {cfg['pct']}%)\n"
             f"{how}\nMEXC bid {fmt(opp['mexc_bid'])}, USDT на HTX: {usdt}\n"
@@ -2094,23 +2106,21 @@ async def try_start(coin, cfg, opp, check_only=False):
             f"<i>Реальные сделки: /arb_live on</i>"), every=300)
         return False
 
-    # Комиссия вывода фиксированная: партия должна быть такой, чтобы вывод съел
-    # не больше трети выгоды при текущем спреде — иначе покупать нет смысла.
-    fee_usd = res["htx_fee"] * opp["max_price"]
-    min_batch = max(D(arb["batch_usd"]), fee_usd / (D(str(opp["spread"])) / 100 * FEE_MAX_SHARE))
+    # Комиссия вывода фиксированная: даже если выкупить на весь баланс, заданный %
+    # должен остаться ЧИСТЫМИ, после комиссии вывода. Иначе покупать нет смысла.
+    fee_usd = res["htx_fee"] * opp["mexc_bid"]
     try:
         usdt_free = (await htx_balance("usdt"))[0]
     except Exception:
         usdt_free = D(0)
     carry = arb.get("carry", {}).get(coin)
-    have = usdt_free + (D(carry["cost"]) if carry else 0)
-    if min_batch > have:
+    have = usdt_free * D("0.995") + (D(carry["cost"]) if carry else 0)
+    extra = fee_extra_pct(res["htx_fee"], opp["mexc_bid"], have)
+    if D(str(opp["spread"])) < D(cfg["pct"]) + extra:
         if not check_only:
             await note_once(f"fee:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но комиссия вывода с HTX "
-                                           f"~{fmt(fee_usd)}$ — окупается только партия от {fmt(min_batch)}$, "
-                                           f"а на HTX {fmt(usdt_free)} USDT"
-                                           + (f" + монет на {fmt(D(carry['cost']))}$" if carry else "")
-                                           + ". Не покупаю.", every=3 * 3600)
+                                           f"~{fmt(fee_usd)}$ даже на весь баланс {fmt(have)}$ съест {extra:.2f}% — "
+                                           f"чистыми меньше {cfg['pct']}%. Не покупаю.", every=3 * 3600)
         return False
     # Ключ MEXC должен видеть балансы — иначе сделка встанет на первом же шаге.
     try:
@@ -2123,13 +2133,8 @@ async def try_start(coin, cfg, opp, check_only=False):
     if check_only:
         return True
     d = new_deal(coin, cfg, res)
-    d["min_batch"] = str(min_batch)
     d["wd_fee"] = str(res["htx_fee"])
     await _take_carry(d)
-    if d["probe_left"] is not None and D(d["probe_left"]) < min_batch:
-        d["probe_left"] = str(min_batch)
-        await notify(f"ℹ️ <b>{coin}</b>: комиссия вывода ~{fmt(fee_usd)}$, поэтому проба увеличена до "
-                     f"{fmt(min_batch)}$ (иначе её вывод съест выгоду).")
     deals[coin] = d
     await save()
     spawn(run_deal(d))
@@ -2301,15 +2306,19 @@ async def buy_step(d):
     (mbids, _), (hbids, hasks) = await asyncio.gather(mexc_depth(f"{coin}USDT"), htx_depth(hpair))
     if not mbids:
         return
-    pct = D(cfg["pct"])
-    max_price = round_down(mbids[0][0] / (1 + pct / 100), tick)
-
     free_usdt, _ = await htx_balance("usdt")
     o = d["order"]
     locked = (D(o["amount"]) - D(o["filled"])) * D(o["price"]) if o else D(0)
     budget = (free_usdt + locked) * D("0.995")
     if d["probe_left"] is not None:
         budget = min(budget, D(d["probe_left"]))
+
+    # Покупаем только по цене, при которой после комиссии вывода (размазанной на
+    # всю партию: уже купленное + оставшиеся деньги) чистыми остаётся заданный %.
+    pct = D(cfg["pct"])
+    if d.get("wd_fee") is not None:
+        pct += fee_extra_pct(D(d["wd_fee"]), mbids[0][0], _dd(d, "unw_cost") + budget)
+    max_price = round_down(mbids[0][0] / (1 + pct / 100), tick)
 
     # Партия набралась и вывод окупается — выводим, ордер при этом продолжает стоять.
     if _worth_withdrawing(d, mbids[0][0]):
@@ -2408,14 +2417,14 @@ async def _idle(d, why):
 
 
 def _worth_withdrawing(d, mexc_bid):
-    """Вывод партии окупается: комиссия ≤ трети ожидаемой выгоды по цене MEXC."""
+    """Выводить можно: после комиссии вывода по цене MEXC чистыми остаётся заданный %."""
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
     if unw_q <= 0 or unw_c < D(arb["batch_usd"]):
         return False
     if d.get("wd_fee") is None:  # сделка из старой версии
         return unw_c >= D(d.get("min_batch") or arb["batch_usd"])
-    profit = unw_q * D(str(mexc_bid)) - unw_c
-    return profit * FEE_MAX_SHARE >= D(d["wd_fee"]) * D(str(mexc_bid))
+    net = net_pct(unw_q, unw_c, D(d["wd_fee"]), D(str(mexc_bid)))
+    return net is not None and net >= D(d["cfg"]["pct"])
 
 
 async def _take_carry(d):
@@ -2452,8 +2461,10 @@ async def _stop_buying(d, why):
             arb.setdefault("carry", {})[d["coin"]] = {"qty": str(unw_q), "cost": str(unw_c)}
             d["unw_qty"] = d["unw_cost"] = "0"
             fee = D(d.get("wd_fee") or 0) * mbid
+            net = net_pct(unw_q, unw_c, D(d.get("wd_fee") or 0), mbid)
             await notify(f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}). {fmt(unw_q)} шт. на {fmt(unw_c)}$ "
-                         f"не вывожу — комиссия вывода ~{fmt(fee)}$ съест выгоду. Лежат на HTX, "
+                         f"не вывожу — после комиссии вывода ~{fmt(fee)}$ чистыми вышло бы "
+                         f"{(net if net is not None else D(0)):.2f}% (нужно {d['cfg']['pct']}%). Лежат на HTX, "
                          f"следующая сделка по {d['coin']} докупит и выведет всё одной партией.")
             await save()
             return
@@ -3065,7 +3076,8 @@ async def cmd_arb(message: types.Message):
         f"проверка вывода HTX через {arb['check_sec']} сек. · стакан MEXC при покупке: "
         f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}",
         f"свой ордер первым в стакане HTX: {'вкл' if arb.get('maker', True) else 'выкл'} · "
-        f"вывод партией, когда комиссия ≤ {int(FEE_MAX_SHARE * 100)}% выгоды (и от {arb.get('batch_usd', 15):g}$)",
+        f"вывод партией от {arb.get('batch_usd', 15):g}$, только если чистыми после комиссии вывода "
+        f"остаётся заданный %",
         "",
         _keys_text(),
         "",
