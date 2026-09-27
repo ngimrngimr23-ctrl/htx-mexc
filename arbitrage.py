@@ -68,10 +68,12 @@ RPC_URLS = {
     "bsc": os.environ.get("BSC_RPC_URL") or "https://bsc-dataseed.bnbchain.org",
     "monad": os.environ.get("MONAD_RPC_URL") or "https://rpc.monad.xyz",
     "sui": os.environ.get("SUI_RPC_URL") or "https://fullnode.mainnet.sui.io:443",
+    # Cosmos Hub: REST (LCD) API ноды, не JSON-RPC.
+    "atom": (os.environ.get("COSMOS_REST_URL") or "https://cosmos-rest.publicnode.com").rstrip("/"),
 }
-NET_TITLES = {"eth": "Ethereum", "bsc": "BNB Chain", "monad": "Monad", "sui": "Sui"}
-NATIVE_COIN = {"eth": "ETH", "bsc": "BNB", "monad": "MON", "sui": "SUI"}
-BUILTIN_NETS = ("eth", "bsc", "monad", "sui")
+NET_TITLES = {"eth": "Ethereum", "bsc": "BNB Chain", "monad": "Monad", "sui": "Sui", "atom": "Cosmos Hub"}
+NATIVE_COIN = {"eth": "ETH", "bsc": "BNB", "monad": "MON", "sui": "SUI", "atom": "ATOM"}
+BUILTIN_NETS = ("eth", "bsc", "monad", "sui", "atom")
 # Как сеть может называться у бирж. Сравниваем по отдельным словам названия
 # ("BEP20(BSC)" → BEP20, BSC), а не подстрокой — иначе ETH совпал бы с ETHW.
 NET_ALIASES = {
@@ -79,6 +81,7 @@ NET_ALIASES = {
     "bsc": {"BEP20", "BSC", "BNB SMART CHAIN", "BNBSMARTCHAIN", "BSC20"},
     "monad": {"MONAD", "MON"},
     "sui": {"SUI"},
+    "atom": {"ATOM", "COSMOS", "COSMOSHUB"},
 }
 SUI_NATIVE_TYPE = "0x2::sui::SUI"
 
@@ -614,9 +617,7 @@ async def mexc_deposit_address(coin, net_entry):
         row = pick(await mexc_req("GET", "/api/v3/capital/deposit/address", {"coin": coin.upper()}))
     if not row or not row.get("address"):
         raise ExchangeError(f"MEXC: не удалось получить адрес депозита {coin} ({'/'.join(names)})")
-    if row.get("memo") or row.get("tag"):
-        raise ExchangeError(f"MEXC требует memo для {coin} — такие сети бот не поддерживает")
-    return row["address"]
+    return row["address"], (row.get("memo") or row.get("tag") or None)
 
 
 # ================= КОШЕЛЬКИ =================
@@ -822,20 +823,199 @@ async def sui_send_all(coin_type, to):
     return res.get("digest"), amount
 
 
+# ---- Cosmos Hub (ATOM) ----
+# Ключ secp256k1 — тот же, что у EVM (EVM_PRIVATE_KEY), если не задан отдельный
+# COSMOS_PRIVATE_KEY. Адрес cosmos1… = bech32(ripemd160(sha256(сжатый pubkey))).
+# Транзакции — protobuf Cosmos SDK, режим подписи SIGN_MODE_DIRECT, отправка через
+# REST ноды. Поддерживается только сам ATOM (uatom), не IBC-токены.
+COSMOS_PRIVATE_KEY = os.environ.get("COSMOS_PRIVATE_KEY")
+COSMOS_DENOM = "uatom"
+COSMOS_GAS_LIMIT = 150000
+MEMO_NETS = {"atom"}  # сети, где бот умеет передать memo для депозита MEXC
+
+
+def _bech32_encode(hrp, data8):
+    acc = bits = 0
+    data5 = []
+    for b in data8:
+        acc = (acc << 8) | b
+        bits += 8
+        while bits >= 5:
+            bits -= 5
+            data5.append((acc >> bits) & 31)
+    if bits:
+        data5.append((acc << (5 - bits)) & 31)
+    values = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + data5 + [0] * 6
+    pm = _bech32_polymod(values) ^ 1
+    checksum = [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(_BECH32[x] for x in data5 + checksum)
+
+
+def _ripemd160(data):
+    try:
+        from Crypto.Hash import RIPEMD160
+        return RIPEMD160.new(data).digest()
+    except ImportError:
+        return hashlib.new("ripemd160", data).digest()
+
+
+_cosmos_keys = None
+
+
+def cosmos_keys():
+    """(приватный ключ eth_keys, сжатый pubkey 33 байта, адрес cosmos1…)."""
+    global _cosmos_keys
+    if _cosmos_keys is None:
+        raw = (COSMOS_PRIVATE_KEY or EVM_PRIVATE_KEY or "").strip()
+        if not raw:
+            raise ExchangeError("не задан EVM_PRIVATE_KEY (или COSMOS_PRIVATE_KEY) для Cosmos Hub")
+        from eth_keys import keys
+        pk = keys.PrivateKey(bytes.fromhex(raw[2:] if raw.startswith("0x") else raw))
+        pub = pk.public_key.to_compressed_bytes()
+        addr = _bech32_encode("cosmos", _ripemd160(hashlib.sha256(pub).digest()))
+        _cosmos_keys = (pk, pub, addr)
+    return _cosmos_keys
+
+
+def _pb_varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7f
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _pb_bytes(field, data):
+    """Поле length-delimited (строки, байты, вложенные сообщения). Пустые — опускаем."""
+    if isinstance(data, str):
+        data = data.encode()
+    if not data:
+        return b""
+    return _pb_varint(field << 3 | 2) + _pb_varint(len(data)) + data
+
+
+def _pb_uint(field, n):
+    return _pb_varint(field << 3) + _pb_varint(n) if n else b""
+
+
+def _pb_coin(denom, amount):
+    return _pb_bytes(1, denom) + _pb_bytes(2, str(amount))
+
+
+def cosmos_build_tx(from_addr, to_addr, amount, memo, fee_amount, gas_limit, pubkey,
+                    account_number, sequence, chain_id, sign_fn):
+    """Собирает и подписывает MsgSend. Возвращает байты TxRaw."""
+    msg = _pb_bytes(1, from_addr) + _pb_bytes(2, to_addr) + _pb_bytes(3, _pb_coin(COSMOS_DENOM, amount))
+    any_msg = _pb_bytes(1, "/cosmos.bank.v1beta1.MsgSend") + _pb_bytes(2, msg)
+    body = _pb_bytes(1, any_msg) + _pb_bytes(2, memo or "")
+    any_pub = _pb_bytes(1, "/cosmos.crypto.secp256k1.PubKey") + _pb_bytes(2, _pb_bytes(1, pubkey))
+    mode_info = _pb_bytes(1, _pb_uint(1, 1))  # single { mode: SIGN_MODE_DIRECT }
+    signer = _pb_bytes(1, any_pub) + _pb_bytes(2, mode_info) + _pb_uint(3, sequence)
+    fee = _pb_bytes(1, _pb_coin(COSMOS_DENOM, fee_amount)) + _pb_uint(2, gas_limit)
+    auth = _pb_bytes(1, signer) + _pb_bytes(2, fee)
+    sign_doc = _pb_bytes(1, body) + _pb_bytes(2, auth) + _pb_bytes(3, chain_id) + _pb_uint(4, account_number)
+    sig = sign_fn(hashlib.sha256(sign_doc).digest())
+    return _pb_bytes(1, body) + _pb_bytes(2, auth) + _pb_bytes(3, sig)
+
+
+def cosmos_sign(digest):
+    """Подпись secp256k1 в формате Cosmos: r‖s (64 байта, low-S)."""
+    pk = cosmos_keys()[0]
+    sig = pk.sign_msg_hash(digest)
+    n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    s_ = sig.s if sig.s <= n // 2 else n - sig.s
+    return sig.r.to_bytes(32, "big") + s_.to_bytes(32, "big")
+
+
+async def cosmos_get(path):
+    async with http().get(RPC_URLS["atom"] + path, timeout=TIMEOUT) as r:
+        data = await r.json(content_type=None)
+        if r.status != 200:
+            raise ExchangeError(f"Cosmos {path}: HTTP {r.status} {str(data)[:200]}")
+        return data
+
+
+async def cosmos_balance():
+    data = await cosmos_get(f"/cosmos/bank/v1beta1/balances/{cosmos_keys()[2]}/by_denom?denom={COSMOS_DENOM}")
+    return int((data.get("balance") or {}).get("amount") or 0)
+
+
+async def cosmos_fee():
+    """Комиссия в uatom: текущая цена газа сети (x/feemarket) с запасом, иначе 0.025."""
+    price = D("0.025")
+    try:
+        data = await cosmos_get(f"/feemarket/v1/gas_price/{COSMOS_DENOM}")
+        price = max(D(str(data["price"]["amount"])) * D("1.5"), D("0.005"))
+    except Exception:
+        pass
+    return int((price * COSMOS_GAS_LIMIT).to_integral_value(rounding=ROUND_UP))
+
+
+async def cosmos_send_all(to, memo):
+    """Отправляет весь ATOM за вычетом комиссии. Возвращает (txhash, отправлено_uatom)."""
+    pk, pub, addr = cosmos_keys()
+    acc = (await cosmos_get(f"/cosmos/auth/v1beta1/accounts/{addr}"))["account"]
+    acc = acc.get("base_account") or acc
+    chain_id = (await cosmos_get("/cosmos/base/tendermint/v1beta1/node_info"))["default_node_info"]["network"]
+    fee = await cosmos_fee()
+    amount = await cosmos_balance() - fee
+    if amount <= 0:
+        raise ExchangeError("Cosmos: на кошельке не хватает ATOM даже на комиссию")
+    tx = cosmos_build_tx(addr, to, amount, memo, fee, COSMOS_GAS_LIMIT, pub,
+                         int(acc.get("account_number") or 0), int(acc.get("sequence") or 0), chain_id, cosmos_sign)
+    async with http().post(RPC_URLS["atom"] + "/cosmos/tx/v1beta1/txs", timeout=TIMEOUT,
+                           json={"tx_bytes": base64.b64encode(tx).decode(), "mode": "BROADCAST_MODE_SYNC"}) as r:
+        res = (await r.json(content_type=None)).get("tx_response") or {}
+    if int(res.get("code") or 0) != 0:
+        raise ExchangeError(f"Cosmos: транзакция отклонена: {res.get('raw_log') or res}")
+    txhash = res.get("txhash")
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        await asyncio.sleep(3)
+        try:
+            got = (await cosmos_get(f"/cosmos/tx/v1beta1/txs/{txhash}")).get("tx_response") or {}
+        except ExchangeError:
+            continue  # ещё не в блоке
+        if int(got.get("code") or 0) != 0:
+            raise ExchangeError(f"Cosmos: транзакция {txhash} упала: {got.get('raw_log')}")
+        return txhash, amount
+    raise ExchangeError(f"Cosmos: транзакция {txhash} не подтвердилась за 2 минуты")
+
+
 def wallet_address(net):
-    return sui_keys()[2] if net == "sui" else evm_account().address
+    if net == "sui":
+        return sui_keys()[2]
+    if net == "atom":
+        return cosmos_keys()[2]
+    return evm_account().address
 
 
 async def wallet_balance(net, token):
-    return await (sui_balance(token) if net == "sui" else evm_balance(net, token))
+    if net == "sui":
+        return await sui_balance(token)
+    if net == "atom":
+        return await cosmos_balance()
+    return await evm_balance(net, token)
 
 
 async def wallet_decimals(net, token):
-    return await (sui_decimals(token) if net == "sui" else evm_decimals(net, token))
+    if net == "sui":
+        return await sui_decimals(token)
+    if net == "atom":
+        return 6
+    return await evm_decimals(net, token)
 
 
-async def wallet_send_all(net, token, to):
-    return await (sui_send_all(token, to) if net == "sui" else evm_send_all(net, token, to))
+async def wallet_send_all(net, token, to, memo=None):
+    if net == "sui":
+        return await sui_send_all(token, to)
+    if net == "atom":
+        return await cosmos_send_all(to, memo)
+    return await evm_send_all(net, token, to)
 
 
 address_book_errors = {}
@@ -1813,10 +1993,12 @@ async def transport_step(d):
         return
 
     res = await resolve_coin(coin, d["cfg"])
-    address = await mexc_deposit_address(coin, res["mexc_net"])
+    address, memo = await mexc_deposit_address(coin, res["mexc_net"])
+    if memo and net not in MEMO_NETS:
+        raise ExchangeError(f"MEXC требует memo для {coin} в сети {NET_TITLES[net]} — эта сеть memo не поддерживает")
     d["forwarding"] = True
     await save()
-    tx, sent_raw = await wallet_send_all(net, d["token"], address)
+    tx, sent_raw = await wallet_send_all(net, d["token"], address, memo)
     sent = D(sent_raw) / scale
     d["forwarding"] = False
     # Помечаем партии, которые покрывает эта отправка (могли прийти сразу несколько).
@@ -2063,10 +2245,15 @@ def _keys_text():
         sui = f"<code>{sui_keys()[2]}</code>" if SUI_PRIVATE_KEY else sui
     except Exception as e:
         sui = f"ошибка ключа: {e}"
+    try:
+        cosmos = f"<code>{cosmos_keys()[2]}</code>" if (COSMOS_PRIVATE_KEY or EVM_PRIVATE_KEY) else "не задан"
+    except Exception as e:
+        cosmos = f"ошибка ключа: {e}"
     return (f"{mark(HTX_API_KEY and HTX_API_SECRET)} ключ HTX · "
             f"{mark(MEXC_API_KEY and MEXC_API_SECRET)} ключ MEXC\n"
             f"👛 EVM (ETH/BNB/Monad): {evm}\n"
-            f"👛 Sui: {sui}")
+            f"👛 Sui: {sui}\n"
+            f"👛 Cosmos Hub: {cosmos}")
 
 
 @router.message(Command("arb"))
@@ -2234,6 +2421,8 @@ async def cmd_add(message: types.Message, command: CommandObject):
             net = "eth"
         if net == "mon":
             net = "monad"
+        if net in ("cosmos", "cosmoshub"):
+            net = "atom"
         if net not in NET_TITLES or not coin or pct <= 0:
             raise ValueError
         cfg = {"pct": pct, "net": net, "probe": 0, "htx_chain": None, "mexc_net": None}
@@ -2608,7 +2797,7 @@ async def cmd_wallet(message: types.Message):
     for net in list(NET_TITLES):
         try:
             bal = await wallet_balance(net, None)
-            dec = 9 if net == "sui" else 18
+            dec = {"sui": 9, "atom": 6}.get(net, 18)
             lines.append(f"{NET_TITLES[net]}: {fmt(D(bal) / (D(10) ** dec))} {NATIVE_COIN[net]} (на газ)")
         except Exception as e:
             lines.append(f"{NET_TITLES[net]}: {e}")
