@@ -160,7 +160,14 @@ arb = {
     "batch_usd": 15.0,
     # Монеты, на которые бот временно «забил» после /stop аварии: {монета: до_когда}.
     "paused": {},
+    # Куплено на HTX, но не выведено (вывод не окупался): {монета: {"qty", "cost"}}.
+    # Следующая сделка по монете начинает с этого остатка и выводит всё разом.
+    "carry": {},
 }
+
+# Партию выводим, только когда комиссия вывода съедает не больше этой доли
+# ожидаемой выгоды: при спреде 1.5% и комиссии 2.2$ это партия от ~450$.
+FEE_MAX_SHARE = Decimal("0.33")
 
 # Сделки по монетам: {монета: сделка}. Покупать может только одна (весь USDT в
 # ней), остальные в это время доводят свои партии до продажи.
@@ -2075,7 +2082,7 @@ async def try_start(coin, cfg, opp, check_only=False):
         else:
             how = (f"Поставил бы ордер на покупку на HTX первым в стакане по {fmt(opp['maker_price'])} "
                    f"(макс. {fmt(opp['max_price'])}) и держал его под цену MEXC; "
-                   f"вывод партиями от {arb['batch_usd']:g}$")
+                   f"вывод одной партией, когда комиссия вывода ≤ {int(FEE_MAX_SHARE * 100)}% выгоды")
         await note_once(f"dry:{coin}", (
             f"🧪 <b>ТЕСТ</b> · <b>{coin}</b>: спред {opp['spread']:.2f}% (мин. {cfg['pct']}%)\n"
             f"{how}\nMEXC bid {fmt(opp['mexc_bid'])}, USDT на HTX: {usdt}\n"
@@ -2087,18 +2094,23 @@ async def try_start(coin, cfg, opp, check_only=False):
             f"<i>Реальные сделки: /arb_live on</i>"), every=300)
         return False
 
-    # Комиссия вывода фиксированная: партия должна быть хотя бы в 20 раз больше,
-    # иначе вывод съест выгоду (у L3, например, 630 монет ≈ 19$ за вывод).
+    # Комиссия вывода фиксированная: партия должна быть такой, чтобы вывод съел
+    # не больше трети выгоды при текущем спреде — иначе покупать нет смысла.
     fee_usd = res["htx_fee"] * opp["max_price"]
-    min_batch = max(D(arb["batch_usd"]), fee_usd * 20)
+    min_batch = max(D(arb["batch_usd"]), fee_usd / (D(str(opp["spread"])) / 100 * FEE_MAX_SHARE))
     try:
         usdt_free = (await htx_balance("usdt"))[0]
     except Exception:
         usdt_free = D(0)
-    if min_batch > usdt_free and not check_only:
-        await note_once(f"fee:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но комиссия вывода с HTX "
-                                       f"~{fmt(fee_usd)}$ — окупается только партия от {fmt(min_batch)}$, "
-                                       f"а на HTX {fmt(usdt_free)} USDT. Не покупаю.", every=3 * 3600)
+    carry = arb.get("carry", {}).get(coin)
+    have = usdt_free + (D(carry["cost"]) if carry else 0)
+    if min_batch > have:
+        if not check_only:
+            await note_once(f"fee:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но комиссия вывода с HTX "
+                                           f"~{fmt(fee_usd)}$ — окупается только партия от {fmt(min_batch)}$, "
+                                           f"а на HTX {fmt(usdt_free)} USDT"
+                                           + (f" + монет на {fmt(D(carry['cost']))}$" if carry else "")
+                                           + ". Не покупаю.", every=3 * 3600)
         return False
     # Ключ MEXC должен видеть балансы — иначе сделка встанет на первом же шаге.
     try:
@@ -2112,6 +2124,8 @@ async def try_start(coin, cfg, opp, check_only=False):
         return True
     d = new_deal(coin, cfg, res)
     d["min_batch"] = str(min_batch)
+    d["wd_fee"] = str(res["htx_fee"])
+    await _take_carry(d)
     if d["probe_left"] is not None and D(d["probe_left"]) < min_batch:
         d["probe_left"] = str(min_batch)
         await notify(f"ℹ️ <b>{coin}</b>: комиссия вывода ~{fmt(fee_usd)}$, поэтому проба увеличена до "
@@ -2297,8 +2311,8 @@ async def buy_step(d):
     if d["probe_left"] is not None:
         budget = min(budget, D(d["probe_left"]))
 
-    # Партия набралась — выводим сразу, ордер при этом продолжает стоять.
-    if _dd(d, "unw_cost") >= D(d.get("min_batch") or arb["batch_usd"]):
+    # Партия набралась и вывод окупается — выводим, ордер при этом продолжает стоять.
+    if _worth_withdrawing(d, mbids[0][0]):
         await withdraw_batch(d)
         if not d["buying"]:
             return
@@ -2393,18 +2407,55 @@ async def _idle(d, why):
         await _stop_buying(d, why)
 
 
+def _worth_withdrawing(d, mexc_bid):
+    """Вывод партии окупается: комиссия ≤ трети ожидаемой выгоды по цене MEXC."""
+    unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
+    if unw_q <= 0 or unw_c < D(arb["batch_usd"]):
+        return False
+    if d.get("wd_fee") is None:  # сделка из старой версии
+        return unw_c >= D(d.get("min_batch") or arb["batch_usd"])
+    profit = unw_q * D(str(mexc_bid)) - unw_c
+    return profit * FEE_MAX_SHARE >= D(d["wd_fee"]) * D(str(mexc_bid))
+
+
+async def _take_carry(d):
+    """Новая сделка забирает монеты, оставшиеся на HTX от прошлой (не больше, чем есть)."""
+    c = arb.get("carry", {}).pop(d["coin"], None)
+    if not c:
+        return
+    q, cost = D(c["qty"]), D(c["cost"])
+    try:
+        free, _ = await htx_balance(hcoin(d["coin"], d["cfg"]))
+    except Exception:
+        free = q
+    if free < q:
+        cost, q = (cost * free / q if q > 0 else D(0)), free
+    if q > 0:
+        _add(d, "unw_qty", q)
+        _add(d, "unw_cost", cost)
+
+
 async def _stop_buying(d, why):
     await _cancel_order(d)
     d["buying"] = False
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
     if unw_q > 0:
-        min_batch = D(d.get("min_batch") or arb["batch_usd"])
-        if unw_c >= min_batch:
+        try:
+            mbids, _ = await mexc_depth(f"{d['coin']}USDT")
+            mbid = mbids[0][0] if mbids else D(0)
+        except Exception:
+            mbid = D(0)
+        if _worth_withdrawing(d, mbid):
             await withdraw_batch(d)
         else:
-            await notify(f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}); остаток {fmt(unw_q)} шт. "
-                         f"на {fmt(unw_c)}$ меньше партии {fmt(min_batch)}$ — остаётся на HTX, уйдёт со следующим выводом.")
+            # Вывод такой партии съест выгоду — не выводим, копим до следующей сделки.
+            arb.setdefault("carry", {})[d["coin"]] = {"qty": str(unw_q), "cost": str(unw_c)}
             d["unw_qty"] = d["unw_cost"] = "0"
+            fee = D(d.get("wd_fee") or 0) * mbid
+            await notify(f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}). {fmt(unw_q)} шт. на {fmt(unw_c)}$ "
+                         f"не вывожу — комиссия вывода ~{fmt(fee)}$ съест выгоду. Лежат на HTX, "
+                         f"следующая сделка по {d['coin']} докупит и выведет всё одной партией.")
+            await save()
             return
     if _dd(d, "bought_qty") > 0:
         await notify(f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}). Всего куплено "
@@ -2982,6 +3033,9 @@ async def cmd_arb(message: types.Message):
         if _dd(d, "sold_qty") > 0 or d.get("sell"):
             lines.append(f"продано на MEXC: {fmt(d['sold_qty'])} шт. на {fmt(d['proceeds'])}$"
                          + (f"; лесенка {fmt(d['sell']['qty'])} шт. по {fmt(d['sell']['price'])}" if d.get("sell") else ""))
+    for c, v in arb.get("carry", {}).items():
+        lines.append(f"📦 {c}: на HTX лежит {fmt(D(v['qty']))} шт. (куплено на {fmt(D(v['cost']))}$) — "
+                     f"вывод пока не окупается, уйдёт со следующей сделкой")
     now_paused = {c: u for c, u in arb.get("paused", {}).items() if u > time.time()}
     if now_paused:
         lines.append("⏸ На паузе: " + ", ".join(f"{c} (ещё {int((u - time.time()) // 60) + 1} мин.)"
@@ -3011,7 +3065,7 @@ async def cmd_arb(message: types.Message):
         f"проверка вывода HTX через {arb['check_sec']} сек. · стакан MEXC при покупке: "
         f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}",
         f"свой ордер первым в стакане HTX: {'вкл' if arb.get('maker', True) else 'выкл'} · "
-        f"вывод партиями от {arb.get('batch_usd', 15):g}$",
+        f"вывод партией, когда комиссия ≤ {int(FEE_MAX_SHARE * 100)}% выгоды (и от {arb.get('batch_usd', 15):g}$)",
         "",
         _keys_text(),
         "",
