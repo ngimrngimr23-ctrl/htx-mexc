@@ -4,7 +4,7 @@ import json
 import re
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from aiohttp import web
 import time
 import os
@@ -172,6 +172,9 @@ HTX_TRANSFER_TTL = 600  # 10 минут
 
 # Сколько кандидатов за проход догружаем стаканами (по 2 запроса на кандидата).
 MAX_DEPTH_CANDIDATES = 25
+
+# Как часто повторять сигнал, по которому не удалось проверить вывод с HTX.
+UNKNOWN_WITHDRAW_COOLDOWN = 300
 
 mexc_contracts_cache = {"ts": 0.0, "data": {}}
 MEXC_CONTRACTS_TTL = 6 * 3600  # 6 часов — сети/контракты почти никогда не меняются
@@ -1400,8 +1403,14 @@ async def scanner_task():
                 debug_stats["passed_transfer_check"] += 1
 
                 # Анти-спам: простой кулдаун по времени.
+                # Не удалось понять, открыт ли вывод с HTX (сеть не определилась или
+                # HTX не отдал статус) — такие сигналы помечаем красным и шлём не по
+                # обычному кулдауну, а раз в UNKNOWN_WITHDRAW_COOLDOWN сек.
+                withdraw_unknown = buy_ex == "HTX" and (
+                    htx_coin_status is None or route["state"] == "nomatch")
                 prev = alert_memory.get(pair)
-                if prev and (now - prev["last_msg"]) < settings["cooldown_min"] * 60:
+                cooldown = UNKNOWN_WITHDRAW_COOLDOWN if withdraw_unknown else settings["cooldown_min"] * 60
+                if prev and (now - prev["last_msg"]) < cooldown:
                     continue
                 debug_stats["passed_cooldown"] += 1
 
@@ -1411,7 +1420,7 @@ async def scanner_task():
                     "buy_price": buy_price, "sell_price": sell_price, "threshold": threshold,
                     "base_coin": base_coin, "htx_coin_status": htx_coin_status,
                     "hpair": hpair, "htx_base": htx_base,
-                    "route": route, "prev": prev,
+                    "route": route, "prev": prev, "withdraw_unknown": withdraw_unknown,
                 })
 
             if not candidates:
@@ -1566,6 +1575,8 @@ async def scanner_task():
                     f"🔀 <b>СПРЕД: <code>{base_coin}</code></b>"
                     + (f" (на HTX: <code>{c['htx_base']}</code>, тот же контракт)"
                        if c["htx_base"] != base_coin else ""),
+                    *(["🔴🔴🔴 <b>НЕ УДАЛОСЬ ПРОВЕРИТЬ, ОТКРЫТ ЛИ ВЫВОД НА HTX</b> 🔴🔴🔴"]
+                      if c["withdraw_unknown"] else []),
                     "",
                     f"💹 <b>{best_spread:+.2f}%</b> по лучшей цене · Купить на <b>{buy_ex}</b> ({fmt_price(buy_price)}) "
                     f"→ Продать на <b>{sell_ex}</b> ({fmt_price(sell_price)})",
@@ -1584,20 +1595,32 @@ async def scanner_task():
                 ]
                 alert_text = "\n".join(lines)
 
+                # Кнопка «В автоарбитраж» — только для направления HTX→MEXC и сети,
+                # которую автоарбитраж умеет (EVM/Sui/Cosmos и свои EVM-сети).
+                markup = None
+                if buy_ex == "HTX":
+                    names = []
+                    if route.get("best"):
+                        names = list(route["best"]["htx"].get("names", [])) + list(route["best"]["mexc"].get("names", []))
+                    net = arbitrage.net_from_names(*names) if names else None
+                    if net:
+                        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                            text=f"➕ {base_coin} в автоарбитраж (от {settings['spread_percent']:g}%, {arbitrage.NET_TITLES[net]})",
+                            callback_data=f"arbadd:{base_coin}:{net}:{settings['spread_percent']:g}")]])
                 if settings["chat_id"]:
-                    messages.append((settings["chat_id"], alert_text))
+                    messages.append((settings["chat_id"], alert_text, markup))
                 if settings["channel_id"]:
-                    messages.append((settings["channel_id"], alert_text))
+                    messages.append((settings["channel_id"], alert_text, None))
 
             # ===== Отправка всех сообщений этого прохода ПАРАЛЛЕЛЬНО =====
-            async def _send(chat, text):
+            async def _send(chat, text, markup):
                 try:
-                    await bot.send_message(chat, text, parse_mode="HTML")
+                    await bot.send_message(chat, text, parse_mode="HTML", reply_markup=markup)
                 except Exception as e:
                     print(f"Ошибка отправки в {chat}: {e}", flush=True)
 
             if messages:
-                await asyncio.gather(*[_send(chat, text) for chat, text in messages])
+                await asyncio.gather(*[_send(chat, text, markup) for chat, text, markup in messages])
 
         except Exception as e:
             print(f"Ошибка сканера: {e}", flush=True)

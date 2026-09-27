@@ -2466,22 +2466,22 @@ async def cmd_add(message: types.Message, command: CommandObject):
         await message.answer("❌ Пример: /arb_add PEPE 3 bsc  ·  /arb_add PEPE 3 bsc 150  ·  /arb_add ATOM 2\n"
                              f"Сети: {nets_list_text()}", parse_mode="HTML")
         return
-    text = f"✅ <b>{coin}</b>: от {pct}% · {NET_TITLES[net]} · " + \
-           (f"проба {cfg['probe']}$ → весь баланс" if cfg["probe"] else "сразу весь баланс")
+    await message.answer(await add_coin(coin, cfg), parse_mode="HTML")
+
+
+async def add_coin(coin, cfg):
+    """Добавляет монету в автоарбитраж (или обновляет её настройки) и возвращает
+    отчёт: пара на HTX, сети, контракт, адресная книга. Общая для /arb_add и
+    кнопки «В автоарбитраж» под сигналом сканера."""
+    net, pct = cfg["net"], cfg["pct"]
+    text = f"✅ <b>{coin}</b>: от {pct:g}% · {NET_TITLES[net]} · " + \
+           (f"проба {cfg['probe']:g}$ → весь баланс" if cfg["probe"] else "сразу весь баланс")
+    # Тикер пишется как на MEXC (там продаём). Нет пары на MEXC — не добавляем.
     try:
-        # Тикер пишется как на MEXC (там продаём). Нет пары на MEXC — не добавляем.
-        pair_ok = True
-        try:
-            await mexc_symbol(f"{coin}USDT")
-        except ExchangeError:
-            pair_ok = False
-        if not pair_ok:
-            raise CoinNotOnMexc(f"пары {coin}/USDT нет на MEXC")
-    except CoinNotOnMexc as e:
-        await message.answer(f"❌ <b>{coin}</b> не добавлена: {e}.\n"
-                             f"Пиши тикер как на MEXC — если на HTX он другой, бот найдёт его сам.",
-                             parse_mode="HTML")
-        return
+        await mexc_symbol(f"{coin}USDT")
+    except ExchangeError:
+        return (f"❌ <b>{coin}</b> не добавлена: пары {coin}/USDT нет на MEXC.\n"
+                f"Пиши тикер как на MEXC — если на HTX он другой, бот найдёт его сам.")
     arb["coins"][coin] = cfg
     await save()
     try:
@@ -2508,7 +2508,35 @@ async def cmd_add(message: types.Message, command: CommandObject):
             text += f"\n❔ Адрес бота: {e}"
     except Exception as e:
         text += f"\n⚠️ Проверка сетей: {e}"
-    await message.answer(text, parse_mode="HTML")
+    return text
+
+
+def net_from_names(*names):
+    """Код сети бота по названиям сети на биржах ('ERC20', 'BEP20(BSC)', 'SUI'…) или None."""
+    for net in NET_TITLES:
+        if matches_net(net, *names):
+            return net
+    return None
+
+
+@router.callback_query(F.data.startswith("arbadd:"))
+async def cb_add(callback: types.CallbackQuery):
+    """Кнопка под сигналом сканера: сразу добавить монету в автоарбитраж."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    try:
+        _, coin, net, pct = callback.data.split(":")
+        cfg = {"pct": float(pct), "net": net, "probe": 0, "htx_chain": None, "mexc_net": None}
+        if net not in NET_TITLES:
+            raise ValueError
+    except Exception:
+        await callback.answer("Не разобрал кнопку")
+        return
+    await callback.answer(f"Добавляю {coin}…")
+    ctx.chat_set(callback.message.chat.id)
+    await notify(await add_coin(coin, cfg) + "\n<i>Процент/пробу можно поменять: /arb_add "
+                 f"{coin} {pct} {net} 20</i>")
 
 
 @router.message(Command("arb_htx"))
