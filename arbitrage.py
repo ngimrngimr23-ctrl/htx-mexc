@@ -1407,42 +1407,86 @@ async def wallet_send_all(net, token, to, memo=None):
 address_book_errors = {}
 
 
-async def htx_address_saved(currency, chain, address):
-    """Есть ли адрес в адресной книге вывода HTX для этой монеты и сети.
-    Через API HTX выводит ТОЛЬКО на сохранённые адреса (иначе ошибка
-    api-not-support-temp-addr). None — проверить не удалось (ключ/ошибка API)."""
-    try:
-        rows = await htx_req("GET", "/v2/account/withdraw/address", {"currency": currency.lower()})
-    except Exception as e:
-        print(f"[arb] адресная книга HTX {currency}: {e}", flush=True)
-        address_book_errors[currency.upper()] = str(e)[:200]
-        return None
-    return _book_match(rows, chain, address) is not None
+_book_cache = {}
 
 
-def _book_match(rows, chain, address):
+async def htx_book_rows(currency):
+    """Адресная книга вывода HTX по монете (кэш 60 сек.)."""
+    cur = currency.lower()
+    hit = _book_cache.get(cur)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    rows = await htx_req("GET", "/v2/account/withdraw/address", {"currency": cur}) or []
+    _book_cache[cur] = (time.time(), rows)
+    return rows
+
+
+def _book_match(rows, chain, address, any_chain=False):
     """Адрес из книги в ТОМ ЖЕ написании, что сохранён на HTX (регистр букв важен:
     HTX сравнивает строки буква в букву), или None."""
     addr = address.lower()
     for r in rows or []:
-        if str(r.get("address", "")).lower() == addr and (not chain or r.get("chain") == chain):
+        if str(r.get("address", "")).lower() == addr and (any_chain or not chain or r.get("chain") == chain):
             return str(r["address"])
     return None
 
 
-async def htx_book_address(currency, chain, address):
-    """Написание адреса для заявки на вывод — как в адресной книге HTX.
-    Если книгу прочитать не удалось — отдаём адрес как есть."""
+def _is_evm_address(a):
+    return bool(re.fullmatch(r"0x[0-9a-fA-F]{40}", str(a or "")))
+
+
+async def htx_find_saved(currency, chain, address):
+    """Ищет адрес в адресной книге HTX: сначала у самой монеты, а для EVM-адреса —
+    ещё и среди адресов других монет (так HTX хранит общий адрес на всю сеть).
+    Возвращает (написание_как_в_книге, «монета»/«общий») или (None, None).
+    Бросает исключение, если книгу не удалось прочитать вовсе."""
+    found = _book_match(await htx_book_rows(currency), chain, address)
+    if found:
+        return found, "монета"
+    if _is_evm_address(address):
+        for other in ("usdt", "eth", "usdc", "bnb"):
+            if other == currency.lower():
+                continue
+            try:
+                found = _book_match(await htx_book_rows(other), None, address, any_chain=True)
+            except Exception:
+                continue
+            if found:
+                return found, "общий"
+    return None, None
+
+
+async def htx_address_saved(currency, chain, address):
+    """Есть ли адрес в адресной книге вывода HTX (у монеты или общий на сеть).
+    Через API HTX выводит ТОЛЬКО на сохранённые адреса (иначе ошибка
+    api-not-support-temp-addr). None — проверить не удалось (ключ/ошибка API)."""
     try:
-        rows = await htx_req("GET", "/v2/account/withdraw/address", {"currency": currency.lower()})
+        found, _ = await htx_find_saved(currency, chain, address)
+    except Exception as e:
+        print(f"[arb] адресная книга HTX {currency}: {e}", flush=True)
+        address_book_errors[currency.upper()] = str(e)[:200]
+        return None
+    return found is not None
+
+
+async def htx_book_address(currency, chain, address):
+    """Написание адреса для заявки на вывод — как в адресной книге HTX. Если адрес
+    не нашёлся, EVM-адрес отдаём маленькими буквами (так его хранит HTX)."""
+    try:
+        found, _ = await htx_find_saved(currency, chain, address)
     except Exception:
-        return address
-    return _book_match(rows, chain, address) or address
+        found = None
+    if found:
+        return found
+    return address.lower() if _is_evm_address(address) else address
 
 
 def address_book_hint(coin_htx, chain, address):
+    extra = (" Для EVM-адреса (0x…) можно один раз добавить его как общий адрес на сеть — бот его увидит."
+             if _is_evm_address(address) else "")
     return (f"Добавь адрес бота в адресную книгу вывода HTX: монета <b>{coin_htx}</b>, сеть <code>{chain}</code>, "
-            f"адрес <code>{address}</code>. Через API HTX выводит только на сохранённые адреса.")
+            f"адрес <code>{address.lower() if _is_evm_address(address) else address}</code>. "
+            f"Через API HTX выводит только на сохранённые адреса.{extra}")
 
 
 # ================= СОПОСТАВЛЕНИЕ СЕТЕЙ =================
@@ -3146,8 +3190,17 @@ async def cmd_htx_check(message: types.Message, command: CommandObject):
         for a in addrs or []:
             addr = str(a.get("address", ""))
             out.append(f"• <code>{a.get('chain')}</code> {addr} {'✅ кошелёк бота' if addr.lower() in mine else ''}")
+            raw = ", ".join(f"{k}={v}" for k, v in a.items() if k not in ("address",))
+            out.append(f"   <code>{raw[:300].replace('<', '')}</code>")
         if not addrs:
-            out.append("пусто — добавь адреса бота (/arb_wallet) в адресную книгу HTX")
+            out.append("у самой монеты адресов нет")
+        try:
+            evm = evm_account().address
+            found, kind = await htx_find_saved(coin, None, evm)
+            out.append(f"EVM-адрес бота: " + (f"✅ найден ({kind}): <code>{found}</code>" if found else
+                                              "❌ не найден ни у монеты, ни как общий"))
+        except Exception as e:
+            out.append(f"EVM-адрес бота: проверить не удалось: {e}")
     except Exception as e:
         out.append(f"\n4. ключ: {e}")
 
