@@ -100,6 +100,26 @@ def unregister_net(name):
         table.pop(name, None)
 
 
+NET_WORDS = {"bnb": "bsc", "bep20": "bsc", "erc20": "eth", "ethereum": "eth", "mon": "monad",
+             "cosmos": "atom", "cosmoshub": "atom"}
+
+
+def parse_net(word):
+    """Слово из команды → код сети или None, если это не сеть."""
+    w = str(word or "").lower()
+    w = NET_WORDS.get(w, w)
+    return w if w in NET_TITLES else None
+
+
+def net_for_coin(coin):
+    """Сеть, у которой эта монета — родная (или сеть называется так же), иначе None."""
+    c = coin.upper()
+    for net, native in NATIVE_COIN.items():
+        if native == c:
+            return net
+    return parse_net(c)
+
+
 def nets_list_text():
     return ", ".join(f"<code>{n}</code>" for n in NET_TITLES)
 
@@ -2369,6 +2389,7 @@ async def cmd_help(message: types.Message):
         "/arb — статус: спред по монетам сейчас, сделка, балансы, настройки\n"
         "/arb_add PEPE 3 bsc — торговать PEPE от 3% в сети BNB, сразу на весь баланс\n"
         "/arb_add PEPE 3 bsc 150 — то же, но сперва проба на 150$, после успешного вывода — весь баланс\n"
+        "/arb_add ATOM 2 — сеть можно не писать, если монета родная для сети (ATOM, SUI, MON, BNB, ETH…)\n"
         f"   сети: {nets_list_text()} (свои EVM-сети — /arb_net)\n"
         "   если бот не нашёл сеть сам: добавь <code>htx=код</code> и/или <code>mexc=имя</code> (см. /arb_chains)\n"
         "   если тикер на HTX другой: <code>htxcoin=ТИКЕР</code>, напр. /arb_add MON 1.5 monad htxcoin=MONAD\n"
@@ -2414,19 +2435,24 @@ async def cmd_add(message: types.Message, command: CommandObject):
         if coin.endswith("USDT"):
             coin = coin[:-4]
         pct = abs(float(args[1].replace(",", ".")))
-        net = args[2].lower()
-        if net in ("bnb", "bep20"):
-            net = "bsc"
-        if net in ("erc20", "ethereum"):
-            net = "eth"
-        if net == "mon":
-            net = "monad"
-        if net in ("cosmos", "cosmoshub"):
-            net = "atom"
-        if net not in NET_TITLES or not coin or pct <= 0:
+        rest = args[2:]
+        # Сеть можно не писать, если монета — родная монета сети и называется так
+        # же (ATOM → atom, SUI → sui, MON → monad, MAPO → mapo…): /arb_add ATOM 2
+        net = parse_net(rest[0]) if rest else None
+        if net:
+            rest = rest[1:]
+        else:
+            net = net_for_coin(coin)
+            if not net:
+                await message.answer(
+                    f"❌ Для <b>{coin}</b> укажи сеть: /arb_add {coin} {pct:g} bsc\n"
+                    f"Без сети можно только для родной монеты сети (ATOM, SUI, MON…).\nСети: {nets_list_text()}",
+                    parse_mode="HTML")
+                return
+        if not coin or pct <= 0:
             raise ValueError
         cfg = {"pct": pct, "net": net, "probe": 0, "htx_chain": None, "mexc_net": None}
-        for a in args[3:]:
+        for a in rest:
             if a.lower().startswith("htxcoin="):
                 cfg["htx_coin"] = re.sub(r"[^A-Z0-9]", "", a[8:].upper()) or None
                 cfg["htx_coin_manual"] = bool(cfg["htx_coin"])
@@ -2437,7 +2463,7 @@ async def cmd_add(message: types.Message, command: CommandObject):
             else:
                 cfg["probe"] = abs(float(a.replace(",", ".")))
     except Exception:
-        await message.answer("❌ Пример: /arb_add PEPE 3 bsc  или  /arb_add PEPE 3 bsc 150\n"
+        await message.answer("❌ Пример: /arb_add PEPE 3 bsc  ·  /arb_add PEPE 3 bsc 150  ·  /arb_add ATOM 2\n"
                              f"Сети: {nets_list_text()}", parse_mode="HTML")
         return
     text = f"✅ <b>{coin}</b>: от {pct}% · {NET_TITLES[net]} · " + \
