@@ -147,12 +147,6 @@ arb = {
     "step_pct": 0.3,       # шаг снижения лимитки на MEXC, % от безубытка
     "step_sec": 120,       # как часто снижать, сек
     "floor_pct": 1.2,      # ниже безубытка минус этот % не опускаемся
-    # Продажа по ордерам на покупку MEXC (если цели нет, но покупателей много):
-    # лимитка по лучшему покупателю, ждём sell_hold_sec; потом по следующему
-    # покупателю не ниже −step_pct%; ждём; снимаем и ждём sell_pause_sec новых.
-    "sell_min_bids": 5,    # сколько ордеров на покупку выше пола считать «много»
-    "sell_hold_sec": 90,
-    "sell_pause_sec": 30,
     "check_sec": 60,       # через сколько после заявки на вывод смотреть баланс HTX
     "spam_sec": 1.0,       # период спама при аварии
     "poll_sec": 1.0,       # как часто проверять спред по монетам из списка (/arb_set poll)
@@ -1957,6 +1951,12 @@ async def note_once(key, text, every=1800):
 
 engine_state = {"last_pass": 0.0}
 PAUSE_SEC = 300
+# Продажа по ордерам на покупку MEXC (если цели нет, но покупателей много):
+# лимитка по лучшему покупателю, ждём SELL_HOLD_SEC; потом по следующему
+# покупателю не ниже −step_pct%; ждём; снимаем и ждём SELL_PAUSE_SEC новых.
+SELL_MIN_BIDS = 5      # сколько ордеров на покупку выше пола считать «много»
+SELL_HOLD_SEC = 90
+SELL_PAUSE_SEC = 30
 
 
 def coin_paused(coin):
@@ -2690,7 +2690,7 @@ async def sell_step(d, alarm):
     bids, asks = await mexc_depth(sym)
     floor = round_up(breakeven * (1 - D(str(arb["floor_pct"])) / 100), info["tick"])
     live = [p for p, q in bids if p >= floor]
-    many = len(live) >= int(arb.get("sell_min_bids", 5))
+    many = len(live) >= SELL_MIN_BIDS
 
     async def replace(price, **meta):
         qty = new
@@ -2708,7 +2708,7 @@ async def sell_step(d, alarm):
     if many:
         # 2а) Покупателей много (пусть и мелких): продаём по их ценам.
         d["ladder_since"] = None
-        hold = arb.get("sell_hold_sec", 90)
+        hold = SELL_HOLD_SEC
         if s and s.get("mode") == "bid":
             if now - s.get("placed", now) < hold:
                 if has_more:  # доехали ещё монеты — ставим их туда же
@@ -2723,7 +2723,7 @@ async def sell_step(d, alarm):
                     return
             # Постояли на обеих ценах — снимаем и ждём, пока появятся покупатели.
             await _sell_cancel(d, sym)
-            d["sell_pause_until"] = now + arb.get("sell_pause_sec", 30)
+            d["sell_pause_until"] = now + SELL_PAUSE_SEC
             await save()
             return
         if s:  # стояла лесенка — переходим на продажу по покупателям
@@ -3157,9 +3157,9 @@ async def cmd_arb(message: types.Message):
     lines += [
         "",
         "<b>Настройки:</b>",
-        f"продажа на MEXC без цели: если покупателей ≥{arb.get('sell_min_bids', 5)} — по их ценам "
-        f"({arb.get('sell_hold_sec', 90)} сек. на лучшем, потом на следующем не ниже −{arb['step_pct']}%, "
-        f"пауза {arb.get('sell_pause_sec', 30)} сек.); иначе лесенка −{arb['step_pct']}% каждые {arb['step_sec']} сек.; "
+        f"продажа на MEXC без цели: если покупателей ≥{SELL_MIN_BIDS} — по их ценам "
+        f"({SELL_HOLD_SEC} сек. на лучшем, потом на следующем не ниже −{arb['step_pct']}%, "
+        f"пауза {SELL_PAUSE_SEC} сек.); иначе лесенка −{arb['step_pct']}% каждые {arb['step_sec']} сек.; "
         f"пол −{arb['floor_pct']}% от безубытка, ниже лучшего покупателя не ставит",
         f"проверка вывода HTX через {arb['check_sec']} сек. · стакан MEXC при покупке: "
         f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}",
@@ -3233,8 +3233,6 @@ async def cmd_help(message: types.Message):
         "/arb_set depth on|off — учитывать стакан MEXC при покупке (по умолчанию on)\n"
         "/arb_set maker on|off — ставить свой ордер первым в стакане HTX (по умолчанию on)\n"
         "/arb_set batch 15 — с какой суммы купленного сразу выводить партию\n"
-        "/arb_set bids 5 · hold 90 · pause 30 — продажа на MEXC по ордерам на покупку: сколько покупателей "
-        "считать «много», сколько секунд стоять на цене, пауза перед новым кругом\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
@@ -3730,8 +3728,7 @@ async def cmd_set(message: types.Message, command: CommandObject):
     keys = {"step": ("step_pct", float), "interval": ("step_sec", int),
             "floor": ("floor_pct", float), "check": ("check_sec", int),
             "spam": ("spam_sec", float), "poll": ("poll_sec", float),
-            "batch": ("batch_usd", float), "bids": ("sell_min_bids", int),
-            "hold": ("sell_hold_sec", int), "pause": ("sell_pause_sec", int)}
+            "batch": ("batch_usd", float)}
     args = (command.args or "").split()
     if len(args) == 2 and args[0].lower() == "maker" and args[1].lower() in ("on", "off"):
         arb["maker"] = args[1].lower() == "on"
