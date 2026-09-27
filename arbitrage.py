@@ -1704,6 +1704,7 @@ async def resolve_coin(coin, cfg):
         "htx_chain": htx.get("chain"),
         # Вывод «открыт», только если ни один из двух источников HTX не говорит обратное.
         "htx_withdraw_ok": htx.get("withdrawStatus") == "allowed" and not v1_closed((await htx_v1_row(hc, htx)).get("we")),
+        "htx_withdraw_status": htx.get("withdrawStatus"),
         "htx_fee": htx_chain_fee(htx),
         "htx_min_withdraw": D(htx.get("minWithdrawAmt") or 0),
         "htx_withdraw_step": step_of(htx.get("withdrawPrecision", 8)),
@@ -2000,7 +2001,10 @@ async def try_start(coin, cfg, opp):
                      f"<code>{res['htx_pair']}</code> — пересчитаю спред по ней.")
         return False
     if not res["htx_withdraw_ok"]:
-        await note_once(f"wd:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но HTX явно пишет, что вывод в сети {res['htx_chain']} закрыт — пропускаю.")
+        st = res.get("htx_withdraw_status")
+        why = (f"HTX пишет, что вывод в сети {res['htx_chain']} закрыт" if st == "prohibited" or (st == "allowed") else
+               f"статус вывода в сети {res['htx_chain']} неизвестен (HTX отдал: {st or 'ничего'})")
+        await note_once(f"wd:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {why} — не покупаю.")
         return False
     if not res["mexc_deposit_ok"]:
         await note_once(f"dep:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но на MEXC закрыт депозит в этой сети — пропускаю.")
