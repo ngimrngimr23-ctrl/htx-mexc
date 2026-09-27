@@ -129,6 +129,8 @@ arb = {
     "maker": True,
     # С какой суммы купленного сразу выводить партию, не снимая ордер (/arb_set batch).
     "batch_usd": 15.0,
+    # Монеты, на которые бот временно «забил» после /stop аварии: {монета: до_когда}.
+    "paused": {},
 }
 
 deal = None       # активная сделка (одна за раз: покупка идёт на весь баланс)
@@ -1087,9 +1089,10 @@ STOP_KB = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="🛑 Остановить спам", callback_data="arb_stop_spam")]])
 
 
-def alarm_start(text):
+def alarm_start(text, pause_coin=None):
+    """pause_coin — монета, на которую бот «забивает», если спам остановили."""
     aid = uuid.uuid4().hex[:8]
-    alarms[aid] = {"text": text, "acked": False}
+    alarms[aid] = {"text": text, "acked": False, "pause_coin": pause_coin}
     return aid
 
 
@@ -1247,6 +1250,15 @@ async def note_once(key, text, every=1800):
 
 
 engine_state = {"last_pass": 0.0}
+PAUSE_SEC = 300
+
+
+def coin_paused(coin):
+    until = arb.setdefault("paused", {}).get(coin)
+    if until and time.time() < until:
+        return True
+    arb["paused"].pop(coin, None)
+    return False
 
 def _ago(ts):
     if not ts:
@@ -1274,7 +1286,8 @@ async def engine_loop():
                         except Exception as e:
                             await note_once(f"res:{coin}", f"⚠️ <b>{coin}</b>: не удалось найти монету на HTX: {e}",
                                             every=1800)
-                coins = [(c, cfg) for c, cfg in arb["coins"].items() if cfg.get("htx_symbol")]
+                coins = [(c, cfg) for c, cfg in arb["coins"].items()
+                         if cfg.get("htx_symbol") and not coin_paused(c)]
                 opps = await asyncio.gather(*[check_opportunity(c, cfg) for c, cfg in coins],
                                             return_exceptions=True)
                 found = []
@@ -1419,6 +1432,13 @@ async def run_deal():
     d = deal
     alarm = {"id": None}
     while True:
+        if d.get("abandoned"):
+            # По /stop аварии бот «забил» на монету: ордера не трогаем, сделку бросаем.
+            if alarm["id"]:
+                alarm_end(alarm["id"])
+            deal = None
+            await save()
+            return
         try:
             if d["mexc_baseline"] is None:
                 d["mexc_baseline"] = str(await mexc_free(d["coin"]))
@@ -1702,7 +1722,8 @@ async def _batch_failed(d, breakeven, reason):
     d["buying"] = False
     d["unw_qty"] = d["unw_cost"] = "0"
     r = {"id": uuid.uuid4().hex[:8], "coin": hcoin(d["coin"], d["cfg"]), "symbol": hsym(d["coin"], d["cfg"]),
-         "breakeven": str(breakeven or 0), "reason": reason, "order_id": None, "created": time.time()}
+         "mexc_coin": d["coin"], "breakeven": str(breakeven or 0), "reason": reason,
+         "order_id": None, "price": None, "created": time.time()}
     rescues.append(r)
     await save()
     spawn(run_rescue(r))
@@ -1890,40 +1911,63 @@ async def finish_deal(d):
 # ---------- аварийная продажа на HTX ----------
 
 async def run_rescue(r):
+    """Вывод не прошёл: выставляем продажу монеты на HTX по текущей цене покупки
+    на MEXC и держим её под эту цену, пока не продастся. Спам — сразу. Если спам
+    остановили (/stop или кнопка) — бот «забивает» на монету: ордер не трогает и
+    не торгует ею PAUSE_SEC сек. или до /arb_resume."""
     coin, sym = r["coin"], r.get("symbol") or f"{r['coin']}usdt"
+    mcoin = r.get("mexc_coin") or coin
     aid = None
     try:
         info = await htx_symbol(sym)
-        price = round_up(D(r["breakeven"]), info["tick"])
-        if not r["order_id"]:
-            free, _ = await htx_balance(coin)
-            qty = round_down(free, info["step"])
-            await notify(f"⚠️ <b>{coin}</b>: {r['reason']}.\nПродаю {fmt(qty)} шт. на HTX в ноль по {fmt(price)}.")
-            if qty <= 0 or qty * price < info["min_value"]:
-                raise ExchangeError(f"на HTX нечего продавать ({fmt(qty)} шт.)")
-            r["order_id"] = await htx_place(sym, "sell-limit", qty, price)
-            await save()
-        started = time.time()
+        free, _ = await htx_balance(coin)
+        aid = alarm_start(f"<b>{mcoin}</b>: куплено {fmt(free)} шт. на HTX, но вывод не прошёл: {r['reason']}\n"
+                          f"Продаю на HTX по цене MEXC.", pause_coin=mcoin)
         while True:
-            o = await htx_order(r["order_id"])
-            if o["state"] == "filled":
-                await notify(f"✅ <b>{coin}</b>: аварийная продажа на HTX исполнена, "
-                             f"{fmt(o['filled'])} шт. на {fmt(o['cash'])}$.")
-                break
-            if o["state"] in ("canceled", "partial-canceled"):
-                await notify(f"ℹ️ <b>{coin}</b>: аварийный ордер на HTX отменён (продано {fmt(o['filled'])} шт.). "
-                             f"Дальше — вручную.")
-                break
-            if aid is None and time.time() - started > 10:
-                aid = alarm_start(f"<b>{coin}</b>: вывод с HTX не прошёл, ордер на продажу в ноль "
-                                  f"по {fmt(price)} на HTX не исполняется (продано {fmt(o['filled'])}).")
+            if alarms.get(aid, {}).get("acked"):
+                return  # спам остановлен — «забили» на монету, ордер оставляем как есть
+            if r["order_id"]:
+                o = await htx_order(r["order_id"])
+                if o["state"] == "filled":
+                    await notify(f"✅ <b>{mcoin}</b>: монеты, которые не удалось вывести, проданы на HTX: "
+                                 f"{fmt(o['filled'])} шт. на {fmt(o['cash'])}$.")
+                    return
+                if o["state"] in ("canceled", "partial-canceled") and not r.get("self_cancel"):
+                    await notify(f"ℹ️ <b>{mcoin}</b>: ордер на продажу на HTX отменён вручную "
+                                 f"(продано {fmt(o['filled'])} шт.). Дальше — вручную.")
+                    return
+            # Цена продажи = текущая лучшая цена покупки на MEXC.
+            bids, _ = await mexc_depth(f"{mcoin}USDT")
+            if not bids:
+                await asyncio.sleep(5)
+                continue
+            price = round_down(bids[0][0], info["tick"])
+            if price != (D(r["price"]) if r["price"] else None):
+                if r["order_id"]:
+                    r["self_cancel"] = True
+                    await htx_cancel(r["order_id"])
+                    await htx_wait_final(r["order_id"], timeout=5)
+                    r["self_cancel"] = False
+                free, _ = await htx_balance(coin)
+                qty = round_down(free, info["step"])
+                if qty <= 0 or qty * price < info["min_value"]:
+                    await notify(f"✅ <b>{mcoin}</b>: на HTX больше нечего продавать.")
+                    return
+                r["order_id"] = await htx_place(sym, "sell-limit", qty, price)
+                r["price"] = str(price)
+                await save()
+                alarm_update(aid, f"<b>{mcoin}</b>: куплено {fmt(qty)} шт. на HTX, но вывод не прошёл: {r['reason']}\n"
+                                  f"Ордер на продажу на HTX: {fmt(qty)} шт. по {fmt(price)} (= цена покупки на MEXC), "
+                                  f"переставляю вслед за MEXC.")
             await asyncio.sleep(5)
     except Exception as e:
         print(f"[arb] rescue {coin}: {traceback.format_exc()}", flush=True)
-        text = f"<b>{coin}</b>: вывод с HTX не прошёл, и продать на HTX не получилось: <code>{e}</code>. Нужны ручные действия!"
-        if aid is None:
-            aid = alarm_start(text)
-        # Ждём, пока спам остановят вручную — дальше решает человек.
+        text = (f"<b>{mcoin}</b>: вывод с HTX не прошёл, и продать на HTX не получилось: <code>{e}</code>. "
+                f"Нужны ручные действия!")
+        if aid is None or aid not in alarms:
+            aid = alarm_start(text, pause_coin=mcoin)
+        else:
+            alarm_update(aid, text)
         while aid in alarms and not alarms[aid]["acked"]:
             await asyncio.sleep(1)
     finally:
@@ -2038,6 +2082,10 @@ async def cmd_arb(message: types.Message):
         if _dd(d, "sold_qty") > 0 or d.get("sell"):
             lines.append(f"продано на MEXC: {fmt(d['sold_qty'])} шт. на {fmt(d['proceeds'])}$"
                          + (f"; лесенка {fmt(d['sell']['qty'])} шт. по {fmt(d['sell']['price'])}" if d.get("sell") else ""))
+    now_paused = {c: u for c, u in arb.get("paused", {}).items() if u > time.time()}
+    if now_paused:
+        lines.append("⏸ На паузе: " + ", ".join(f"{c} (ещё {int((u - time.time()) // 60) + 1} мин.)"
+                                                for c, u in now_paused.items()) + " — /arb_resume")
     if rescues:
         lines.append(f"⚠️ Аварийных продаж на HTX: {len(rescues)} ({', '.join(r['coin'] for r in rescues)})")
     active_alarms = [a for a in alarms.values() if not a["acked"]]
@@ -2099,7 +2147,8 @@ async def cmd_help(message: types.Message):
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
         "/arb_net — список сетей · /arb_net del mapo — удалить свою сеть\n"
         "/arb_reset — забыть зависшую сделку (после ручного разбора)\n"
-        "/stop — остановить спам\n\n"
+        "/stop — остановить спам (при аварии вывода — ещё и пауза по монете на 5 мин.)\n"
+        "/arb_resume PEPE — снять эту паузу раньше\n\n"
         "<b>Как идёт сделка</b>\n"
         "1. Покупка на HTX: если есть продавцы по цене, дающей твой % к MEXC, — выкупает их сразу. "
         "Если нет — ставит свой ордер на покупку первым в стакане (на тик выше лучшего чужого, но не дороже "
@@ -2528,20 +2577,49 @@ async def cmd_reset(message: types.Message, command: CommandObject):
 
 
 async def _stop_spam():
-    n = 0
+    """Гасит спам. Для аварий «вывод не прошёл» бот ещё и «забивает» на монету:
+    бросает её сделку, не трогает её ордера и не торгует ею PAUSE_SEC сек. или до /arb_resume."""
+    n, paused = 0, []
     for a in alarms.values():
         if not a["acked"]:
             a["acked"] = True
             n += 1
-    return n
+            c = a.get("pause_coin")
+            if c:
+                arb.setdefault("paused", {})[c] = time.time() + PAUSE_SEC
+                paused.append(c)
+                if deal and deal.get("coin") == c:
+                    deal["abandoned"] = True
+    if paused:
+        await save()
+    return n, sorted(set(paused))
+
+
+@router.message(Command("arb_resume"))
+async def cmd_resume(message: types.Message, command: CommandObject):
+    if not await _guard(message):
+        return
+    coin = re.sub(r"[^A-Z0-9]", "", (command.args or "").upper())
+    paused = arb.setdefault("paused", {})
+    if not coin or coin == "ALL":
+        coins = list(paused)
+        paused.clear()
+    else:
+        coins = [coin] if paused.pop(coin, None) else []
+    await save()
+    await message.answer(f"▶️ Снова торгую: {', '.join(coins)}" if coins else "ℹ️ На паузе ничего нет.")
 
 
 @router.message(Command("stop"))
 async def cmd_stop(message: types.Message):
     if not await _guard(message):
         return
-    n = await _stop_spam()
-    await message.answer(f"🔕 Спам остановлен ({n}). Как только ситуация разрешится, пришлю итог.")
+    n, paused = await _stop_spam()
+    text = f"🔕 Спам остановлен ({n})."
+    if paused:
+        text += (f"\n⏸ Автоарбитраж по {', '.join(paused)} отключён на {PAUSE_SEC // 60} мин.: ордера не трогаю, "
+                 f"сделку бросил — дальше вручную. Вернуть раньше: /arb_resume {paused[0]}")
+    await message.answer(text)
 
 
 @router.callback_query(F.data == "arb_stop_spam")
@@ -2549,8 +2627,11 @@ async def cb_stop(callback: types.CallbackQuery):
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа")
         return
-    n = await _stop_spam()
+    n, paused = await _stop_spam()
     await callback.answer(f"Спам остановлен ({n})")
+    if paused:
+        await notify(f"⏸ Автоарбитраж по {', '.join(paused)} отключён на {PAUSE_SEC // 60} мин.: ордера не трогаю, "
+                     f"сделку бросил — дальше вручную. Вернуть раньше: /arb_resume {paused[0]}")
 
 
 # ================= ЗАПУСК =================
@@ -2587,5 +2668,6 @@ BOT_COMMANDS = [
     ("arb_live", "Реальные сделки on / тест off"),
     ("arb_set", "Параметры лесенки и проверок"),
     ("arb_wallet", "Кошельки бота"),
+    ("arb_resume", "Снять паузу с монеты после /stop"),
     ("stop", "Остановить спам"),
 ]
