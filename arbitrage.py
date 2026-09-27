@@ -851,9 +851,27 @@ async def htx_address_saved(currency, chain, address):
         print(f"[arb] адресная книга HTX {currency}: {e}", flush=True)
         address_book_errors[currency.upper()] = str(e)[:200]
         return None
+    return _book_match(rows, chain, address) is not None
+
+
+def _book_match(rows, chain, address):
+    """Адрес из книги в ТОМ ЖЕ написании, что сохранён на HTX (регистр букв важен:
+    HTX сравнивает строки буква в букву), или None."""
     addr = address.lower()
-    return any(str(r.get("address", "")).lower() == addr and (not chain or r.get("chain") == chain)
-               for r in rows or [])
+    for r in rows or []:
+        if str(r.get("address", "")).lower() == addr and (not chain or r.get("chain") == chain):
+            return str(r["address"])
+    return None
+
+
+async def htx_book_address(currency, chain, address):
+    """Написание адреса для заявки на вывод — как в адресной книге HTX.
+    Если книгу прочитать не удалось — отдаём адрес как есть."""
+    try:
+        rows = await htx_req("GET", "/v2/account/withdraw/address", {"currency": currency.lower()})
+    except Exception:
+        return address
+    return _book_match(rows, chain, address) or address
 
 
 def address_book_hint(coin_htx, chain, address):
@@ -1688,6 +1706,7 @@ async def withdraw_batch(d):
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
     breakeven = unw_c / unw_q if unw_q > 0 else None
     wid, errors, amount = None, [], D(0)
+    to_addr = await htx_book_address(hc, res["htx_chain"], wallet_address(cfg["net"]))
     # HTX часто не отдаёт (или отдаёт неверно) комиссию вывода — при отказе
     # пробуем ещё раз с запасом 1% / 3% / 5%.
     for share in ("1", "0.99", "0.97", "0.95"):
@@ -1695,7 +1714,7 @@ async def withdraw_batch(d):
         if amount <= 0 or amount < res["htx_min_withdraw"]:
             break
         try:
-            wid = await htx_withdraw(wallet_address(cfg["net"]), hc, amount, res["htx_chain"], res["htx_fee"])
+            wid = await htx_withdraw(to_addr, hc, amount, res["htx_chain"], res["htx_fee"])
             break
         except ExchangeError as e:
             errors.append(str(e))
