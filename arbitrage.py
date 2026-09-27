@@ -1376,6 +1376,9 @@ async def load():
             arb.update(json.loads(raw_cfg))
             for name, n in arb.get("networks", {}).items():
                 register_net(name, n["rpc"], n["native"], n.get("aliases", []))
+            for name, url in arb.get("rpc_override", {}).items():
+                if name in RPC_URLS:
+                    RPC_URLS[name] = url
         if isinstance(raw_deal, str):
             deal = json.loads(raw_deal)
         if isinstance(raw_resc, str):
@@ -2233,6 +2236,126 @@ async def run_rescue(r):
         await save()
 
 
+# ================= ПОИСК НОД (RPC) =================
+#
+# EVM: открытый реестр сетей Chainlist (ethereum-lists) — там у каждой сети
+# список публичных RPC. Cosmos Hub: официальный Cosmos Chain Registry (REST).
+# Каждую ноду проверяем: отвечает ли, та ли сеть (chain id), высота блока, пинг.
+
+CHAINLIST_URL = "https://chainid.network/chains.json"
+EVM_CHAIN_IDS = {"eth": 1, "bsc": 56, "monad": 143}
+COSMOS_REGISTRY_URL = "https://raw.githubusercontent.com/cosmos/chain-registry/master/cosmoshub/chain.json"
+_chainlist = {"ts": 0.0, "data": []}
+
+
+async def chainlist():
+    if time.time() - _chainlist["ts"] > 86400 or not _chainlist["data"]:
+        async with http().get(CHAINLIST_URL, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            data = await r.json(content_type=None)
+        _chainlist.update(ts=time.time(), data=data if isinstance(data, list) else [])
+    return _chainlist["data"]
+
+
+async def find_evm_chain(query, chain_id=None):
+    """Сеть из Chainlist по chain id или по названию/символу монеты газа. Тестнеты
+    пропускаем. Возвращает (сеть, похожие) — сеть None, если однозначно не нашлась."""
+    q = str(query or "").lower()
+    chains = [c for c in await chainlist() if "test" not in str(c.get("name", "")).lower()
+              and "devnet" not in str(c.get("name", "")).lower()]
+    if chain_id is not None:
+        hit = [c for c in chains if c.get("chainId") == chain_id]
+        return (hit[0] if hit else None), hit
+    exact = [c for c in chains if q in (str(c.get("shortName", "")).lower(), str(c.get("chain", "")).lower(),
+                                        str(c.get("name", "")).lower())]
+    if not exact:
+        exact = [c for c in chains if str((c.get("nativeCurrency") or {}).get("symbol", "")).lower() == q]
+    if not exact:
+        exact = [c for c in chains if str(c.get("name", "")).lower().startswith(q)]
+    return (exact[0] if len(exact) == 1 else None), exact
+
+
+def evm_rpc_candidates(chain):
+    """Публичные https-RPC из реестра (без тех, что требуют API-ключ)."""
+    return [u for u in chain.get("rpc", []) if u.startswith("https://") and "${" not in u and "{" not in u]
+
+
+async def probe_evm(url, expect_chain_id=None):
+    t0 = time.time()
+    try:
+        body = [{"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
+                {"jsonrpc": "2.0", "id": 2, "method": "eth_blockNumber", "params": []}]
+        async with http().post(url, json=body, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            data = await r.json(content_type=None)
+        res = {x.get("id"): x.get("result") for x in data} if isinstance(data, list) else {}
+        cid, block = int(res[1], 16), int(res[2], 16)
+        ok = expect_chain_id is None or cid == expect_chain_id
+        return {"url": url, "ok": ok, "chain_id": cid, "block": block, "ms": int((time.time() - t0) * 1000),
+                "err": None if ok else f"другая сеть (chain id {cid})"}
+    except Exception as e:
+        return {"url": url, "ok": False, "err": str(e)[:80] or type(e).__name__, "ms": None}
+
+
+async def probe_cosmos(url):
+    t0 = time.time()
+    try:
+        async with http().get(url.rstrip("/") + "/cosmos/base/tendermint/v1beta1/blocks/latest",
+                              timeout=aiohttp.ClientTimeout(total=8)) as r:
+            data = await r.json(content_type=None)
+        hdr = (data.get("block") or {}).get("header") or {}
+        ok = hdr.get("chain_id") == "cosmoshub-4"
+        return {"url": url, "ok": ok, "chain_id": hdr.get("chain_id"), "block": int(hdr.get("height") or 0),
+                "ms": int((time.time() - t0) * 1000), "err": None if ok else f"другая сеть ({hdr.get('chain_id')})"}
+    except Exception as e:
+        return {"url": url, "ok": False, "err": str(e)[:80] or type(e).__name__, "ms": None}
+
+
+async def rpc_alternatives(net):
+    """Кандидаты-ноды для сети с проверкой, лучшие первыми."""
+    if net == "atom":
+        async with http().get(COSMOS_REGISTRY_URL, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            reg = await r.json(content_type=None)
+        urls = [a["address"] for a in (reg.get("apis") or {}).get("rest", []) if a.get("address", "").startswith("https://")]
+        probes = await asyncio.gather(*[probe_cosmos(u) for u in urls[:12]])
+    elif net == "sui":
+        return []
+    else:
+        cur = await probe_evm(RPC_URLS[net])
+        cid = cur.get("chain_id") if cur.get("ok") else (
+            EVM_CHAIN_IDS.get(net) or arb.get("networks", {}).get(net, {}).get("chain_id"))
+        if not cid:
+            return []
+        chain, _ = await find_evm_chain(None, cid)
+        if not chain:
+            return []
+        urls = evm_rpc_candidates(chain)
+        probes = await asyncio.gather(*[probe_evm(u, chain.get("chainId")) for u in urls[:12]])
+    good = [p for p in probes if p["ok"]]
+    top = max((p["block"] for p in good), default=0)
+    # Отстающие больше чем на 50 блоков — не годятся (нода не синхронизирована).
+    good = [p for p in good if p["block"] >= top - 50]
+    return sorted(good, key=lambda p: p["ms"])
+
+
+async def probe_current(net):
+    if net == "sui":
+        t0 = time.time()
+        try:
+            await rpc("sui", "sui_getLatestCheckpointSequenceNumber", [])
+            return {"url": RPC_URLS[net], "ok": True, "ms": int((time.time() - t0) * 1000), "block": None}
+        except Exception as e:
+            return {"url": RPC_URLS[net], "ok": False, "err": str(e)[:80]}
+    if net == "atom":
+        return await probe_cosmos(RPC_URLS[net])
+    return await probe_evm(RPC_URLS[net])
+
+
+def probe_line(p):
+    if p.get("ok"):
+        extra = f", блок {p['block']}" if p.get("block") else ""
+        return f"✅ <code>{p['url']}</code> — {p['ms']} мс{extra}"
+    return f"❌ <code>{p['url']}</code> — {p.get('err')}"
+
+
 # ================= КОМАНДЫ =================
 
 def _is_admin(user_id):
@@ -2407,6 +2530,7 @@ async def cmd_help(message: types.Message):
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
         "/arb_net — список сетей · /arb_net del mapo — удалить свою сеть\n"
+        "/arb_rpc — состояние нод всех сетей · /arb_rpc eth — запасные ноды · /arb_rpc eth auto — перейти на лучшую\n"
         "/arb_reset — забыть зависшую сделку (после ручного разбора)\n"
         "/stop — остановить спам (при аварии вывода — ещё и пауза по монете на 5 мин.)\n"
         "/arb_resume PEPE — снять эту паузу раньше\n\n"
@@ -2727,7 +2851,73 @@ async def cmd_chains(message: types.Message, command: CommandObject):
                          f"<code>{res['mexc_net'].get('netWork') or res['mexc_net'].get('network')}</code>")
         except Exception as e:
             lines.append(f"\n⚠️ {e}")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    net = cfg["net"] if cfg else net_for_coin(coin)
+    if net:
+        lines.append(f"\n🌐 Нода сети {NET_TITLES[net]}: {probe_line(await probe_current(net))}")
+        lines.append(f"Запасные ноды и смена: /arb_rpc {net}")
+    await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
+@router.message(Command("arb_rpc"))
+async def cmd_rpc(message: types.Message, command: CommandObject):
+    """Ноды сетей: /arb_rpc — все; /arb_rpc eth — текущая + найденные запасные;
+    /arb_rpc eth auto — перейти на самую быструю рабочую; /arb_rpc eth <url> — свою."""
+    if not await _guard(message):
+        return
+    args = (command.args or "").split()
+    if not args:
+        probes = await asyncio.gather(*[probe_current(n) for n in NET_TITLES])
+        lines = ["🌐 <b>Ноды сетей</b>"] + [f"<b>{NET_TITLES[n]}</b> ({n}): {probe_line(p)}"
+                                          for n, p in zip(NET_TITLES, probes)]
+        lines.append("\nПодробнее и запасные: /arb_rpc eth · сменить на лучшую: /arb_rpc eth auto")
+        await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+        return
+    net = parse_net(args[0]) or net_for_coin(args[0].upper())
+    if not net:
+        await message.answer(f"❌ Не знаю такую сеть. Сети: {nets_list_text()}", parse_mode="HTML")
+        return
+    cur = await probe_current(net)
+    if len(args) > 1:
+        new = None
+        if args[1].lower() == "auto":
+            try:
+                alts = await rpc_alternatives(net)
+            except Exception as e:
+                await message.answer(f"❌ Не удалось найти ноды: {e}")
+                return
+            if not alts:
+                await message.answer("❌ Рабочих запасных нод не нашёл.")
+                return
+            new = alts[0]["url"]
+        elif args[1].startswith("http"):
+            new = args[1]
+        if new:
+            old = RPC_URLS[net]
+            RPC_URLS[net] = new
+            test = await probe_current(net)
+            if not test.get("ok"):
+                RPC_URLS[net] = old
+                await message.answer(f"❌ Нода не подошла: {probe_line(test)}", parse_mode="HTML")
+                return
+            arb.setdefault("rpc_override", {})[net] = new
+            if net in arb.get("networks", {}):
+                arb["networks"][net]["rpc"] = new
+            await save()
+            await message.answer(f"✅ {NET_TITLES[net]}: теперь нода {probe_line(test)}", parse_mode="HTML",
+                                 disable_web_page_preview=True)
+            return
+    lines = [f"🌐 <b>{NET_TITLES[net]}</b>", f"Сейчас: {probe_line(cur)}"]
+    try:
+        alts = await rpc_alternatives(net)
+        if alts:
+            lines.append("\nНашёл рабочие ноды (быстрые первыми):")
+            lines += [f"• {probe_line(p)}" for p in alts[:6]]
+            lines.append(f"\nПерейти на самую быструю: /arb_rpc {net} auto")
+        elif net != "sui":
+            lines.append("\nЗапасных рабочих нод в реестре не нашёл.")
+    except Exception as e:
+        lines.append(f"\nПоиск нод не удался: {e}")
+    await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
 @router.message(Command("arb_net"))
@@ -2736,6 +2926,31 @@ async def cmd_net(message: types.Message, command: CommandObject):
         return
     args = (command.args or "").split()
     action = args[0].lower() if args else "list"
+
+    if action == "add" and len(args) >= 2 and (len(args) == 2 or not args[2].startswith("http")):
+        # /arb_net add mapo [MAPO] — ноду и монету газа бот ищет сам в реестре Chainlist.
+        name = args[1].lower()
+        try:
+            chain, similar = await find_evm_chain(args[2] if len(args) > 2 else name)
+        except Exception as e:
+            await message.answer(f"❌ Реестр сетей недоступен: {e}")
+            return
+        if not chain:
+            names = ", ".join(f"{c.get('name')} ({c.get('nativeCurrency', {}).get('symbol')}, id {c.get('chainId')})"
+                              for c in similar[:6])
+            await message.answer(("❌ Однозначно не нашёл сеть «%s». " % name) +
+                                 (f"Похожие: {names}. Уточни: /arb_net add {name} &lt;символ газа&gt;" if similar else
+                                  f"Укажи ноду сам: /arb_net add {name} https://… МОНЕТА"), parse_mode="HTML")
+            return
+        probes = await asyncio.gather(*[probe_evm(u, chain.get("chainId")) for u in evm_rpc_candidates(chain)[:12]])
+        good = sorted([p for p in probes if p["ok"]], key=lambda p: p["ms"])
+        if not good:
+            await message.answer(f"❌ Нашёл сеть {chain.get('name')}, но ни одна публичная нода не ответила. "
+                                 f"Укажи ноду сам: /arb_net add {name} https://… {chain['nativeCurrency']['symbol']}")
+            return
+        args = ["add", name, good[0]["url"], chain["nativeCurrency"]["symbol"]] + args[3:]
+        await message.answer(f"🔎 {chain.get('name')} (chain id {chain.get('chainId')}): нода {probe_line(good[0])}",
+                             parse_mode="HTML", disable_web_page_preview=True)
 
     if action == "add":
         try:
@@ -2747,7 +2962,8 @@ async def cmd_net(message: types.Message, command: CommandObject):
             aliases = [a for a in (args[4].upper().split(",") if len(args) > 4 else []) if a]
         except Exception:
             await message.answer(
-                "Пример: /arb_net add mapo https://rpc.maplabs.io MAPO\n"
+                "Пример: /arb_net add mapo — ноду бот найдёт сам\n"
+                "или вручную: /arb_net add mapo https://rpc.maplabs.io MAPO\n"
                 "или с названиями сети на биржах: /arb_net add mapo https://rpc.maplabs.io MAPO MAPO,MAP")
             return
         if name in BUILTIN_NETS:
@@ -2764,7 +2980,7 @@ async def cmd_net(message: types.Message, command: CommandObject):
                 RPC_URLS[name] = arb["networks"][name]["rpc"]
             await message.answer(f"❌ Нода не отвечает как EVM-сеть: {e}")
             return
-        arb["networks"][name] = {"rpc": rpc_url, "native": native, "aliases": aliases}
+        arb["networks"][name] = {"rpc": rpc_url, "native": native, "aliases": aliases, "chain_id": chain_id}
         register_net(name, rpc_url, native, aliases)
         await save()
         addr = ""
@@ -2987,6 +3203,7 @@ BOT_COMMANDS = [
     ("arb_confirm", "Подтвердить контракт монеты вручную"),
     ("arb_htx", "Что HTX отдаёт по монете (проверка API)"),
     ("arb_net", "Свои EVM-сети: список / add / del"),
+    ("arb_rpc", "Ноды сетей: проверка, поиск, смена"),
     ("arb_on", "Включить автоарбитраж"),
     ("arb_off", "Выключить автоарбитраж"),
     ("arb_live", "Реальные сделки on / тест off"),
