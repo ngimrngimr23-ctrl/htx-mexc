@@ -1937,9 +1937,34 @@ async def finish_deal(d):
 
 # ---------- аварийная продажа на HTX ----------
 
+# Аварийная продажа на HTX, если вывод не прошёл: (сек. от начала, скидка от цены
+# MEXC в %). Со скидкой продаём, только если цена всё ещё ≥ закупки + RESCUE_MIN_PROFIT%;
+# после последней ступени — в безубыток.
+RESCUE_STEPS = [(0, 0), (300, 1.5), (480, 2.0), (780, 2.5)]
+RESCUE_BREAKEVEN_AFTER = 1080
+RESCUE_MIN_PROFIT = 1.0
+
+
+def rescue_price(mexc_bid, breakeven, elapsed, tick):
+    """Цена аварийной продажи на HTX: (цена, описание ступени)."""
+    if breakeven > 0 and elapsed >= RESCUE_BREAKEVEN_AFTER:
+        return round_up(breakeven, tick), "в безубыток"
+    disc = 0
+    for start, pct in RESCUE_STEPS:
+        if elapsed >= start:
+            disc = pct
+    price = round_down(mexc_bid * (1 - D(disc) / 100), tick)
+    if disc and breakeven > 0:
+        min_price = round_up(breakeven * (1 + D(RESCUE_MIN_PROFIT) / 100), tick)
+        if price < min_price:
+            return min_price, f"MEXC −{disc:g}% ниже закупки +{RESCUE_MIN_PROFIT:g}% — держу закупка +{RESCUE_MIN_PROFIT:g}%"
+    return price, ("= цена покупки на MEXC" if not disc else f"= MEXC −{disc:g}%")
+
+
 async def run_rescue(r):
-    """Вывод не прошёл: выставляем продажу монеты на HTX по текущей цене покупки
-    на MEXC и держим её под эту цену, пока не продастся. Спам — сразу. Если спам
+    """Вывод не прошёл: продаём монету на HTX вслед за ценой покупки на MEXC —
+    5 мин. по цене MEXC, потом 3 мин. −1,5%, 5 мин. −2%, 5 мин. −2,5% (но не ниже
+    закупки +1%), дальше — в безубыток. Спам — сразу. Если спам
     остановили (/stop или кнопка) — бот «забивает» на монету: ордер не трогает и
     не торгует ею PAUSE_SEC сек. или до /arb_resume."""
     coin, sym = r["coin"], r.get("symbol") or f"{r['coin']}usdt"
@@ -1968,7 +1993,8 @@ async def run_rescue(r):
             if not bids:
                 await asyncio.sleep(5)
                 continue
-            price = round_down(bids[0][0], info["tick"])
+            price, stage = rescue_price(bids[0][0], D(r.get("breakeven") or 0),
+                                        time.time() - r["created"], info["tick"])
             if price != (D(r["price"]) if r["price"] else None):
                 if r["order_id"]:
                     r["self_cancel"] = True
@@ -1984,8 +2010,8 @@ async def run_rescue(r):
                 r["price"] = str(price)
                 await save()
                 alarm_update(aid, f"<b>{mcoin}</b>: куплено {fmt(qty)} шт. на HTX, но вывод не прошёл: {r['reason']}\n"
-                                  f"Ордер на продажу на HTX: {fmt(qty)} шт. по {fmt(price)} (= цена покупки на MEXC), "
-                                  f"переставляю вслед за MEXC.")
+                                  f"Ордер на продажу на HTX: {fmt(qty)} шт. по {fmt(price)} ({stage}), "
+                                  f"закупка {fmt(D(r.get('breakeven') or 0))}. Переставляю вслед за MEXC.")
             await asyncio.sleep(5)
     except Exception as e:
         print(f"[arb] rescue {coin}: {traceback.format_exc()}", flush=True)
