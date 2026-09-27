@@ -162,7 +162,9 @@ arb = {
     "paused": {},
 }
 
-deal = None       # активная сделка (одна за раз: покупка идёт на весь баланс)
+# Сделки по монетам: {монета: сделка}. Покупать может только одна (весь USDT в
+# ней), остальные в это время доводят свои партии до продажи.
+deals = {}
 rescues = []      # аварийные продажи на HTX (вывод не прошёл)
 alarms = {}       # id -> {"text": str, "acked": bool}
 
@@ -1805,18 +1807,18 @@ async def save():
         return
     await asyncio.gather(
         ctx.redis("SET", "arb:config", json.dumps(arb)),
-        ctx.redis("SET", "arb:deal", json.dumps(deal, default=_json_default)),
+        ctx.redis("SET", "arb:deals", json.dumps(deals, default=_json_default)),
         ctx.redis("SET", "arb:rescues", json.dumps(rescues, default=_json_default)),
         return_exceptions=True,
     )
 
 
 async def load():
-    global deal, rescues
+    global deals, rescues
     if not ctx.redis:
         return
     raw_cfg, raw_deal, raw_resc = await asyncio.gather(
-        ctx.redis("GET", "arb:config"), ctx.redis("GET", "arb:deal"),
+        ctx.redis("GET", "arb:config"), ctx.redis("GET", "arb:deals"),
         ctx.redis("GET", "arb:rescues"), return_exceptions=True)
     try:
         if isinstance(raw_cfg, str):
@@ -1827,9 +1829,16 @@ async def load():
                 if name in RPC_URLS:
                     RPC_URLS[name] = url
         if isinstance(raw_deal, str):
-            deal = json.loads(raw_deal)
+            deals = json.loads(raw_deal) or {}
         if isinstance(raw_resc, str):
             rescues = json.loads(raw_resc) or []
+        if not deals:
+            old = await ctx.redis("GET", "arb:deal")  # формат прошлой версии: одна сделка
+            if isinstance(old, str) and old not in ("null", ""):
+                od = json.loads(old)
+                if od and od.get("coin"):
+                    deals[od["coin"]] = od
+                await ctx.redis("SET", "arb:deal", "null")
     except Exception as e:
         print(f"[arb] не удалось восстановить состояние: {e}", flush=True)
 
@@ -1943,7 +1952,7 @@ async def engine_loop():
     while True:
         engine_state["last_pass"] = time.time()
         try:
-            if arb["enabled"] and deal is None and not rescues and arb["coins"]:
+            if arb["enabled"] and arb["coins"]:
                 # Все монеты списка проверяются ПАРАЛЛЕЛЬНО: время прохода = одному
                 # запросу, а не сумме по монетам. Первой пробуем монету с большим спредом.
                 # Сначала — монеты, для которых ещё не найдена настоящая пара на HTX:
@@ -1959,7 +1968,7 @@ async def engine_loop():
                             await note_once(f"res:{coin}", f"⚠️ <b>{coin}</b>: не удалось найти монету на HTX: {e}",
                                             every=1800)
                 coins = [(c, cfg) for c, cfg in arb["coins"].items()
-                         if cfg.get("htx_symbol") and not coin_paused(c)]
+                         if cfg.get("htx_symbol") and not coin_paused(c) and c not in deals]
                 opps = await asyncio.gather(*[check_opportunity(c, cfg) for c, cfg in coins],
                                             return_exceptions=True)
                 found = []
@@ -1968,17 +1977,40 @@ async def engine_loop():
                         await note_once(f"chk:{coin}", f"⚠️ <b>{coin}</b>: не удалось проверить спред: <code>{opp}</code>", every=1800)
                     elif opp:
                         found.append((opp["spread"], coin, cfg, opp))
-                for _, coin, cfg, opp in sorted(found, key=lambda x: x[0], reverse=True):
-                    if await try_start(coin, cfg, opp):
-                        break
+                found.sort(key=lambda x: x[0], reverse=True)
+                buyer = next((d for d in deals.values() if d.get("buying")), None)
+                if buyer is None:
+                    for _, coin, cfg, opp in found:
+                        if await try_start(coin, cfg, opp):
+                            break
+                elif not buyer.get("preempt") and not buyer.get("ioc"):
+                    # Покупатель занят другой монетой. Если у этой монеты сейчас реальный
+                    # спред (есть продавцы) или он заметно лучше — перехватываем.
+                    for spread, coin, cfg, opp in found:
+                        if not should_preempt(buyer, opp):
+                            break
+                        if await try_start(coin, cfg, opp, check_only=True):
+                            buyer["preempt"] = (f"переключаюсь на {coin}: спред {spread:.2f}%"
+                                                + (" и есть продавцы по нужной цене" if opp["mode"] == "taker" else ""))
+                            await notify(f"🔀 <b>{buyer['coin']}</b>: снимаю ожидающий ордер — {buyer['preempt']}.")
+                            break
         except Exception as e:
             await note_once("engine_err", f"⚠️ Автоарбитраж: ошибка цикла: <code>{e}</code>", every=600)
             print(f"[arb] engine: {traceback.format_exc()}", flush=True)
         await asyncio.sleep(arb["poll_sec"])
 
 
-async def try_start(coin, cfg, opp):
-    global deal
+def should_preempt(buyer, opp):
+    """Стоит ли снять ожидающий ордер текущего покупателя ради этой возможности."""
+    if buyer.get("ioc"):
+        return False
+    if opp["mode"] == "taker":
+        return True  # у другой монеты можно купить прямо сейчас
+    waiting = buyer.get("order") is None and buyer.get("idle_since")
+    return bool(waiting) or opp["spread"] >= D(str(buyer.get("maker_spread") or 0)) + 1
+
+
+async def try_start(coin, cfg, opp, check_only=False):
     try:
         res = await resolve_coin(coin, cfg)
         wallet_address(cfg["net"])
@@ -2028,6 +2060,8 @@ async def try_start(coin, cfg, opp):
                                           f"{contract_line(coin, cfg, res)}", every=3 * 3600)
         return False
 
+    if arb["dry_run"] and check_only:
+        return False
     if arb["dry_run"]:
         usdt = "?"
         try:
@@ -2062,7 +2096,7 @@ async def try_start(coin, cfg, opp):
         usdt_free = (await htx_balance("usdt"))[0]
     except Exception:
         usdt_free = D(0)
-    if min_batch > usdt_free:
+    if min_batch > usdt_free and not check_only:
         await note_once(f"fee:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но комиссия вывода с HTX "
                                        f"~{fmt(fee_usd)}$ — окупается только партия от {fmt(min_batch)}$, "
                                        f"а на HTX {fmt(usdt_free)} USDT. Не покупаю.", every=3 * 3600)
@@ -2075,14 +2109,17 @@ async def try_start(coin, cfg, opp):
                                      f"Включи ключу на MEXC право «Аккаунт: просмотр информации об аккаунте» "
                                      f"(и «Спот: торговля», «Кошелёк: просмотр депозитов»).", every=1800)
         return False
-    deal = new_deal(coin, cfg, res)
-    deal["min_batch"] = str(min_batch)
-    if deal["probe_left"] is not None and D(deal["probe_left"]) < min_batch:
-        deal["probe_left"] = str(min_batch)
+    if check_only:
+        return True
+    d = new_deal(coin, cfg, res)
+    d["min_batch"] = str(min_batch)
+    if d["probe_left"] is not None and D(d["probe_left"]) < min_batch:
+        d["probe_left"] = str(min_batch)
         await notify(f"ℹ️ <b>{coin}</b>: комиссия вывода ~{fmt(fee_usd)}$, поэтому проба увеличена до "
                      f"{fmt(min_batch)}$ (иначе её вывод съест выгоду).")
+    deals[coin] = d
     await save()
-    spawn(run_deal())
+    spawn(run_deal(d))
     return True
 
 
@@ -2134,16 +2171,14 @@ def deal_breakeven(d):
     return _dd(d, "cost") / _dd(d, "qty") if _dd(d, "qty") > 0 else None
 
 
-async def run_deal():
-    global deal
-    d = deal
+async def run_deal(d):
     alarm = {"id": None}
     while True:
         if d.get("abandoned"):
             # По /stop аварии бот «забил» на монету: ордера не трогаем, сделку бросаем.
             if alarm["id"]:
                 alarm_end(alarm["id"])
-            deal = None
+            deals.pop(d["coin"], None)
             await save()
             return
         try:
@@ -2169,7 +2204,7 @@ async def run_deal():
     if alarm["id"]:
         alarm_end(alarm["id"])
     await finish_deal(d)
-    deal = None
+    deals.pop(d["coin"], None)
     await save()
 
 
@@ -2223,6 +2258,10 @@ async def _cancel_order(d):
 
 async def buy_step(d):
     coin, cfg = d["coin"], d["cfg"]
+    if d.get("preempt"):
+        why = d.pop("preempt")
+        await _stop_buying(d, why)
+        return
     hpair = hsym(coin, cfg)
     info = await htx_symbol(hpair)
     tick = info["tick"]
@@ -2346,6 +2385,7 @@ async def buy_step(d):
     d["order"] = {"id": oid, "price": str(want), "amount": str(amount), "filled": "0", "cash": "0"}
     await save()
     spread = (mbids[0][0] - want) / want * 100
+    d["maker_spread"] = str(spread)
     if first:
         await notify(f"📌 <b>{coin}</b>: поставил ордер на покупку на HTX первым: {fmt(amount)} шт. по {fmt(want)} "
                      f"(на {fmt(amount * want)}$, спред к MEXC {spread:.2f}%). Слежу за ценой.")
@@ -2922,12 +2962,11 @@ async def cmd_arb(message: types.Message):
                          + (f", проба {cfg['probe']:g}$" if cfg.get("probe") else "") + ")")
 
     # --- Сделка ---
-    lines.append("\n<b>Сделка:</b>")
-    if not deal:
+    lines.append("\n<b>Сделки:</b>")
+    if not deals:
         lines.append("нет — ждёт спред" if arb["enabled"] else "нет")
-    else:
-        d = deal
-        lines.append(f"<b>{d['coin']}</b> · идёт {_ago(d.get('started'))}")
+    for d in list(deals.values()):
+        lines.append(f"\n<b>{d['coin']}</b> · идёт {_ago(d.get('started'))}")
         o = d.get("order")
         if o:
             lines.append(f"📌 ордер на покупку HTX: {fmt(o['amount'])} шт. по {fmt(o['price'])}, "
@@ -3006,8 +3045,8 @@ async def cmd_list(message: types.Message):
             flags.append(f"проба {c['probe']:g}$")
         if coin_paused(coin):
             flags.append(f"⏸ пауза ещё {int((arb['paused'][coin] - time.time()) // 60) + 1} мин.")
-        if deal and deal.get("coin") == coin:
-            flags.append("🔄 идёт сделка")
+        if coin in deals:
+            flags.append("🔄 покупает" if deals[coin].get("buying") else "🔄 доводит сделку")
         try:
             key = _addr_key(wallet_address(net))
             if coin.upper() in arb.get("addr_bad", {}).get(key, []) or \
@@ -3583,16 +3622,22 @@ async def cmd_wallet(message: types.Message):
 
 @router.message(Command("arb_reset"))
 async def cmd_reset(message: types.Message, command: CommandObject):
-    global deal
     if not await _guard(message):
         return
     if (command.args or "").strip().lower() != "да":
-        await message.answer("Бот забудет текущую сделку (монеты/ордера останутся как есть — разбирать вручную).\n"
-                             "Подтверди: /arb_reset да")
+        await message.answer("Бот забудет сделки (монеты/ордера останутся как есть — разбирать вручную).\n"
+                             "Подтверди: /arb_reset да  (или только одну: /arb_reset да PEPE)")
         return
-    deal = None
+    coin = re.sub(r"[^A-Z0-9]", "", ((command.args or "").split()[1:] or [""])[0].upper())
+    if coin and coin in deals:
+        deals[coin]["abandoned"] = True
+        text = f"🧹 Сделка {coin} сброшена."
+    else:
+        for d in deals.values():
+            d["abandoned"] = True
+        text = "🧹 Все сделки сброшены."
     await save()
-    await message.answer("🧹 Сделка сброшена. Перезапусти бота, если она ещё выполнялась.")
+    await message.answer(text + " Ордера и монеты остались как есть — разбирать вручную.")
 
 
 async def _stop_spam():
@@ -3607,8 +3652,8 @@ async def _stop_spam():
             if c:
                 arb.setdefault("paused", {})[c] = time.time() + PAUSE_SEC
                 paused.append(c)
-                if deal and deal.get("coin") == c:
-                    deal["abandoned"] = True
+                if c in deals:
+                    deals[c]["abandoned"] = True
     if paused:
         await save()
     return n, sorted(set(paused))
@@ -3659,15 +3704,15 @@ async def start():
     """Восстанавливает состояние и запускает фоновые задачи. Возвращает их список."""
     await load()
     tasks = [asyncio.create_task(spam_loop()), asyncio.create_task(engine_loop())]
-    global deal
-    if deal and deal.get("v") != 2:
-        await notify(f"⚠️ Незавершённая сделка <b>{deal.get('coin')}</b> из прошлой версии бота сброшена — "
-                     f"проверь HTX/кошелёк/MEXC вручную.")
-        deal = None
-        await save()
-    if deal:
-        await notify(f"♻️ Бот перезапущен посреди сделки <b>{deal['coin']}</b> — продолжаю.")
-        tasks.append(spawn(run_deal()))
+    for coin, d in list(deals.items()):
+        if d.get("v") != 2:
+            await notify(f"⚠️ Незавершённая сделка <b>{coin}</b> из прошлой версии бота сброшена — "
+                         f"проверь HTX/кошелёк/MEXC вручную.")
+            deals.pop(coin)
+            continue
+        await notify(f"♻️ Бот перезапущен посреди сделки <b>{coin}</b> — продолжаю.")
+        tasks.append(spawn(run_deal(d)))
+    await save()
     for r in list(rescues):
         tasks.append(spawn(run_rescue(r)))
     return tasks
