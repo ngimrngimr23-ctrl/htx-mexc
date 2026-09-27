@@ -838,6 +838,9 @@ async def wallet_send_all(net, token, to):
     return await (sui_send_all(token, to) if net == "sui" else evm_send_all(net, token, to))
 
 
+address_book_errors = {}
+
+
 async def htx_address_saved(currency, chain, address):
     """Есть ли адрес в адресной книге вывода HTX для этой монеты и сети.
     Через API HTX выводит ТОЛЬКО на сохранённые адреса (иначе ошибка
@@ -846,6 +849,7 @@ async def htx_address_saved(currency, chain, address):
         rows = await htx_req("GET", "/v2/account/withdraw/address", {"currency": currency.lower()})
     except Exception as e:
         print(f"[arb] адресная книга HTX {currency}: {e}", flush=True)
+        address_book_errors[currency.upper()] = str(e)[:200]
         return None
     addr = address.lower()
     return any(str(r.get("address", "")).lower() == addr and (not chain or r.get("chain") == chain)
@@ -1337,10 +1341,14 @@ async def try_start(coin, cfg, opp):
     if not arb["dry_run"]:
         addr = wallet_address(cfg["net"])
         saved = await htx_address_saved(res["htx_ticker"], res["htx_chain"], addr)
-        if saved is False:
-            await note_once(f"book:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но не покупаю — "
-                                            f"HTX не даст вывести.\n{address_book_hint(res['htx_ticker'], res['htx_chain'], addr)}",
-                            every=3 * 3600)
+        if saved is not True:
+            # Не нашли адрес ИЛИ не смогли проверить — не покупаем: иначе купим и не выведем.
+            why = ("адреса бота нет в адресной книге вывода HTX" if saved is False else
+                   f"не удалось проверить адресную книгу HTX: {address_book_errors.get(res['htx_ticker'].upper(), '?')}")
+            await note_once(f"book:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но не покупаю — {why}.\n"
+                                            f"{address_book_hint(res['htx_ticker'], res['htx_chain'], addr)}\n"
+                                            f"Проверить: /arb_htx {res['htx_ticker']} (раздел 4)",
+                            every=1800)
             return False
     if not arb["dry_run"] and not contract_confirmed(cfg, res):
         await note_once(f"unconf:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но контракт не сверен.\n"
