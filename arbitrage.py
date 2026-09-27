@@ -2979,6 +2979,41 @@ async def cmd_arb(message: types.Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+@router.message(Command("arb_list"))
+async def cmd_list(message: types.Message):
+    """Монеты в автоарбитраже с настройками — мгновенно, без запросов к биржам."""
+    if not await _guard(message):
+        return
+    if not arb["coins"]:
+        await message.answer("Список автоарбитража пуст. Добавить: /arb_add PEPE 3 bsc")
+        return
+    lines = [f"📋 <b>Монеты в автоарбитраже ({len(arb['coins'])})</b> · "
+             f"{'▶️ ВКЛ' if arb['enabled'] else '⏸ ВЫКЛ'} · {'🧪 тест' if arb['dry_run'] else '💸 реальные сделки'}", ""]
+    for coin, c in sorted(arb["coins"].items()):
+        net = c["net"]
+        flags = []
+        if c.get("htx_coin") and c["htx_coin"] != coin:
+            flags.append(f"на HTX {c['htx_coin']}")
+        if c.get("probe"):
+            flags.append(f"проба {c['probe']:g}$")
+        if coin_paused(coin):
+            flags.append(f"⏸ пауза ещё {int((arb['paused'][coin] - time.time()) // 60) + 1} мин.")
+        if deal and deal.get("coin") == coin:
+            flags.append("🔄 идёт сделка")
+        try:
+            key = _addr_key(wallet_address(net))
+            if coin.upper() in arb.get("addr_bad", {}).get(key, []) or \
+                    (c.get("htx_coin") or "").upper() in arb.get("addr_bad", {}).get(key, []):
+                flags.append("⛔ HTX отклонил адрес")
+        except Exception:
+            pass
+        lines.append(f"• <b>{coin}</b> — от {c['pct']:g}% · {NET_TITLES.get(net, net)}"
+                     + (f" · {', '.join(flags)}" if flags else ""))
+        lines.append(f"   <code>/arb_add {coin} {c['pct']:g} {net}{' ' + format(c['probe'], 'g') if c.get('probe') else ''}</code>")
+    lines.append("\nИзменить — отправь строку с новым процентом · убрать: /arb_del МОНЕТА · спред сейчас: /arb")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @router.message(Command("arb_help"))
 async def cmd_help(message: types.Message):
     if not await _guard(message):
@@ -2993,6 +3028,7 @@ async def cmd_help(message: types.Message):
         "   если бот не нашёл сеть сам: добавь <code>htx=код</code> и/или <code>mexc=имя</code> (см. /arb_chains)\n"
         "   если тикер на HTX другой: <code>htxcoin=ТИКЕР</code>, напр. /arb_add MON 1.5 monad htxcoin=MONAD\n"
         "/arb_del PEPE — убрать монету\n"
+        "/arb_list — список монет в автоарбитраже\n"
         "/arb_confirm PEPE — подтвердить контракт вручную, если HTX его не отдал\n"
         "/arb_htx PEPE — что HTX реально отдаёт: сети, статусы, комиссии, контракты, лимиты, адресная книга\n"
         "/arb_chains PEPE — сети монеты на HTX и MEXC и что выбрал бот\n"
@@ -3632,6 +3668,7 @@ async def start():
 BOT_COMMANDS = [
     ("arb", "Автоарбитраж: статус, спред, сделка, балансы"),
     ("arb_help", "Автоарбитраж: помощь"),
+    ("arb_list", "Список монет в автоарбитраже"),
     ("arb_add", "Добавить монету: PEPE 3 bsc [проба$]"),
     ("arb_del", "Убрать монету из автоарбитража"),
     ("arb_chains", "Сети монеты на HTX и MEXC"),
