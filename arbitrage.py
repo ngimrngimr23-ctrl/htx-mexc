@@ -147,6 +147,12 @@ arb = {
     "step_pct": 0.3,       # шаг снижения лимитки на MEXC, % от безубытка
     "step_sec": 120,       # как часто снижать, сек
     "floor_pct": 1.2,      # ниже безубытка минус этот % не опускаемся
+    # Продажа по ордерам на покупку MEXC (если цели нет, но покупателей много):
+    # лимитка по лучшему покупателю, ждём sell_hold_sec; потом по следующему
+    # покупателю не ниже −step_pct%; ждём; снимаем и ждём sell_pause_sec новых.
+    "sell_min_bids": 5,    # сколько ордеров на покупку выше пола считать «много»
+    "sell_hold_sec": 90,
+    "sell_pause_sec": 30,
     "check_sec": 60,       # через сколько после заявки на вывод смотреть баланс HTX
     "spam_sec": 1.0,       # период спама при аварии
     "poll_sec": 1.0,       # как часто проверять спред по монетам из списка (/arb_set poll)
@@ -2663,43 +2669,114 @@ async def sell_step(d, alarm):
 
     s = d["sell"]
     has_more = enough(new, breakeven)
+    now = time.time()
     if not s and not has_more:
-        if d["ladder_since"] is not None:
+        if d["ladder_since"] is not None or d.get("sell_pause_until"):
             d["ladder_since"] = None
+            d["sell_pause_until"] = None
             if alarm["id"]:
                 alarm_end(alarm["id"])
                 alarm["id"] = None
         return
 
-    # 2) Лесенка: безубыток, потом −step_pct% каждые step_sec, до пола; спам.
+    # 2) Цели нет. Стакан не давим: лимитка никогда не ниже лучшего покупателя,
+    #    так что за раз исполняется только он, а остаток стоит и ждёт новых.
+    bids, asks = await mexc_depth(sym)
+    floor = round_up(breakeven * (1 - D(str(arb["floor_pct"])) / 100), info["tick"])
+    live = [p for p, q in bids if p >= floor]
+    many = len(live) >= int(arb.get("sell_min_bids", 5))
+
+    async def replace(price, **meta):
+        qty = new
+        if d["sell"]:
+            await _sell_cancel(d, sym)
+            qty = round_down(await mexc_free(coin) - D(d["mexc_baseline"]), info["step"])
+        if not enough(qty, price):
+            return False
+        oid = await mexc_place(sym, "SELL", "LIMIT", qty, price)
+        d["sell"] = dict({"id": oid, "price": str(price), "qty": str(qty), "filled": "0", "quote": "0",
+                          "placed": now}, **meta)
+        await save()
+        return True
+
+    if many:
+        # 2а) Покупателей много (пусть и мелких): продаём по их ценам.
+        d["ladder_since"] = None
+        hold = arb.get("sell_hold_sec", 90)
+        if s and s.get("mode") == "bid":
+            if now - s.get("placed", now) < hold:
+                if has_more:  # доехали ещё монеты — ставим их туда же
+                    await replace(D(s["price"]), mode="bid", stage=s.get("stage", 0), placed=s.get("placed"))
+                return
+            if s.get("stage", 0) == 0:
+                # Следующий актуальный покупатель, но не дешевле −step_pct% от нашей цены.
+                lim = max(D(s["price"]) * (1 - D(str(arb["step_pct"])) / 100), floor)
+                nxt = [p for p in live if p >= lim]
+                if nxt and await replace(nxt[0], mode="bid", stage=1):
+                    await _sell_alarm(d, alarm, target, breakeven, floor)
+                    return
+            # Постояли на обеих ценах — снимаем и ждём, пока появятся покупатели.
+            await _sell_cancel(d, sym)
+            d["sell_pause_until"] = now + arb.get("sell_pause_sec", 30)
+            await save()
+            return
+        if s:  # стояла лесенка — переходим на продажу по покупателям
+            await _sell_cancel(d, sym)
+            new = round_down(await mexc_free(coin) - D(d["mexc_baseline"]), info["step"])
+        if now < (d.get("sell_pause_until") or 0):
+            return
+        d["sell_pause_until"] = None
+        if await replace(live[0], mode="bid", stage=0):
+            await _sell_alarm(d, alarm, target, breakeven, floor)
+        return
+
+    # 2б) Покупателей мало: лесенка от безубытка, −step_pct% каждые step_sec до пола,
+    #     но тоже не ниже лучшего покупателя (иначе ордер съест весь стакан).
+    if now < (d.get("sell_pause_until") or 0):
+        return
+    d["sell_pause_until"] = None
+    if s and s.get("mode") == "bid":
+        await _sell_cancel(d, sym)
+        s = None
+        new = round_down(await mexc_free(coin) - D(d["mexc_baseline"]), info["step"])
+        has_more = enough(new, breakeven)
     if d["ladder_since"] is None:
-        d["ladder_since"] = time.time()
-    k = int((time.time() - d["ladder_since"]) // arb["step_sec"])
-    _, asks = await mexc_depth(sym)
+        d["ladder_since"] = now
+    k = int((now - d["ladder_since"]) // arb["step_sec"])
     my_price = D(s["price"]) if s else None
     others = [p for p, q in asks if p != my_price]
-    price, floor = ladder_price(breakeven, k, arb["step_pct"], arb["floor_pct"],
-                                others[0] if others else None, info["tick"])
+    price, _ = ladder_price(breakeven, k, arb["step_pct"], arb["floor_pct"],
+                            others[0] if others else None, info["tick"])
+    if bids and price < bids[0][0]:
+        price = bids[0][0]
     if s and D(s["price"]) == price and not has_more:
         return
-    qty = new
-    if s:
-        s["self_cancel"] = True
-        await mexc_cancel(sym, s["id"])
-        o = await mexc_wait_final(sym, s["id"], timeout=5)
-        dq, dc = o["filled"] - D(s["filled"]), o["quote"] - D(s["quote"])
-        _add(d, "sold_qty", dq)
-        _add(d, "proceeds", dc)
-        d["sell"] = None
-        qty = round_down(await mexc_free(coin) - D(d["mexc_baseline"]), info["step"])
-    if not enough(qty, price):
+    if await replace(price, mode="ladder"):
+        await _sell_alarm(d, alarm, target, breakeven, floor)
+
+
+async def _sell_cancel(d, sym):
+    """Снимает свою лимитку продажи на MEXC и учитывает, что по ней успело продаться."""
+    s = d["sell"]
+    if not s:
         return
-    oid = await mexc_place(sym, "SELL", "LIMIT", qty, price)
-    d["sell"] = {"id": oid, "price": str(price), "qty": str(qty), "filled": "0", "quote": "0"}
-    await save()
-    text = (f"<b>{coin}</b>: не удалось продать на MEXC с плановой выгодой (цель {fmt(target)}). "
-            f"Лимитка {fmt(qty)} шт. по {fmt(price)} ({(price / breakeven - 1) * 100:+.2f}% к безубытку "
-            f"{fmt(breakeven)})" + (" — это пол, ниже не опускаю." if price <= floor else "."))
+    s["self_cancel"] = True
+    await mexc_cancel(sym, s["id"])
+    o = await mexc_wait_final(sym, s["id"], timeout=5)
+    _add(d, "sold_qty", o["filled"] - D(s["filled"]))
+    _add(d, "proceeds", o["quote"] - D(s["quote"]))
+    d["sell"] = None
+
+
+async def _sell_alarm(d, alarm, target, breakeven, floor):
+    s = d["sell"]
+    price = D(s["price"])
+    how = ("по ордерам на покупку" + (" (следующий покупатель)" if s.get("stage") else "")
+           if s.get("mode") == "bid" else "лесенкой")
+    text = (f"<b>{d['coin']}</b>: не удалось продать на MEXC с плановой выгодой (цель {fmt(target)}). "
+            f"Продаю {how}: лимитка {fmt(D(s['qty']))} шт. по {fmt(price)} "
+            f"({(price / breakeven - 1) * 100:+.2f}% к безубытку {fmt(breakeven)})"
+            + (" — это пол, ниже не опускаю." if price <= floor else "."))
     if alarm["id"] is None:
         alarm["id"] = alarm_start(text)
     else:
@@ -3072,7 +3149,10 @@ async def cmd_arb(message: types.Message):
     lines += [
         "",
         "<b>Настройки:</b>",
-        f"продажа на MEXC: шаг −{arb['step_pct']}% каждые {arb['step_sec']} сек., пол −{arb['floor_pct']}% от безубытка",
+        f"продажа на MEXC без цели: если покупателей ≥{arb.get('sell_min_bids', 5)} — по их ценам "
+        f"({arb.get('sell_hold_sec', 90)} сек. на лучшем, потом на следующем не ниже −{arb['step_pct']}%, "
+        f"пауза {arb.get('sell_pause_sec', 30)} сек.); иначе лесенка −{arb['step_pct']}% каждые {arb['step_sec']} сек.; "
+        f"пол −{arb['floor_pct']}% от безубытка, ниже лучшего покупателя не ставит",
         f"проверка вывода HTX через {arb['check_sec']} сек. · стакан MEXC при покупке: "
         f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}",
         f"свой ордер первым в стакане HTX: {'вкл' if arb.get('maker', True) else 'выкл'} · "
@@ -3145,6 +3225,8 @@ async def cmd_help(message: types.Message):
         "/arb_set depth on|off — учитывать стакан MEXC при покупке (по умолчанию on)\n"
         "/arb_set maker on|off — ставить свой ордер первым в стакане HTX (по умолчанию on)\n"
         "/arb_set batch 15 — с какой суммы купленного сразу выводить партию\n"
+        "/arb_set bids 5 · hold 90 · pause 30 — продажа на MEXC по ордерам на покупку: сколько покупателей "
+        "считать «много», сколько секунд стоять на цене, пауза перед новым кругом\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
@@ -3640,7 +3722,8 @@ async def cmd_set(message: types.Message, command: CommandObject):
     keys = {"step": ("step_pct", float), "interval": ("step_sec", int),
             "floor": ("floor_pct", float), "check": ("check_sec", int),
             "spam": ("spam_sec", float), "poll": ("poll_sec", float),
-            "batch": ("batch_usd", float)}
+            "batch": ("batch_usd", float), "bids": ("sell_min_bids", int),
+            "hold": ("sell_hold_sec", int), "pause": ("sell_pause_sec", int)}
     args = (command.args or "").split()
     if len(args) == 2 and args[0].lower() == "maker" and args[1].lower() in ("on", "off"):
         arb["maker"] = args[1].lower() == "on"
