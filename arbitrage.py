@@ -70,10 +70,13 @@ RPC_URLS = {
     "sui": os.environ.get("SUI_RPC_URL") or "https://fullnode.mainnet.sui.io:443",
     # Cosmos Hub: REST (LCD) API ноды, не JSON-RPC.
     "atom": (os.environ.get("COSMOS_REST_URL") or "https://cosmos-rest.publicnode.com").rstrip("/"),
+    "sol": os.environ.get("SOLANA_RPC_URL") or "https://api.mainnet-beta.solana.com",
+    "trx": (os.environ.get("TRON_API_URL") or "https://api.trongrid.io").rstrip("/"),
 }
-NET_TITLES = {"eth": "Ethereum", "bsc": "BNB Chain", "monad": "Monad", "sui": "Sui", "atom": "Cosmos Hub"}
-NATIVE_COIN = {"eth": "ETH", "bsc": "BNB", "monad": "MON", "sui": "SUI", "atom": "ATOM"}
-BUILTIN_NETS = ("eth", "bsc", "monad", "sui", "atom")
+NET_TITLES = {"eth": "Ethereum", "bsc": "BNB Chain", "monad": "Monad", "sui": "Sui", "atom": "Cosmos Hub",
+              "sol": "Solana", "trx": "Tron"}
+NATIVE_COIN = {"eth": "ETH", "bsc": "BNB", "monad": "MON", "sui": "SUI", "atom": "ATOM", "sol": "SOL", "trx": "TRX"}
+BUILTIN_NETS = ("eth", "bsc", "monad", "sui", "atom", "sol", "trx")
 # Как сеть может называться у бирж. Сравниваем по отдельным словам названия
 # ("BEP20(BSC)" → BEP20, BSC), а не подстрокой — иначе ETH совпал бы с ETHW.
 NET_ALIASES = {
@@ -82,6 +85,8 @@ NET_ALIASES = {
     "monad": {"MONAD", "MON"},
     "sui": {"SUI"},
     "atom": {"ATOM", "COSMOS", "COSMOSHUB"},
+    "sol": {"SOL", "SOLANA", "SPL"},
+    "trx": {"TRX", "TRON", "TRC20"},
 }
 SUI_NATIVE_TYPE = "0x2::sui::SUI"
 
@@ -101,7 +106,8 @@ def unregister_net(name):
 
 
 NET_WORDS = {"bnb": "bsc", "bep20": "bsc", "erc20": "eth", "ethereum": "eth", "mon": "monad",
-             "cosmos": "atom", "cosmoshub": "atom"}
+             "cosmos": "atom", "cosmoshub": "atom", "solana": "sol", "spl": "sol",
+             "tron": "trx", "trc20": "trx"}
 
 
 def parse_net(word):
@@ -471,8 +477,15 @@ def v1_closed(v):
 
 
 def norm_contract(x):
-    """Приводит адреса к одному виду: регистр EVM не важен, а у Sui 0x2 == 0x000…02."""
-    x = str(x or "").strip().lower()
+    """Приводит адреса к одному виду: регистр EVM не важен, у Sui 0x2 == 0x000…02,
+    Tron в hex (41…) == Tron в base58 (T…)."""
+    raw = str(x or "").strip()
+    m = re.fullmatch(r"(?:0x)?(41[0-9a-fA-F]{40})", raw)
+    if m:
+        return _b58check(bytes.fromhex(m.group(1)))
+    if re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", raw) or (len(raw) >= 32 and not raw.startswith("0x")):
+        return raw  # base58 (Tron/Solana): регистр значим
+    x = raw.lower()
     addr, sep, rest = x.partition("::")
     if addr.startswith("0x"):
         addr = "0x" + (addr[2:].lstrip("0") or "0")
@@ -1026,7 +1039,328 @@ async def cosmos_send_all(to, memo):
     raise ExchangeError(f"Cosmos: транзакция {txhash} не подтвердилась за 2 минуты")
 
 
+# ---- base58 ----
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58encode(b):
+    n = int.from_bytes(b, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = _B58[r] + out
+    return "1" * (len(b) - len(b.lstrip(b"\0"))) + out
+
+
+def b58decode(s):
+    n = 0
+    for c in s:
+        n = n * 58 + _B58.index(c)
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\0" * (len(s) - len(s.lstrip("1"))) + body
+
+
+# ---- Solana ----
+# Ключ ed25519: SOLANA_PRIVATE_KEY (base58 из Phantom — 64 байта, или JSON-массив
+# байтов), иначе выводится из EVM_PRIVATE_KEY (те же 32 байта как seed ed25519).
+# Перевод SOL (System Program) и SPL-токенов (Token / Token-2022, transferChecked,
+# ATA получателя создаётся при необходимости). Legacy-транзакции, отправка через RPC.
+SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
+SOL_SYSTEM = "11111111111111111111111111111111"
+SOL_TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+SOL_TOKEN22 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+SOL_ATA = "ATokenGPvbdGVxr1b2hvZbsiqW5xWrXEJz1n4vcpVmS"
+SOL_FEE_RESERVE = 3_000_000  # лампорты, оставляем на кошельке SOL под комиссии/ренту
+
+
+_sol_keys = None
+
+
+def sol_keys():
+    """(приватный ключ ed25519, pubkey 32 байта, адрес base58)."""
+    global _sol_keys
+    if _sol_keys is None:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        raw = (SOLANA_PRIVATE_KEY or "").strip()
+        if raw.startswith("["):
+            seed = bytes(json.loads(raw))[:32]
+        elif raw:
+            seed = b58decode(raw)[:32]
+        else:
+            evm = (EVM_PRIVATE_KEY or "").strip()
+            if not evm:
+                raise ExchangeError("не задан SOLANA_PRIVATE_KEY (или EVM_PRIVATE_KEY) для Solana")
+            seed = bytes.fromhex(evm[2:] if evm.startswith("0x") else evm)
+        priv = Ed25519PrivateKey.from_private_bytes(seed)
+        pub = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        _sol_keys = (priv, pub, b58encode(pub))
+    return _sol_keys
+
+
+_ED_P = 2 ** 255 - 19
+_ED_D = (-121665 * pow(121666, _ED_P - 2, _ED_P)) % _ED_P
+
+
+def _on_curve(b32):
+    """Лежит ли 32-байтовая строка на кривой ed25519 (для поиска PDA)."""
+    y = int.from_bytes(b32, "little") & ((1 << 255) - 1)
+    if y >= _ED_P:
+        return False
+    u = (y * y - 1) % _ED_P
+    v = (_ED_D * y * y + 1) % _ED_P
+    x2 = u * pow(v, _ED_P - 2, _ED_P) % _ED_P
+    if x2 == 0:
+        return True
+    x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - x2) % _ED_P != 0:
+        x = x * pow(2, (_ED_P - 1) // 4, _ED_P) % _ED_P
+    return (x * x - x2) % _ED_P == 0
+
+
+def sol_find_pda(seeds, program):
+    prog = b58decode(program)
+    for bump in range(255, -1, -1):
+        h = hashlib.sha256(b"".join(seeds) + bytes([bump]) + prog + b"ProgramDerivedAddress").digest()
+        if not _on_curve(h):
+            return b58encode(h)
+    raise ExchangeError("Solana: не нашёл PDA")
+
+
+def sol_ata(owner, mint, token_program=SOL_TOKEN):
+    return sol_find_pda([b58decode(owner), b58decode(token_program), b58decode(mint)], SOL_ATA)
+
+
+def _compact(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7f
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def sol_build_tx(payer, instructions, blockhash, sign_fn):
+    """instructions: [(program, [(pubkey, is_signer, is_writable)], data)]. Legacy-сообщение."""
+    metas = {payer: [True, True]}
+    order = [payer]
+    for prog, accs, _ in instructions:
+        for pk, s_, w in accs:
+            if pk not in metas:
+                metas[pk] = [s_, w]
+                order.append(pk)
+            else:
+                metas[pk][0] |= s_
+                metas[pk][1] |= w
+        if prog not in metas:
+            metas[prog] = [False, False]
+            order.append(prog)
+    groups = ([k for k in order if metas[k] == [True, True]], [k for k in order if metas[k] == [True, False]],
+              [k for k in order if metas[k] == [False, True]], [k for k in order if metas[k] == [False, False]])
+    keys = groups[0] + groups[1] + groups[2] + groups[3]
+    idx = {k: i for i, k in enumerate(keys)}
+    msg = bytes([len(groups[0]) + len(groups[1]), len(groups[1]), len(groups[3])])
+    msg += _compact(len(keys)) + b"".join(b58decode(k).rjust(32, b"\0") for k in keys)
+    msg += b58decode(blockhash).rjust(32, b"\0")
+    msg += _compact(len(instructions))
+    for prog, accs, data in instructions:
+        msg += bytes([idx[prog]]) + _compact(len(accs)) + bytes(idx[a[0]] for a in accs)
+        msg += _compact(len(data)) + data
+    return _compact(1) + sign_fn(msg) + msg
+
+
+def sol_sign(msg):
+    return sol_keys()[0].sign(msg)
+
+
+async def sol_rpc(method, params):
+    return await rpc("sol", method, params)
+
+
+async def sol_token_program(mint):
+    info = await sol_rpc("getAccountInfo", [mint, {"encoding": "base64"}])
+    owner = ((info or {}).get("value") or {}).get("owner")
+    if owner not in (SOL_TOKEN, SOL_TOKEN22):
+        raise ExchangeError(f"Solana: {mint} — не SPL-токен")
+    return owner
+
+
+async def sol_token_accounts(owner, mint):
+    res = await sol_rpc("getTokenAccountsByOwner", [owner, {"mint": mint}, {"encoding": "jsonParsed"}])
+    out = []
+    for a in (res or {}).get("value", []):
+        amt = a["account"]["data"]["parsed"]["info"]["tokenAmount"]
+        out.append((a["pubkey"], int(amt["amount"]), int(amt["decimals"])))
+    return out
+
+
+async def sol_balance(mint):
+    addr = sol_keys()[2]
+    if not mint:
+        return int((await sol_rpc("getBalance", [addr]))["value"])
+    return sum(a for _, a, _ in await sol_token_accounts(addr, mint))
+
+
+async def sol_decimals(mint):
+    if not mint:
+        return 9
+    return int((await sol_rpc("getTokenSupply", [mint]))["value"]["decimals"])
+
+
+async def sol_send_all(mint, to):
+    addr = sol_keys()[2]
+    bh = (await sol_rpc("getLatestBlockhash", [{"commitment": "finalized"}]))["value"]["blockhash"]
+    if not mint:
+        amount = await sol_balance(None) - 5000 - SOL_FEE_RESERVE
+        if amount <= 0:
+            raise ExchangeError("Solana: на кошельке нет SOL для пересылки")
+        ix = [(SOL_SYSTEM, [(addr, True, True), (to, False, True)],
+               (2).to_bytes(4, "little") + amount.to_bytes(8, "little"))]
+    else:
+        prog = await sol_token_program(mint)
+        accs = sorted(await sol_token_accounts(addr, mint), key=lambda a: -a[1])
+        if not accs or accs[0][1] <= 0:
+            raise ExchangeError("Solana: на кошельке нет токенов для пересылки")
+        src, amount, dec = accs[0]
+        dest = sol_ata(to, mint, prog)
+        ix = [
+            # Создать ATA получателя, если его ещё нет (Idempotent — не падает, если есть).
+            (SOL_ATA, [(addr, True, True), (dest, False, True), (to, False, False), (mint, False, False),
+                       (SOL_SYSTEM, False, False), (prog, False, False)], bytes([1])),
+            (prog, [(src, False, True), (mint, False, False), (dest, False, True), (addr, True, False)],
+             bytes([12]) + amount.to_bytes(8, "little") + bytes([dec])),
+        ]
+    tx = sol_build_tx(addr, ix, bh, sol_sign)
+    sig = await sol_rpc("sendTransaction", [base64.b64encode(tx).decode(),
+                                            {"encoding": "base64", "preflightCommitment": "confirmed"}])
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        await asyncio.sleep(3)
+        st = ((await sol_rpc("getSignatureStatuses", [[sig]])) or {}).get("value", [None])[0]
+        if st and st.get("err"):
+            raise ExchangeError(f"Solana: транзакция {sig} упала: {st['err']}")
+        if st and st.get("confirmationStatus") in ("confirmed", "finalized"):
+            return sig, amount
+    raise ExchangeError(f"Solana: транзакция {sig} не подтвердилась за 2 минуты")
+
+
+# ---- Tron ----
+# Ключ secp256k1 — тот же EVM_PRIVATE_KEY (TronLink импортирует тот же hex-ключ),
+# адрес T… = base58check(0x41 + последние 20 байт keccak(pubkey)). Транзакции
+# собирает нода TronGrid, мы только подписываем txID и отправляем.
+TRON_API_KEY = os.environ.get("TRON_API_KEY")
+TRC20_FEE_LIMIT = 30_000_000  # сан (30 TRX) — потолок сжигания на энергию для TRC20
+
+
+def _b58check(payload):
+    return b58encode(payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4])
+
+
+def tron_hex(addr):
+    raw = b58decode(addr)
+    return raw[:21]
+
+
+_tron_keys = None
+
+
+def tron_keys():
+    """(ключ eth_keys, адрес T…)."""
+    global _tron_keys
+    if _tron_keys is None:
+        from eth_keys import keys
+        from eth_utils import keccak
+        raw = (EVM_PRIVATE_KEY or "").strip()
+        if not raw:
+            raise ExchangeError("не задан EVM_PRIVATE_KEY для Tron")
+        pk = keys.PrivateKey(bytes.fromhex(raw[2:] if raw.startswith("0x") else raw))
+        addr = _b58check(b"\x41" + keccak(pk.public_key.to_bytes())[-20:])
+        _tron_keys = (pk, addr)
+    return _tron_keys
+
+
+async def tron_post(path, body):
+    headers = {"TRON-PRO-API-KEY": TRON_API_KEY} if TRON_API_KEY else {}
+    async with http().post(RPC_URLS["trx"] + path, json=body, headers=headers, timeout=TIMEOUT) as r:
+        data = await r.json(content_type=None)
+    if isinstance(data, dict) and data.get("Error"):
+        raise ExchangeError(f"Tron {path}: {data['Error']}")
+    return data
+
+
+def _abi_address(addr):
+    return tron_hex(addr)[1:].hex().rjust(64, "0")
+
+
+async def tron_const_call(contract, selector, param=""):
+    res = await tron_post("/wallet/triggerconstantcontract", {
+        "owner_address": tron_keys()[1], "contract_address": contract,
+        "function_selector": selector, "parameter": param, "visible": True})
+    out = (res.get("constant_result") or ["0"])[0]
+    return int(out or "0", 16)
+
+
+async def tron_balance(token):
+    addr = tron_keys()[1]
+    if not token:
+        acc = await tron_post("/wallet/getaccount", {"address": addr, "visible": True})
+        return int(acc.get("balance") or 0)
+    return await tron_const_call(token, "balanceOf(address)", _abi_address(addr))
+
+
+async def tron_decimals(token):
+    return 6 if not token else await tron_const_call(token, "decimals()")
+
+
+def tron_sign(txid_hex):
+    """Подпись txID: r‖s‖v (65 байт, v = 0/1), как ждёт Tron."""
+    return tron_keys()[0].sign_msg_hash(bytes.fromhex(txid_hex)).to_bytes().hex()
+
+
+async def tron_send_all(token, to):
+    addr = tron_keys()[1]
+    if not token:
+        amount = await tron_balance(None) - 2_000_000  # 2 TRX на bandwidth
+        if amount <= 0:
+            raise ExchangeError("Tron: на кошельке нет TRX для пересылки")
+        tx = await tron_post("/wallet/createtransaction",
+                             {"owner_address": addr, "to_address": to, "amount": amount, "visible": True})
+    else:
+        amount = await tron_balance(token)
+        if amount <= 0:
+            raise ExchangeError("Tron: на кошельке нет токенов для пересылки")
+        res = await tron_post("/wallet/triggersmartcontract", {
+            "owner_address": addr, "contract_address": token, "function_selector": "transfer(address,uint256)",
+            "parameter": _abi_address(to) + format(amount, "x").rjust(64, "0"),
+            "fee_limit": TRC20_FEE_LIMIT, "call_value": 0, "visible": True})
+        tx = res.get("transaction") or {}
+    if not tx.get("txID"):
+        raise ExchangeError(f"Tron: нода не собрала транзакцию: {str(tx)[:200]}")
+    tx["signature"] = [tron_sign(tx["txID"])]
+    res = await tron_post("/wallet/broadcasttransaction", tx)
+    if not res.get("result"):
+        raise ExchangeError(f"Tron: транзакция отклонена: {res}")
+    txid = tx["txID"]
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        await asyncio.sleep(4)
+        info = await tron_post("/wallet/gettransactioninfobyid", {"value": txid})
+        if info.get("id"):
+            rcpt = (info.get("receipt") or {}).get("result")
+            if token and rcpt not in (None, "SUCCESS"):
+                raise ExchangeError(f"Tron: транзакция {txid} упала: {rcpt}")
+            return txid, amount
+    raise ExchangeError(f"Tron: транзакция {txid} не подтвердилась за 2 минуты")
+
+
 def wallet_address(net):
+    if net == "sol":
+        return sol_keys()[2]
+    if net == "trx":
+        return tron_keys()[1]
     if net == "sui":
         return sui_keys()[2]
     if net == "atom":
@@ -1035,6 +1369,10 @@ def wallet_address(net):
 
 
 async def wallet_balance(net, token):
+    if net == "sol":
+        return await sol_balance(token)
+    if net == "trx":
+        return await tron_balance(token)
     if net == "sui":
         return await sui_balance(token)
     if net == "atom":
@@ -1043,6 +1381,10 @@ async def wallet_balance(net, token):
 
 
 async def wallet_decimals(net, token):
+    if net == "sol":
+        return await sol_decimals(token)
+    if net == "trx":
+        return await tron_decimals(token)
     if net == "sui":
         return await sui_decimals(token)
     if net == "atom":
@@ -1051,6 +1393,10 @@ async def wallet_decimals(net, token):
 
 
 async def wallet_send_all(net, token, to, memo=None):
+    if net == "sol":
+        return await sol_send_all(token, to)
+    if net == "trx":
+        return await tron_send_all(token, to)
     if net == "sui":
         return await sui_send_all(token, to)
     if net == "atom":
@@ -2389,6 +2735,13 @@ async def _guard(message: types.Message):
     return True
 
 
+def _safe_addr(net):
+    try:
+        return f"<code>{wallet_address(net)}</code>"
+    except Exception as e:
+        return f"не задан ({e})"
+
+
 def _keys_text():
     def mark(ok):
         return "✅" if ok else "❌"
@@ -2409,7 +2762,9 @@ def _keys_text():
             f"{mark(MEXC_API_KEY and MEXC_API_SECRET)} ключ MEXC\n"
             f"👛 EVM (ETH/BNB/Monad): {evm}\n"
             f"👛 Sui: {sui}\n"
-            f"👛 Cosmos Hub: {cosmos}")
+            f"👛 Cosmos Hub: {cosmos}\n"
+            f"👛 Solana: {_safe_addr('sol')}\n"
+            f"👛 Tron: {_safe_addr('trx')}")
 
 
 @router.message(Command("arb"))
@@ -3048,7 +3403,7 @@ async def cmd_wallet(message: types.Message):
     for net in list(NET_TITLES):
         try:
             bal = await wallet_balance(net, None)
-            dec = {"sui": 9, "atom": 6}.get(net, 18)
+            dec = {"sui": 9, "atom": 6, "sol": 9, "trx": 6}.get(net, 18)
             lines.append(f"{NET_TITLES[net]}: {fmt(D(bal) / (D(10) ** dec))} {NATIVE_COIN[net]} (на газ)")
         except Exception as e:
             lines.append(f"{NET_TITLES[net]}: {e}")

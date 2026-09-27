@@ -71,6 +71,17 @@ def norm_contract(x):
     x = str(x or "").strip()
     if not x or x in ("0", "-", "null", "None"):
         return None
+    m = re.fullmatch(r"(?:0x)?(41[0-9a-fA-F]{40})", x)
+    if m:  # Tron в hex → base58check (T…), как отдаёт MEXC
+        import hashlib
+        payload = bytes.fromhex(m.group(1))
+        payload += hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+        alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        n, out = int.from_bytes(payload, "big"), ""
+        while n:
+            n, r = divmod(n, 58)
+            out = alphabet[r] + out
+        return out
     low = x.lower()
     addr, sep, rest = low.partition("::")
     if sep and addr.startswith("0x"):
