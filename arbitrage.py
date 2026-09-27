@@ -2519,24 +2519,52 @@ def net_from_names(*names):
     return None
 
 
+# Кнопка под сигналом сканера: монета и сеть уже известны, процент (и пробу)
+# пишешь сам — ответом на сообщение бота. {chat_id: {"coin", "net", "ts"}}
+pending_add = {}
+
+
 @router.callback_query(F.data.startswith("arbadd:"))
 async def cb_add(callback: types.CallbackQuery):
-    """Кнопка под сигналом сканера: сразу добавить монету в автоарбитраж."""
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа")
         return
     try:
-        _, coin, net, pct = callback.data.split(":")
-        cfg = {"pct": float(pct), "net": net, "probe": 0, "htx_chain": None, "mexc_net": None}
+        coin, net = callback.data.split(":")[1:3]
         if net not in NET_TITLES:
             raise ValueError
     except Exception:
         await callback.answer("Не разобрал кнопку")
         return
-    await callback.answer(f"Добавляю {coin}…")
-    ctx.chat_set(callback.message.chat.id)
-    await notify(await add_coin(coin, cfg) + "\n<i>Процент/пробу можно поменять: /arb_add "
-                 f"{coin} {pct} {net} 20</i>")
+    chat_id = callback.message.chat.id
+    ctx.chat_set(chat_id)
+    pending_add[chat_id] = {"coin": coin, "net": net, "ts": time.time()}
+    await callback.answer()
+    await ctx.bot.send_message(
+        chat_id,
+        f"➕ <b>{coin}</b> в автоарбитраж, сеть {NET_TITLES[net]}.\n"
+        f"Напиши процент арбитража (и пробу в $, если нужна): <code>2.5</code> или <code>2.5 20</code>\n"
+        f"<i>= /arb_add {coin} &lt;процент&gt; {net}</i>",
+        parse_mode="HTML",
+        reply_markup=types.ForceReply(input_field_placeholder=f"{coin}: процент, например 2.5"))
+
+
+@router.message(F.text.regexp(r"^\s*\d+(?:[.,]\d+)?%?(?:\s+\d+(?:[.,]\d+)?\$?)?\s*$"))
+async def pending_add_reply(message: types.Message):
+    """Ответ на кнопку «в автоарбитраж»: «2.5» или «2.5 20» (процент и проба)."""
+    p = pending_add.get(message.chat.id)
+    if not p or time.time() - p["ts"] > 600 or not _is_admin(message.from_user.id):
+        return
+    parts = message.text.replace(",", ".").replace("%", "").replace("$", "").split()
+    pct = abs(float(parts[0]))
+    probe = abs(float(parts[1])) if len(parts) > 1 else 0
+    if pct <= 0:
+        await message.answer("❌ Процент должен быть больше нуля")
+        return
+    pending_add.pop(message.chat.id, None)
+    ctx.chat_set(message.chat.id)
+    cfg = {"pct": pct, "net": p["net"], "probe": probe, "htx_chain": None, "mexc_net": None}
+    await message.answer(await add_coin(p["coin"], cfg), parse_mode="HTML")
 
 
 @router.message(Command("arb_htx"))

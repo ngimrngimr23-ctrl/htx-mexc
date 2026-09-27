@@ -1605,8 +1605,8 @@ async def scanner_task():
                     net = arbitrage.net_from_names(*names) if names else None
                     if net:
                         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                            text=f"➕ {base_coin} в автоарбитраж (от {settings['spread_percent']:g}%, {arbitrage.NET_TITLES[net]})",
-                            callback_data=f"arbadd:{base_coin}:{net}:{settings['spread_percent']:g}")]])
+                            text=f"➕ {base_coin} в автоарбитраж ({arbitrage.NET_TITLES[net]})",
+                            callback_data=f"arbadd:{base_coin}:{net}")]])
                 if settings["chat_id"]:
                     messages.append((settings["chat_id"], alert_text, markup))
                 if settings["channel_id"]:
