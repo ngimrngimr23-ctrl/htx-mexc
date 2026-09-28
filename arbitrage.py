@@ -26,6 +26,7 @@ import asyncio
 import base64
 import datetime
 import hashlib
+import html
 import hmac
 import json
 import os
@@ -2080,9 +2081,24 @@ def ladder_price(breakeven, k, step_pct, floor_pct, best_other_ask, tick):
 _skip_notes = {}
 
 
+# Почему бот сейчас не покупает монету: {монета: (когда, текст)} — для /arb.
+# В чат такие причины пишутся редко (note_once), а тут видна свежая.
+why_not = {}
+_INFO_KEYS = ("addr1",)  # это не отказ, а пояснение
+
+
+def _html_to_text(t):
+    return re.sub(r"<[^>]+>", "", t)
+
+
 async def note_once(key, text, every=1800):
     """Сообщение не чаще раза в every секунд на ключ (чтобы не засыпать чат)."""
     now = time.time()
+    kind, _, coin = key.partition(":")
+    if coin and kind not in _INFO_KEYS:
+        why_not[coin] = (now, _html_to_text(text).split("\n")[0])
+    elif key == "mexc_perm":
+        why_not["*"] = (now, _html_to_text(text).split("\n")[0])
     if now - _skip_notes.get(key, 0) >= every:
         _skip_notes[key] = now
         await notify(text)
@@ -2131,6 +2147,9 @@ async def engine_loop():
                         except Exception as e:
                             await note_once(f"res:{coin}", f"⚠️ <b>{coin}</b>: не удалось найти монету на HTX: {e}",
                                             every=1800)
+                for c in arb["coins"]:
+                    if coin_paused(c):
+                        why_not[c] = (time.time(), "на паузе после /stop аварии — /arb_resume")
                 coins = [(c, cfg) for c, cfg in arb["coins"].items()
                          if cfg.get("htx_symbol") and not coin_paused(c) and c not in deals]
                 opps = await asyncio.gather(*[check_opportunity(c, cfg) for c, cfg in coins],
@@ -2152,6 +2171,11 @@ async def engine_loop():
                     # спред (есть продавцы) или он заметно лучше — перехватываем.
                     for spread, coin, cfg, opp in found:
                         if not should_preempt(buyer, opp):
+                            for _, c2, _, o2 in found:
+                                why_not[c2] = (time.time(), (
+                                    f"спред {o2['spread']:.2f}% только своим ордером (продавцов по цене нет), "
+                                    f"а весь USDT в ордере {buyer['coin']} со спредом "
+                                    f"{D(str(buyer.get('maker_spread') or 0)):.2f}% — перехват при спреде на 1% выше"))
                             break
                         if await try_start(coin, cfg, opp, check_only=True):
                             buyer["preempt"] = (f"переключаюсь на {coin}: спред {spread:.2f}%"
@@ -3326,6 +3350,11 @@ async def cmd_arb(message: types.Message):
             lines.append(f"• {mark} <b>{coin}</b>{pair}: <b>{sp:+.2f}%</b> (порог {cfg['pct']}%, "
                          f"{NET_TITLES.get(cfg['net'], cfg['net'])}"
                          + (f", проба {cfg['probe']:g}$" if cfg.get("probe") else "") + ")")
+        # Почему не покупал в последние 10 минут (причины, которые в чат приходят редко).
+        for key in (coin, "*"):
+            w = why_not.get(key)
+            if w and time.time() - w[0] < 600 and coin not in deals:
+                lines.append(f"   ↳ не купил {_ago(w[0])} назад: {html.escape(w[1][:300])}")
 
     # --- Сделка ---
     lines.append("\n<b>Сделки:</b>")
