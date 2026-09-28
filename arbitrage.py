@@ -1694,6 +1694,50 @@ async def _htx_chain_by_contract(ticker, chains, token):
     return cand[0] if len(cand) == 1 else None
 
 
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
+
+
+def _urls_in(obj):
+    """Все ссылки в ответе биржи о сети монеты (эксплорер и т.п.), в любом поле."""
+    if isinstance(obj, dict):
+        return [u for v in obj.values() for u in _urls_in(v)]
+    if isinstance(obj, list):
+        return [u for v in obj for u in _urls_in(v)]
+    return _URL_RE.findall(obj) if isinstance(obj, str) else []
+
+
+def _host(url):
+    h = urllib.parse.urlsplit(url).hostname or ""
+    return h[4:] if h.startswith("www.") else h
+
+
+async def explorer_check(net, *sources):
+    """Сверка сети по эксплореру, который указала биржа: домен эксплорера ищем в
+    реестре Chainlist (там у каждой сети список её эксплореров) и сравниваем
+    chain id с сетью бота. Возвращает (True/False/None, пояснение)."""
+    our_id = EVM_CHAIN_IDS.get(net) or arb.get("networks", {}).get(net, {}).get("chain_id")
+    hosts = {_host(u) for src in sources for u in _urls_in(src)} - {""}
+    if not our_id or not hosts:
+        return None, "биржа не дала ссылку на эксплорер" if our_id else ""
+    try:
+        chains = await chainlist()
+    except Exception:
+        return None, "реестр сетей недоступен"
+    hits = {}
+    for c in chains:
+        for e in c.get("explorers") or []:
+            h = _host(str(e.get("url", "")))
+            if h and h in hosts:
+                hits[c.get("chainId")] = (c.get("name"), h)
+    if not hits:
+        return None, f"эксплорер {', '.join(sorted(hosts))} не найден в реестре сетей"
+    if our_id in hits:
+        return True, f"эксплорер {hits[our_id][1]} — сеть {hits[our_id][0]} (chain id {our_id})"
+    cid, (name, h) = next(iter(hits.items()))
+    return False, (f"по эксплореру биржи ({h}) монета в сети {name} (chain id {cid}), "
+                   f"а у бота сеть {NET_TITLES[net]} (chain id {our_id})")
+
+
 async def resolve_coin(coin, cfg):
     """Находит монету и её сеть на обеих биржах и сверяет контракт.
     Тикер на HTX бот находит сам: если под тем же тикером на HTX другая монета
@@ -1794,6 +1838,11 @@ async def resolve_coin(coin, cfg):
             cfg["htx_coin"] = hc
         auto_how = auto_how or "обновлена пара"
 
+    # Сверка сети по эксплореру, который биржи указали для монеты.
+    explorer_ok, explorer_note = await explorer_check(net, mx, htx, await htx_v1_row(hc, htx))
+    if explorer_ok is False:
+        raise ContractMismatch(explorer_note)
+
     if token:
         contract_status = "ok" if htx_ca else "unknown"
     else:
@@ -1819,6 +1868,7 @@ async def resolve_coin(coin, cfg):
         # ok — совпал с HTX; native — нативная монета сети, контракта нет;
         # unknown — HTX контракт не отдал, нужна ручная сверка (/arb_confirm).
         "contract_status": contract_status,
+        "explorer": (explorer_ok, explorer_note),
     }
 
 
@@ -1828,6 +1878,12 @@ def contract_confirmed(cfg, res):
 
 
 def contract_line(coin, cfg, res):
+    ok, note = res.get("explorer") or (None, "")
+    ex = (f"\n✅ Сеть по эксплореру биржи: {note}" if ok else f"\n❔ Сеть по эксплореру: {note}" if note else "")
+    return _contract_line(coin, cfg, res) + ex
+
+
+def _contract_line(coin, cfg, res):
     st = res["contract_status"]
     if st == "native":
         return "Контракт: нативная монета сети (контракта нет)"
