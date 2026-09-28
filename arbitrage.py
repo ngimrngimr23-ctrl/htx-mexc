@@ -3080,12 +3080,56 @@ async def chainlist():
     return _chainlist["data"]
 
 
+_TESTNET_RE = re.compile(r"test|devnet|rinkeby|goerli|sepolia|holesky|hoodi|kovan|ropsten|fuji|mumbai|amoy|"
+                         r"chiado|makalu|staging", re.I)
+
+
+async def pick_chain_for_coin(cands, coin):
+    """Из нескольких похожих сетей выбирает ту, где живёт монета с MEXC:
+      * токен — его контракт с MEXC реально есть в сети (eth_getCode через её ноду);
+      * иначе — название сети совпадает с названием сети монеты на MEXC
+        («Arbitrum One» ↔ «Arbitrum One(ARB)»), а для родной монеты — газ сети.
+    Возвращает сеть или None, если однозначно выбрать нельзя."""
+    nets = await mexc_networks(coin)
+    contracts = {(n.get("contract") or "").strip() for n in nets}
+    contracts = [c for c in contracts if re.fullmatch(r"0x[0-9a-fA-F]{40}", c)]
+
+    async def has_contract(chain):
+        cid = chain.get("chainId")
+        for u in evm_rpc_candidates(chain)[:5]:
+            if not (await probe_evm(u, cid))["ok"]:
+                continue
+            for ca in contracts:
+                try:
+                    code = await _rpc_once(u, "?", "eth_getCode", [ca, "latest"])
+                except Exception:
+                    continue
+                if code and code not in ("0x", "0x0"):
+                    return True
+            return False
+        return False
+
+    if contracts:
+        found = await asyncio.gather(*[has_contract(c) for c in cands])
+        hits = [c for c, ok in zip(cands, found) if ok]
+        if len(hits) == 1:
+            return hits[0]
+        cands = hits or cands
+    squash = lambda x: re.sub(r"[^a-z0-9]", "", str(x or "").lower())
+    mexc_names = [squash(n.get("name")) + " " + squash(n.get("netWork")) + " " + squash(n.get("network"))
+                  for n in nets]
+    by_name = [c for c in cands if squash(c.get("name")) and any(squash(c.get("name")) in m for m in mexc_names)]
+    if len(by_name) == 1:
+        return by_name[0]
+    native = [c for c in cands if str((c.get("nativeCurrency") or {}).get("symbol", "")).upper() == coin.upper()]
+    return native[0] if len(native) == 1 else None
+
+
 async def find_evm_chain(query, chain_id=None):
     """Сеть из Chainlist по chain id или по названию/символу монеты газа. Тестнеты
     пропускаем. Возвращает (сеть, похожие) — сеть None, если однозначно не нашлась."""
     q = str(query or "").lower()
-    chains = [c for c in await chainlist() if "test" not in str(c.get("name", "")).lower()
-              and "devnet" not in str(c.get("name", "")).lower()]
+    chains = [c for c in await chainlist() if not _TESTNET_RE.search(str(c.get("name", "")))]
     if chain_id is not None:
         hit = [c for c in chains if c.get("chainId") == chain_id]
         return (hit[0] if hit else None), hit
@@ -3141,10 +3185,18 @@ async def discover_network(query, coin=None):
         chain, similar = await find_evm_chain(q)
     except Exception as e:
         raise ExchangeError(f"реестр сетей недоступен: {e}")
+    picked = False
+    if not chain and similar and coin:
+        try:
+            chain = await pick_chain_for_coin(similar[:8], coin)
+            picked = chain is not None
+        except Exception:
+            chain = None
     if not chain:
         if similar:
             opts = "; ".join(f"{c.get('name')} (газ {c.get('nativeCurrency', {}).get('symbol')})" for c in similar[:6])
-            raise ExchangeError(f"под «{q}» подходит несколько сетей: {opts}. Уточни название сети")
+            raise ExchangeError(f"под «{query}» подходит несколько сетей: {opts}. Напиши название целиком, "
+                                f"можно с пробелом, например «{similar[0].get('name')}»")
         raise ExchangeError(f"сеть «{q}» не нашлась в реестре EVM-сетей")
     cid = chain.get("chainId")
     native = str((chain.get("nativeCurrency") or {}).get("symbol") or "").upper()
@@ -3155,7 +3207,10 @@ async def discover_network(query, coin=None):
     if not good:
         raise ExchangeError(f"нашёл сеть {chain.get('name')}, но ни одна её публичная нода не ответила правильно")
 
-    name = q if q not in NET_TITLES else re.sub(r"[^a-z0-9_]", "", str(chain.get("shortName", q)).lower())
+    # Выбрали из нескольких похожих — называем сеть по ней самой («arbitrumone»), а не по запросу.
+    name = re.sub(r"[^a-z0-9]", "", str(chain.get("name", q)).lower()) if picked else q
+    if name in NET_TITLES:
+        name = re.sub(r"[^a-z0-9_]", "", str(chain.get("shortName", name)).lower())
     aliases = sorted({a.upper() for a in (q, chain.get("chain"), chain.get("shortName"), native) if a})
     RPC_URLS[name] = good[0]["url"]
     # Сверка с биржей: та ли это сеть, где живёт монета.
@@ -3443,15 +3498,19 @@ async def cmd_add(message: types.Message, command: CommandObject):
         if net:
             rest = rest[1:]
         elif rest and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,20}", rest[0]) and "=" not in rest[0]:
-            # Незнакомая сеть — ищем её сами и сверяем с контрактом монеты на MEXC.
+            # Незнакомая сеть (можно в несколько слов: «Arbitrum One») — ищем её сами
+            # и сверяем с контрактом монеты на MEXC.
+            words = []
+            while rest and re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-]*", rest[0]) and "=" not in rest[0]:
+                words.append(rest.pop(0))
+            query = " ".join(words)
             try:
-                net, chain, _ = await discover_network(rest[0], coin)
+                net, chain, _ = await discover_network(query, coin)
             except ExchangeError as e:
-                await message.answer(f"❌ Сеть «{rest[0]}»: {e}")
+                await message.answer(f"❌ Сеть «{query}»: {e}")
                 return
             await message.answer(f"🔎 Добавил сеть <b>{net}</b>: {chain.get('name')} (chain id {chain.get('chainId')}), "
                                  f"ноду нашёл и проверил сам.", parse_mode="HTML")
-            rest = rest[1:]
         else:
             net = net_for_coin(coin)
             if not net:
@@ -3777,7 +3836,7 @@ async def cmd_net(message: types.Message, command: CommandObject):
     if action == "add" and len(args) >= 2 and (len(args) == 2 or not args[2].startswith("http")):
         # /arb_net add mapo — сеть и ноду бот находит сам.
         try:
-            name, chain, good = await discover_network(args[1])
+            name, chain, good = await discover_network(" ".join(args[1:]))
         except ExchangeError as e:
             await message.answer(f"❌ {e}")
             return
