@@ -606,6 +606,34 @@ async def mexc_free(asset):
     return D(0)
 
 
+async def mexc_total(asset):
+    """Свободно + в ордерах."""
+    data = await mexc_req("GET", "/api/v3/account")
+    for b in data.get("balances", []):
+        if b.get("asset") == asset.upper():
+            return D(b.get("free") or 0) + D(b.get("locked") or 0)
+    return D(0)
+
+
+async def mexc_sold_since(sym, since):
+    """Продажи по паре на MEXC с момента since (сек.): (кол-во, выручка $ за вычетом
+    комиссии в USDT) — по истории сделок, кто бы ни продавал: бот или ты вручную."""
+    qty, quote = D(0), D(0)
+    start = int(since * 1000)
+    while True:
+        data = await mexc_req("GET", "/api/v3/myTrades", {"symbol": sym, "startTime": start, "limit": 1000})
+        for t in data:
+            if t.get("isBuyer"):
+                continue
+            qty += D(t["qty"])
+            quote += D(t["quoteQty"])
+            if str(t.get("commissionAsset", "")).upper() == "USDT":
+                quote -= D(t.get("commission") or 0)
+        if len(data) < 1000:
+            return qty, quote
+        start = int(data[-1]["time"]) + 1
+
+
 async def mexc_place(sym, side, order_type, qty, price):
     data = await mexc_req("POST", "/api/v3/order", {
         "symbol": sym, "side": side, "type": order_type,
@@ -2238,7 +2266,7 @@ def deal_finished(d):
     if any(not b["ok"] for b in d["batches"]):
         return False
     if d["sell_manual"]:
-        return True
+        return bool(d.get("manual_sold"))  # итог — только когда монеты ушли с MEXC
     if any(not b["fwd"] for b in d["batches"]):
         return False
     # Всё отправленное на MEXC продано (с допуском на комиссии) — сделка закончена.
@@ -2627,7 +2655,15 @@ async def transport_step(d):
 # ---------- продажа на MEXC ----------
 
 async def sell_step(d, alarm):
-    if d["sell_manual"] or _dd(d, "qty") <= 0:
+    if d["sell_manual"]:
+        # Продаёшь сам: ждём, пока монеты сделки уйдут с MEXC, — тогда итог.
+        if time.time() - d["last_mexc_check"] >= 30:
+            d["last_mexc_check"] = time.time()
+            left = await mexc_total(d["coin"]) - D(d["mexc_baseline"])
+            if left <= _dd(d, "forwarded") * D("0.03"):
+                d["manual_sold"] = True
+        return
+    if _dd(d, "qty") <= 0:
         return
     if not d["sell"] and time.time() - d["last_mexc_check"] < 3:
         return
@@ -2652,7 +2688,8 @@ async def sell_step(d, alarm):
         elif o["status"] in ("CANCELED", "PARTIALLY_CANCELED") and not s.get("self_cancel"):
             d["sell"] = None
             d["sell_manual"] = True
-            await notify(f"ℹ️ <b>{coin}</b>: ордер на продажу на MEXC отменён вручную — дальше продаёшь сам.")
+            await notify(f"ℹ️ <b>{coin}</b>: ордер на продажу на MEXC отменён вручную — дальше продаёшь сам. "
+                         f"Итог сделки пришлю, когда монеты будут проданы.")
             return
 
     free = await mexc_free(coin)
@@ -2767,6 +2804,7 @@ async def _sell_cancel(d, sym):
     if not s:
         return
     s["self_cancel"] = True
+    await save()  # чтобы после рестарта своя отмена не выглядела ручной
     await mexc_cancel(sym, s["id"])
     o = await mexc_wait_final(sym, s["id"], timeout=5)
     _add(d, "sold_qty", o["filled"] - D(s["filled"]))
@@ -2790,9 +2828,22 @@ async def _sell_alarm(d, alarm, target, breakeven, floor):
 
 
 async def finish_deal(d):
-    cost, proceeds = _dd(d, "cost"), _dd(d, "proceeds")
+    cost = _dd(d, "cost")
     if _dd(d, "qty") <= 0:
         return  # ничего не вывели (или вывод не прошёл — тогда итог даст аварийная продажа)
+    # Продано — по истории сделок MEXC (учитывает и ручные продажи).
+    try:
+        sold, proceeds = await mexc_sold_since(f"{d['coin']}USDT", d["started"])
+        fwd = _dd(d, "forwarded")
+        if sold > fwd > 0:  # продано больше, чем пришло по сделке: берём долю сделки
+            sold, proceeds = fwd, proceeds * fwd / sold
+    except Exception:
+        sold, proceeds = _dd(d, "sold_qty"), _dd(d, "proceeds")
+    if sold <= 0:
+        await notify(f"ℹ️ <b>{d['coin']}</b>: монеты сделки ушли с MEXC, но продаж в истории MEXC не видно — "
+                     f"итог не считаю. Куплено на HTX за {fmt(cost)}$.")
+        return
+    d["sold_qty"] = str(sold)
     pnl = proceeds - cost
     await notify(
         f"🏁 <b>{d['coin']}</b>: сделка завершена.\n"
