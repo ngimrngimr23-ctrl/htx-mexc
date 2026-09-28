@@ -1652,6 +1652,48 @@ async def find_htx_ticker(coin, net, token, cfg):
     return None, None
 
 
+def _is_evm_net(net):
+    return net in ("eth", "bsc", "monad") or net in arb.get("networks", {})
+
+
+async def _mexc_net_by_contract(coin, net, nets):
+    """Сеть MEXC, когда по названию не совпала (MEXC: «MAP», у нас «MAPO»):
+      * родная монета сети — единственная её сеть на MEXC без контракта;
+      * токен в EVM-сети — та сеть MEXC, чей контракт реально есть в НАШЕЙ сети
+        (eth_getCode через её ноду).
+    Возвращает запись сети или None."""
+    if coin.upper() == NATIVE_COIN[net]:
+        native = [n for n in nets if not (n.get("contract") or "").strip()]
+        return native[0] if len(native) == 1 else None
+    if not _is_evm_net(net):
+        return None
+    hits = []
+    for n in nets:
+        ca = (n.get("contract") or "").strip()
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", ca):
+            continue
+        try:
+            code = await rpc(net, "eth_getCode", [ca, "latest"])
+        except Exception:
+            continue
+        if code and code not in ("0x", "0x0"):
+            hits.append(n)
+    return hits[0] if len(hits) == 1 else None
+
+
+async def _htx_chain_by_contract(ticker, chains, token):
+    """Сеть HTX, когда по названию не совпала: для токена — та, где контракт на
+    HTX совпадает с контрактом MEXC; для родной монеты — единственная без контракта."""
+    rows = [r for r in await htx_all_v1_rows() if str(r.get("currency", "")).lower() == ticker.lower()]
+    if token:
+        want = norm_contract(token)
+        codes = {r.get("chain") for r in rows if r.get("ca") and norm_contract(r.get("ca")) == want}
+    else:
+        codes = {r.get("chain") for r in rows if not str(r.get("ca") or "").strip()}
+    cand = [c for c in chains if c.get("chain") in codes]
+    return cand[0] if len(cand) == 1 else None
+
+
 async def resolve_coin(coin, cfg):
     """Находит монету и её сеть на обеих биржах и сверяет контракт.
     Тикер на HTX бот находит сам: если под тем же тикером на HTX другая монета
@@ -1669,6 +1711,11 @@ async def resolve_coin(coin, cfg):
     else:
         mx = [n for n in nets if matches_net(net, n.get("netWork"), n.get("network"))]
     found = ", ".join(str(n.get("netWork") or n.get("network")) for n in nets) or "нет ни одной"
+    if not mx and not cfg.get("mexc_net"):
+        hit = await _mexc_net_by_contract(coin, net, nets)
+        if hit:
+            mx = [hit]
+            cfg["mexc_net"] = hit.get("netWork") or hit.get("network")  # запоминаем сопоставление
     if not mx:
         raise NetworkMissing(f"на MEXC у {coin} нет сети {NET_TITLES[net]} (есть: {found})")
     if len(mx) > 1:
@@ -1692,6 +1739,11 @@ async def resolve_coin(coin, cfg):
         if not await htx_usdt_pair(ticker):  # есть ли у этой монеты спотовая пара с USDT
             return chains, None, None, "нет пары"
         cand = _net_chains(chains, net, cfg)
+        if not cand and not cfg.get("htx_chain"):
+            hit = await _htx_chain_by_contract(ticker, chains, token)
+            if hit:
+                matched_chain[ticker] = hit["chain"]
+                cand = [hit]
         if not cand:
             return chains, None, None, "нет сети"
         if len(cand) > 1:
@@ -1701,6 +1753,7 @@ async def resolve_coin(coin, cfg):
             return chains, cand[0], ca, "другой контракт"
         return chains, cand[0], ca, None
 
+    matched_chain = {}  # тикер HTX → сеть, найденная по контракту, а не по названию
     auto_how = None
     hc = hcoin(coin, cfg)
     chains, htx, htx_ca, problem = await check_htx(hc)
@@ -1730,6 +1783,8 @@ async def resolve_coin(coin, cfg):
             f"контракты разные — это РАЗНЫЕ монеты, а монеты с контрактом MEXC на HTX не нашлось.\n"
             f"HTX ({hc}): <code>{htx_ca}</code>\nMEXC ({coin}): <code>{token}</code>")
 
+    if hc in matched_chain:
+        cfg["htx_chain"] = matched_chain[hc]  # запоминаем сопоставление по контракту
     # Запоминаем найденную монету и НАСТОЯЩЕЕ имя пары на HTX — дальше стакан и
     # ордера идут строго по ним, а не по тикеру с MEXC.
     pair = await htx_usdt_pair(hc)
@@ -2978,10 +3033,18 @@ async def find_evm_chain(query, chain_id=None):
     if chain_id is not None:
         hit = [c for c in chains if c.get("chainId") == chain_id]
         return (hit[0] if hit else None), hit
-    exact = [c for c in chains if q in (str(c.get("shortName", "")).lower(), str(c.get("chain", "")).lower(),
-                                        str(c.get("name", "")).lower())]
+    # По убыванию точности: у тестнета поле chain часто то же («MAPO»), что у основной.
+    exact = [c for c in chains if str(c.get("shortName", "")).lower() == q]
+    if not exact:
+        exact = [c for c in chains if str(c.get("name", "")).lower() == q]
+    if not exact:
+        exact = [c for c in chains if str(c.get("chain", "")).lower() == q]
     if not exact:
         exact = [c for c in chains if str((c.get("nativeCurrency") or {}).get("symbol", "")).lower() == q]
+    if not exact:  # «map» → «MAP Protocol» (целое слово), а не «MAPO Makalu»
+        exact = [c for c in chains if q in re.findall(r"[a-z0-9]+", str(c.get("name", "")).lower())]
+    if not exact:
+        exact = [c for c in chains if re.sub(r"[^a-z0-9]", "", str(c.get("name", "")).lower()) == q]
     if not exact:
         exact = [c for c in chains if str(c.get("name", "")).lower().startswith(q)]
     return (exact[0] if len(exact) == 1 else None), exact
@@ -3390,8 +3453,8 @@ async def add_coin(coin, cfg):
     await save()
     try:
         res = await resolve_coin(coin, cfg)
+        await save()  # сопоставление сетей/тикера, найденное при проверке
         if res["htx_ticker_auto"]:
-            await save()
             if res["htx_ticker"] != coin:
                 text += f"\n🔎 На HTX эта монета — <b>{res['htx_ticker']}</b> (нашёл сам: {res['htx_ticker_auto']})"
         text += f"\nПара на HTX: <code>{res['htx_pair']}</code> · на MEXC: <code>{coin}USDT</code>"
