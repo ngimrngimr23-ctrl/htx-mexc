@@ -154,9 +154,6 @@ arb = {
     # Учитывать стакан MEXC при покупке: брать на HTX только столько, сколько на
     # MEXC сейчас покупают с нужным %, а не ориентироваться на одну лучшую цену.
     "mexc_depth": True,
-    # Если продавцов в пределах % нет — ставить свой ордер на покупку первым в
-    # стакане HTX и держать его, переставляя под цену MEXC (/arb_set maker on|off).
-    "maker": True,
     # С какой суммы купленного сразу выводить партию, не снимая ордер (/arb_set batch).
     "batch_usd": 15.0,
     # Монеты, на которые бот временно «забил» после /stop аварии: {монета: до_когда}.
@@ -2021,13 +2018,7 @@ async def check_opportunity(coin, cfg):
     if hasks[0][0] <= max_price:
         # Продавцы в пределах процента — можно выкупать сразу.
         return dict(base, mode="taker", spread=(mexc_bid - hasks[0][0]) / hasks[0][0] * 100)
-    if arb.get("maker", True) and hbids:
-        # Своим ордером первым в стакане покупателей: на тик выше лучшего чужого,
-        # но не дороже цены с нужным % и ниже лучшего продавца.
-        tick = (await htx_symbol(hpair))["tick"]
-        want = hbids[0][0] + tick
-        if want <= min(round_down(max_price, tick), hasks[0][0] - tick):
-            return dict(base, mode="maker", maker_price=want, spread=(mexc_bid - want) / want * 100)
+    # Своих ордеров на покупку в стакане не держим: покупаем только у продавцов.
     return None
 
 
@@ -2171,11 +2162,6 @@ async def engine_loop():
                     # спред (есть продавцы) или он заметно лучше — перехватываем.
                     for spread, coin, cfg, opp in found:
                         if not should_preempt(buyer, opp):
-                            for _, c2, _, o2 in found:
-                                why_not[c2] = (time.time(), (
-                                    f"спред {o2['spread']:.2f}% только своим ордером (продавцов по цене нет), "
-                                    f"а весь USDT в ордере {buyer['coin']} со спредом "
-                                    f"{D(str(buyer.get('maker_spread') or 0)):.2f}% — перехват при спреде на 1% выше"))
                             break
                         if await try_start(coin, cfg, opp, check_only=True):
                             buyer["preempt"] = (f"переключаюсь на {coin}: спред {spread:.2f}%"
@@ -2188,13 +2174,9 @@ async def engine_loop():
 
 
 def should_preempt(buyer, opp):
-    """Стоит ли снять ожидающий ордер текущего покупателя ради этой возможности."""
-    if buyer.get("ioc"):
-        return False
-    if opp["mode"] == "taker":
-        return True  # у другой монеты можно купить прямо сейчас
-    waiting = buyer.get("order") is None and buyer.get("idle_since")
-    return bool(waiting) or opp["spread"] >= D(str(buyer.get("maker_spread") or 0)) + 1
+    """Отдать деньги другой монете: покупатель сейчас ничего не выкупает (ждёт
+    продавцов), а у другой монеты продавцы по нужной цене есть."""
+    return not buyer.get("ioc") and opp["mode"] == "taker"
 
 
 async def try_start(coin, cfg, opp, check_only=False):
@@ -2261,9 +2243,7 @@ async def try_start(coin, cfg, opp, check_only=False):
             how = (f"Выкупил бы продавцов на HTX по цене не выше {fmt(opp['max_price'])} — "
                    f"с соблюдением {cfg['pct']}% сейчас на ~{fmt(can_cost)}$")
         else:
-            how = (f"Поставил бы ордер на покупку на HTX первым в стакане по {fmt(opp['maker_price'])} "
-                   f"(макс. {fmt(opp['max_price'])}) и держал его под цену MEXC; "
-                   f"вывод, когда после комиссии вывода чистыми остаётся {cfg['pct']}%")
+            how = f"Продавцов по цене не выше {fmt(opp['max_price'])} нет — ждал бы их"
         await note_once(f"dry:{coin}", (
             f"🧪 <b>ТЕСТ</b> · <b>{coin}</b>: спред {opp['spread']:.2f}% (мин. {cfg['pct']}%)\n"
             f"{how}\nMEXC bid {fmt(opp['mexc_bid'])}, USDT на HTX: {usdt}\n"
@@ -2489,7 +2469,7 @@ async def buy_step(d):
         pct += fee_extra_pct(D(d["wd_fee"]), mbids[0][0], _dd(d, "unw_cost") + budget)
     max_price = round_down(mbids[0][0] / (1 + pct / 100), tick)
 
-    # Партия набралась и вывод окупается — выводим, ордер при этом продолжает стоять.
+    # Партия набралась и вывод окупается — выводим, покупка продолжается.
     if _worth_withdrawing(d, mbids[0][0]):
         await withdraw_batch(d)
         if not d["buying"]:
@@ -2539,42 +2519,11 @@ async def buy_step(d):
             d["idle_since"] = None
             return
 
-    # 2) Свой ордер первым в стакане покупателей.
-    if not arb.get("maker", True):
-        await _idle(d, "спред ушёл")
-        return
-    my_price = D(d["order"]["price"]) if d["order"] else None
-    my_rest = (D(d["order"]["amount"]) - D(d["order"]["filled"])) if d["order"] else D(0)
-    # Чужие ордера: всё, кроме нашего; если на нашей цене объёма больше нашего —
-    # там стоит ещё кто-то, и эта цена тоже «чужая» (встанем на тик выше).
-    others = [p for p, q in hbids if p != my_price or q > my_rest * D("1.001")]
-    cap = max_price
-    if hasks:
-        cap = min(cap, hasks[0][0] - tick)
-    want = (others[0] + tick) if others else None
-    if want is None or want > cap:
-        # Первым с нужным % встать нельзя — снимаем ордер и ждём.
-        if d["order"]:
-            await _cancel_order(d)
-        await _idle(d, "спред ушёл")
-        return
-    d["idle_since"] = None
-    if my_price == want:
-        return  # стоим первыми по нужной цене
-    await _cancel_order(d)
-    free_usdt, _ = await htx_balance("usdt")
-    budget = free_usdt * D("0.995")
-    if d["probe_left"] is not None:
-        budget = min(budget, D(d["probe_left"]))
-    amount = round_down(budget / want, info["step"])
-    if amount <= 0 or amount < info["min_qty"] or amount * want < info["min_value"]:
-        return
-    oid = await htx_place(hpair, "buy-limit-maker", amount, want)
-    d["order"] = {"id": oid, "price": str(want), "amount": str(amount), "filled": "0", "cash": "0"}
-    await save()
-    spread = (mbids[0][0] - want) / want * 100
-    d["maker_spread"] = str(spread)
-    # Без уведомления: ордер переставляется часто, его видно в /arb. Пишем только о покупках.
+    # 2) Продавцов по цене с нужным % нет — ничего в стакан не ставим, ждём их.
+    #    (Ордер, оставшийся от прошлой версии бота, снимаем.)
+    if d["order"]:
+        await _cancel_order(d)
+    await _idle(d, "продавцов по нужной цене нет")
 
 
 async def _idle(d, why):
@@ -3417,7 +3366,7 @@ async def cmd_arb(message: types.Message):
         f"пол −{arb['floor_pct']}% от безубытка, ниже лучшего покупателя не ставит",
         f"проверка вывода HTX через {arb['check_sec']} сек. · стакан MEXC при покупке: "
         f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}",
-        f"свой ордер первым в стакане HTX: {'вкл' if arb.get('maker', True) else 'выкл'} · "
+        f"покупка на HTX только у продавцов по цене с твоим %, своих ордеров в стакане нет · "
         f"вывод партией от {arb.get('batch_usd', 15):g}$, только если чистыми после комиссии вывода "
         f"остаётся заданный %",
         "",
@@ -3485,7 +3434,6 @@ async def cmd_help(message: types.Message):
         "/arb_live on · /arb_live off — реальные сделки / тестовый режим\n"
         "/arb_set step 0.3 · interval 120 · floor 1.2 · check 60 · poll 1 — параметры\n"
         "/arb_set depth on|off — учитывать стакан MEXC при покупке (по умолчанию on)\n"
-        "/arb_set maker on|off — ставить свой ордер первым в стакане HTX (по умолчанию on)\n"
         "/arb_set batch 15 — с какой суммы купленного сразу выводить партию\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
@@ -3497,16 +3445,15 @@ async def cmd_help(message: types.Message):
         "/arb_resume PEPE — снять эту паузу раньше\n\n"
         "<b>Как идёт сделка</b>\n"
         "1. Покупка на HTX: если есть продавцы по цене, дающей твой % к MEXC, — выкупает их сразу. "
-        "Если нет — ставит свой ордер на покупку первым в стакане (на тик выше лучшего чужого, но не дороже "
-        "цены с твоим %) и переставляет его, как только меняется цена на MEXC или его перебивают.\n"
-        "2. Как только куплено на 15$ (/arb_set batch) — сразу вывод этой партии на кошелёк бота; "
-        "ордер при этом продолжает стоять и покупать. HTX отклонил вывод или через минуту партия всё ещё "
-        "на балансе — покупка останавливается, монеты продаются на HTX в ноль, не продалось — спам.\n"
+        "Своих ордеров на покупку в стакане не держит: покупает ордером «исполнить сразу» точно по ценам "
+        "продавцов и не больше, чем MEXC сейчас заберёт с твоим %.\n"
+        "2. Вывод на кошелёк бота — партией, как только после комиссии вывода чистыми остаётся твой %. "
+        "HTX отклонил вывод или через минуту партия всё ещё на балансе — покупка останавливается, монеты "
+        "продаются на HTX вслед за ценой MEXC, спам до /stop.\n"
         "3. Каждая дошедшая партия пересылается на депозит MEXC.\n"
-        "4. На MEXC: сразу по ордерам на покупку, пока выгода ≥ твоего %. Остаток — лимитка в безубыток "
-        "(или на тик ниже ближайшего продавца), каждые 2 мин. −0,3%, до −1,2%; спам до /stop или до продажи.\n"
-        "5. Ордер снимается, если первым с твоим % встать уже нельзя; через минуту без возможности покупка "
-        "заканчивается, сделка доводится до продажи.",
+        "4. На MEXC: сразу по ордерам на покупку, пока выгода ≥ твоего %. Иначе — по ценам покупателей, "
+        "не давя стакан (или лесенкой от безубытка), не ниже −1,2%; спам до /stop или до продажи.\n"
+        "5. Минуту нет продавцов по нужной цене — покупка заканчивается, сделка доводится до продажи.",
         parse_mode="HTML")
 
 
@@ -3988,11 +3935,6 @@ async def cmd_set(message: types.Message, command: CommandObject):
             "spam": ("spam_sec", float), "poll": ("poll_sec", float),
             "batch": ("batch_usd", float)}
     args = (command.args or "").split()
-    if len(args) == 2 and args[0].lower() == "maker" and args[1].lower() in ("on", "off"):
-        arb["maker"] = args[1].lower() == "on"
-        await save()
-        await message.answer(f"✅ Свой ордер на покупку первым в стакане HTX: {'вкл' if arb['maker'] else 'выкл'}")
-        return
     if len(args) == 2 and args[0].lower() == "depth" and args[1].lower() in ("on", "off"):
         arb["mexc_depth"] = args[1].lower() == "on"
         await save()
