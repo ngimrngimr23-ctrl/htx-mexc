@@ -1896,14 +1896,14 @@ def _contract_line(coin, cfg, res):
 
 # ================= TELEGRAM: уведомления и спам =================
 
-async def notify(text):
+async def notify(text, kb=None):
     chat = ctx.chat_get()
     if not chat:
         print(f"[arb] нет chat_id, сообщение: {text}", flush=True)
         return
     for _ in range(3):
         try:
-            await ctx.bot.send_message(chat, text, parse_mode="HTML")
+            await ctx.bot.send_message(chat, text, parse_mode="HTML", reply_markup=kb)
             return
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
@@ -2733,19 +2733,36 @@ async def transport_step(d):
             covered += D(b["amount"])
             b["fwd"] = True
     _add(d, "forwarded", sent)
-    await notify(f"🚚 <b>{coin}</b>: отправил {fmt(sent)} шт. на MEXC\ntx: <code>{tx}</code>")
+    await notify(f"🚚 <b>{coin}</b>: отправил {fmt(sent)} шт. на MEXC\ntx: <code>{tx}</code>",
+                 kb=None if d["sell_manual"] else InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                     text="✋ Не продавать на MEXC — продам сам", callback_data=f"arbmanual:{d['id']}")]]))
 
 
 # ---------- продажа на MEXC ----------
 
 async def sell_step(d, alarm):
+    if d.pop("manual_request", False) and not d["sell_manual"]:
+        # Кнопка «продам сам»: снимаем свою лимитку и больше не продаём.
+        if d["sell"]:
+            await _sell_cancel(d, f"{d['coin']}USDT")
+        d["sell_manual"] = True
+        await save()
+        await notify(f"✋ <b>{d['coin']}</b>: продажу на MEXC остановил — продаёшь сам. "
+                     f"Итог сделки пришлю, когда монеты уйдут с MEXC.")
     if d["sell_manual"]:
+        if alarm["id"]:
+            alarm_end(alarm["id"])
+            alarm["id"] = None
         # Продаёшь сам: ждём, пока монеты сделки уйдут с MEXC, — тогда итог.
         if time.time() - d["last_mexc_check"] >= 30:
             d["last_mexc_check"] = time.time()
+            fwd = _dd(d, "forwarded")
             left = await mexc_total(d["coin"]) - D(d["mexc_baseline"])
-            if left <= _dd(d, "forwarded") * D("0.03"):
-                d["manual_sold"] = True
+            if fwd > 0 and left >= fwd * D("0.9"):
+                d["manual_seen"] = True  # монеты дошли до MEXC
+            elif d.get("manual_seen") and left <= fwd * D("0.03") and not any(
+                    not b["fwd"] for b in d["batches"]):
+                d["manual_sold"] = True  # и ушли с MEXC — продал
         return
     if _dd(d, "qty") <= 0:
         return
@@ -3580,6 +3597,25 @@ def net_from_names(*names):
 # Кнопка под сигналом сканера: монета и сеть уже известны, процент (и пробу)
 # пишешь сам — ответом на сообщение бота. {chat_id: {"coin", "net", "ts"}}
 pending_add = {}
+
+
+@router.callback_query(F.data.startswith("arbmanual:"))
+async def cb_manual_sell(callback: types.CallbackQuery):
+    """Кнопка под «отправил на MEXC»: бот не продаёт эти монеты, продаёшь сам."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    did = callback.data.split(":", 1)[1]
+    d = next((x for x in deals.values() if x["id"] == did), None)
+    if not d:
+        await callback.answer("Сделка уже закончена")
+        return
+    d["manual_request"] = True  # обработает цикл сделки: снимет лимитку и перестанет продавать
+    await callback.answer("Ок, продажу на MEXC останавливаю")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("arbadd:"))
