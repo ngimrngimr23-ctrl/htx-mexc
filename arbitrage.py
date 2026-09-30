@@ -2574,6 +2574,8 @@ async def _stop_buying(d, why):
             mbid = D(0)
         if _worth_withdrawing(d, mbid):
             await withdraw_batch(d)
+        elif unw_c < 1:
+            d["unw_qty"] = d["unw_cost"] = "0"  # пыль после округлений — не откладываем
         else:
             # Вывод такой партии съест выгоду — не выводим, копим до следующей сделки.
             arb.setdefault("carry", {})[d["coin"]] = {"qty": str(unw_q), "cost": str(unw_c)}
@@ -3349,6 +3351,8 @@ async def cmd_arb(message: types.Message):
         if _dd(d, "sold_qty") > 0 or d.get("sell"):
             lines.append(f"продано на MEXC: {fmt(d['sold_qty'])} шт. на {fmt(d['proceeds'])}$"
                          + (f"; лесенка {fmt(d['sell']['qty'])} шт. по {fmt(d['sell']['price'])}" if d.get("sell") else ""))
+    for c in [c for c, v in arb.get("carry", {}).items() if D(v["cost"]) < 1]:
+        arb["carry"].pop(c)  # пыль — не показываем и не храним
     for c, v in arb.get("carry", {}).items():
         lines.append(f"📦 {c}: на HTX лежит {fmt(D(v['qty']))} шт. (куплено на {fmt(D(v['cost']))}$) — "
                      f"вывод пока не окупается, уйдёт со следующей сделкой")
