@@ -158,6 +158,9 @@ arb = {
     "batch_usd": 15.0,
     # Монеты, на которые бот временно «забил» после /stop аварии: {монета: до_когда}.
     "paused": {},
+    # Пополнение HTX с кошелька бота: если USDT на HTX меньше topup_usd — перевести
+    # недостающее из сетей TOPUP_NETS (0 — выключено). /arb_set topup 600
+    "topup_usd": 600.0,
     # Куплено на HTX, но не выведено (вывод не окупался): {монета: {"qty", "cost"}}.
     # Следующая сделка по монете начинает с этого остатка и выводит всё разом.
     "carry": {},
@@ -764,9 +767,19 @@ async def evm_decimals(net, token):
     return int(res, 16)
 
 
-async def evm_send_all(net, token, to):
-    """Отправляет ВЕСЬ баланс токена (или нативной монеты за вычетом газа).
+_evm_send_locks = {}
+
+
+async def evm_send_all(net, token, to, amount=None):
+    """Отправляет ВЕСЬ баланс токена (или нативной монеты за вычетом газа), а если
+    задан amount (в минимальных единицах токена) — столько, но не больше баланса.
     Возвращает (tx_hash, отправлено_в_минимальных_единицах)."""
+    lock = _evm_send_locks.setdefault(net, asyncio.Lock())
+    async with lock:  # две отправки в одной сети одновременно получили бы один nonce
+        return await _evm_send(net, token, to, amount)
+
+
+async def _evm_send(net, token, to, want=None):
     from eth_utils import to_checksum_address
     acct = evm_account()
     to = to_checksum_address(to)
@@ -775,7 +788,7 @@ async def evm_send_all(net, token, to):
     gas_price = int(int(await rpc(net, "eth_gasPrice", []), 16) * 1.2)
     balance = await evm_balance(net, token)
     if token:
-        amount = balance
+        amount = balance if want is None else min(int(want), balance)
         data = "0xa9059cbb" + _pad32(to[2:].lower()) + _pad32(format(amount, "x"))
         est = int(await rpc(net, "eth_estimateGas", [{
             "from": acct.address, "to": token, "data": data}]), 16)
@@ -3390,6 +3403,9 @@ async def cmd_arb(message: types.Message):
         f"покупка на HTX только у продавцов по цене с твоим %, своих ордеров в стакане нет · "
         f"вывод партией от {arb.get('batch_usd', 15):g}$, только если чистыми после комиссии вывода "
         f"остаётся заданный %",
+        (f"пополнение HTX: держу ≥{arb.get('topup_usd'):g} USDT, перевожу с кошелька из BNB / Arbitrum"
+         + (f" · ждёт зачисления {fmt(D(arb['topup_pending']['amount']))} USDT" if arb.get("topup_pending") else "")
+         if arb.get("topup_usd") else "пополнение HTX с кошелька: выкл"),
         "",
         _keys_text(),
         "",
@@ -3456,6 +3472,8 @@ async def cmd_help(message: types.Message):
         "/arb_set step 0.3 · interval 120 · floor 1.2 · check 60 · poll 1 — параметры\n"
         "/arb_set depth on|off — учитывать стакан MEXC при покупке (по умолчанию on)\n"
         "/arb_set batch 15 — с какой суммы купленного сразу выводить партию\n"
+        "/arb_set topup 600 — держать на HTX не меньше 600 USDT: недостающее бот сам переводит с кошелька "
+        "из сетей BNB / Arbitrum (0 — выкл)\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
@@ -3973,7 +3991,7 @@ async def cmd_set(message: types.Message, command: CommandObject):
     keys = {"step": ("step_pct", float), "interval": ("step_sec", int),
             "floor": ("floor_pct", float), "check": ("check_sec", int),
             "spam": ("spam_sec", float), "poll": ("poll_sec", float),
-            "batch": ("batch_usd", float)}
+            "batch": ("batch_usd", float), "topup": ("topup_usd", float)}
     args = (command.args or "").split()
     if len(args) == 2 and args[0].lower() == "depth" and args[1].lower() in ("on", "off"):
         arb["mexc_depth"] = args[1].lower() == "on"
@@ -4088,10 +4106,127 @@ async def cb_stop(callback: types.CallbackQuery):
 
 # ================= ЗАПУСК =================
 
+# ================= ПОПОЛНЕНИЕ HTX USDT С КОШЕЛЬКА =================
+#
+# Только из этих сетей (chain id, как искать сеть, контракт USDT). Из других — никогда.
+TOPUP_NETS = [
+    (56, "bsc", "0x55d398326f99059fF775485246999027B3197955"),
+    (42161, "Arbitrum One", "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),
+]
+TOPUP_MIN = D(10)            # меньше не переводим
+TOPUP_WAIT = 45 * 60         # столько ждём зачисления прошлого перевода
+
+
+async def _evm_net_by_chain_id(cid, query):
+    """Наша сеть с этим chain id; если такой нет — находим и добавляем сами."""
+    for name, n in list(EVM_CHAIN_IDS.items()):
+        if n == cid:
+            return name
+    for name, n in arb.get("networks", {}).items():
+        if n.get("chain_id") == cid:
+            return name
+    name, chain, _ = await discover_network(query)
+    if chain.get("chainId") != cid:
+        raise ExchangeError(f"нашлась сеть {chain.get('name')} с chain id {chain.get('chainId')}, а нужна {cid}")
+    return name
+
+
+async def htx_usdt_deposit_address(net, contract):
+    """Адрес депозита USDT на HTX в нашей сети: сеть HTX ищем по контракту USDT."""
+    chains = await htx_chains("usdt")
+    hit = await _htx_chain_by_contract("usdt", chains, contract)
+    if not hit:
+        cand = _net_chains(chains, net, {})
+        hit = cand[0] if len(cand) == 1 else None
+    if not hit:
+        raise ExchangeError(f"на HTX нет депозита USDT в сети {NET_TITLES[net]}")
+    if hit.get("depositStatus") not in (None, "allowed"):
+        raise ExchangeError(f"депозит USDT в сети {hit.get('chain')} на HTX закрыт")
+    rows = await htx_req("GET", "/v2/account/deposit/address", {"currency": "usdt"})
+    row = next((r for r in rows or [] if r.get("chain") == hit.get("chain")), None)
+    if not row or not row.get("address"):
+        raise ExchangeError(f"HTX не дал адрес депозита USDT в сети {hit.get('chain')} — "
+                            f"открой один раз страницу депозита USDT в этой сети на HTX")
+    if row.get("addressTag"):
+        raise ExchangeError("HTX требует memo для депозита USDT — на EVM так не бывает, не перевожу")
+    return row["address"], hit.get("chain")
+
+
+async def topup_step():
+    """USDT на HTX меньше порога — переводим недостающее с кошелька бота (BNB / Arbitrum)."""
+    need_level = D(str(arb.get("topup_usd") or 0))
+    if need_level <= 0 or not arb["enabled"] or arb["dry_run"]:
+        return
+    free, frozen = await htx_balance("usdt")
+    have = free + frozen
+    p = arb.get("topup_pending")
+    if p:
+        if have >= D(p["htx_before"]) + D(p["amount"]) * D("0.9"):
+            arb["topup_pending"] = None
+            await save()
+            await notify(f"✅ Пополнение HTX зачислено: {fmt(D(p['amount']))} USDT ({p['net']}).")
+        elif time.time() - p["at"] < TOPUP_WAIT:
+            return  # ждём зачисления, второй раз не шлём
+        else:
+            arb["topup_pending"] = None
+            await save()
+            await notify(f"⚠️ Пополнение HTX {fmt(D(p['amount']))} USDT ({p['net']}, tx <code>{p['tx']}</code>) "
+                         f"за {TOPUP_WAIT // 60} мин. не зачислилось — проверь депозит на HTX.")
+            return
+    need = need_level - have
+    if need < TOPUP_MIN:
+        return
+    # Где на кошельке есть USDT: сначала сеть, где его больше.
+    options = []
+    for cid, query, token in TOPUP_NETS:
+        try:
+            net = await _evm_net_by_chain_id(cid, query)
+            dec = await evm_decimals(net, token)
+            bal = D(await evm_balance(net, token)) / D(10) ** dec
+            gas = await evm_balance(net, None)
+        except Exception as e:
+            await note_once(f"topupnet:{cid}", f"⚠️ Пополнение HTX: сеть {query} недоступна: <code>{e}</code>",
+                            every=6 * 3600)
+            continue
+        if bal >= TOPUP_MIN:
+            if gas <= 0:
+                await note_once(f"topupgas:{cid}", f"⚠️ Пополнение HTX: на кошельке {fmt(bal)} USDT в сети "
+                                                   f"{NET_TITLES[net]}, но нет {NATIVE_COIN[net]} на газ.", every=6 * 3600)
+                continue
+            options.append((bal, net, token, dec))
+    if not options:
+        await note_once("topup_empty", f"ℹ️ На HTX {fmt(have)} USDT (меньше {fmt(need_level)}), "
+                                       f"а на кошельке бота нет USDT в сетях BNB / Arbitrum для пополнения.",
+                        every=6 * 3600)
+        return
+    bal, net, token, dec = max(options, key=lambda o: o[0])
+    amount = min(need, bal)
+    amount = amount.quantize(D("0.01"), rounding=ROUND_DOWN)
+    address, chain = await htx_usdt_deposit_address(net, token)
+    tx, sent_raw = await evm_send_all(net, token, address, int(amount * D(10) ** dec))
+    sent = D(sent_raw) / D(10) ** dec
+    arb["topup_pending"] = {"at": time.time(), "amount": str(sent), "net": NET_TITLES[net],
+                            "tx": tx, "htx_before": str(have)}
+    await save()
+    await notify(f"💵 На HTX {fmt(have)} USDT — меньше {fmt(need_level)}. Перевёл {fmt(sent)} USDT "
+                 f"с кошелька бота в сети {NET_TITLES[net]} на депозит HTX ({chain}).\ntx: <code>{tx}</code>")
+
+
+async def topup_loop():
+    while True:
+        try:
+            await topup_step()
+        except Exception as e:
+            print(f"[arb] topup: {traceback.format_exc()}", flush=True)
+            await note_once("topup_err", f"⚠️ Пополнение HTX с кошелька: ошибка <code>{e}</code>", every=1800)
+        await asyncio.sleep(60)
+
+
 async def start():
     """Восстанавливает состояние и запускает фоновые задачи. Возвращает их список."""
     await load()
-    tasks = [asyncio.create_task(spam_loop()), asyncio.create_task(engine_loop())]
+    tasks = [asyncio.create_task(spam_loop()), asyncio.create_task(engine_loop()),
+             asyncio.create_task(topup_loop())]
     for coin, d in list(deals.items()):
         if d.get("v") != 2:
             await notify(f"⚠️ Незавершённая сделка <b>{coin}</b> из прошлой версии бота сброшена — "
