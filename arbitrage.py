@@ -3426,26 +3426,59 @@ STATS_DAYS = 35  # грузим чуть больше месяца: покупк
 
 
 _hist_lock = asyncio.Lock()
-_hist_last = {"t": 0.0}
-_hist_cache = {}   # (биржа, пара, начало, конец) → строки; только для окон, закончившихся давно
+_hist_next = {"t": 0.0, "gap": 0.6}  # следующий запрос истории не раньше t; пауза gap подстраивается
+_hist_cache = {}          # "htx|пара|начало|конец" → строки; только окна, закончившиеся давно
+_hist_loaded = {"ok": False}
+_hist_progress = {"done": 0, "total": 0}
+_HIST_FIELDS = ("id", "created-at", "type", "filled-amount", "price", "filled-fees", "fee-currency")
+
+
+def _is_rate_limit(e):
+    t = str(e).lower()
+    return "rate" in t or "too many" in t or "429" in t
 
 
 async def _hist_req(fn, *args):
-    """Запрос истории с паузой между запросами и повтором при «слишком часто»:
-    истории много, а лимит запросов у бирж общий с торговлей."""
-    for attempt in range(6):
+    """Запрос истории через общую очередь: не чаще раза в gap сек. При отказе
+    «слишком часто» замолкает ВСЯ очередь (а не один запрос) и ждёт всё дольше —
+    лимит у биржи общий с торговлей, долбить его бесполезно."""
+    for attempt in range(10):
         async with _hist_lock:
-            wait = _hist_last["t"] + 0.35 - time.time()
+            wait = _hist_next["t"] - time.time()
             if wait > 0:
                 await asyncio.sleep(wait)
-            _hist_last["t"] = time.time()
+            _hist_next["t"] = time.time() + _hist_next["gap"]
         try:
-            return await fn(*args)
+            res = await fn(*args)
+            _hist_next["gap"] = max(0.6, _hist_next["gap"] * 0.97)  # проходит — понемногу ускоряемся
+            return res
         except ExchangeError as e:
-            if "rate" not in str(e).lower() and "too many" not in str(e).lower() and "429" not in str(e):
+            if not _is_rate_limit(e) or attempt == 9:
                 raise
-            await asyncio.sleep(2 * (attempt + 1))
-    return await fn(*args)
+            pause = min(5 * (attempt + 1), 30)
+            _hist_next["t"] = max(_hist_next["t"], time.time() + pause)
+            _hist_next["gap"] = min(_hist_next["gap"] * 1.3, 5.0)  # биржа против — дальше реже
+
+
+async def _hist_cache_load():
+    if _hist_loaded["ok"] or not ctx.redis:
+        return
+    _hist_loaded["ok"] = True
+    try:
+        raw = await ctx.redis("GET", "arb:hist")
+        if raw:
+            _hist_cache.update(json.loads(raw))
+    except Exception:
+        pass
+
+
+async def _hist_cache_save():
+    if not ctx.redis:
+        return
+    try:
+        await ctx.redis("SET", "arb:hist", json.dumps(_hist_cache))
+    except Exception:
+        pass
 
 
 async def htx_trades(symbol, since, until):
@@ -3457,13 +3490,14 @@ async def htx_trades(symbol, since, until):
     t = since - since % step
     while t < until:
         end = t + step  # окна встык (без зазора), повторы отсеиваем по id
-        key = ("htx", symbol, t, end)
+        key = f"htx|{symbol}|{int(t)}|{int(end)}"
+        _hist_progress["done"] += 1
         if key in _hist_cache:
             rows_all = _hist_cache[key]
         else:
             rows_all = await _htx_window(symbol, t, end)
-            if end < time.time() - 600:
-                _hist_cache[key] = rows_all
+            if end < time.time() - 600:  # окно закончилось — больше не изменится
+                _hist_cache[key] = [{k: r.get(k) for k in _HIST_FIELDS} for r in rows_all]
         for r in rows_all:
             if r.get("id") not in seen and since <= r.get("created-at", 0) / 1000 <= until:
                 seen.add(r.get("id"))
@@ -3613,7 +3647,30 @@ async def cmd_stats(message: types.Message):
         return coin, ev, wd, None
 
     wd_errors = []
-    results = await asyncio.gather(*[one(c) for c in coins])
+    await _hist_cache_load()
+    step = 48 * 3600
+    _hist_progress.update(done=0, total=len(coins) * (int((now - (since_all - since_all % step)) // step) + 1))
+
+    async def progress():
+        last = ""
+        while True:
+            await asyncio.sleep(10)
+            txt = (f"⏳ Считаю по истории сделок HTX и MEXC… загружено {_hist_progress['done']} из "
+                   f"~{_hist_progress['total']} кусков истории HTX (биржа ограничивает частоту запросов, "
+                   f"повторно будет быстро — прошлые дни запоминаются).")
+            if txt != last:
+                last = txt
+                try:
+                    await wait.edit_text(txt)
+                except Exception:
+                    pass
+
+    prog = asyncio.ensure_future(progress())
+    try:
+        results = await asyncio.gather(*[one(c) for c in coins])
+    finally:
+        prog.cancel()
+    await _hist_cache_save()
     out = ["📊 <b>Автоарбитраж: итоги по истории бирж</b>"]
     errors = [f"{c}: {e}" for c, _, _, e in results if e]
     for title, since in periods:
