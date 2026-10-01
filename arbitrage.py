@@ -3425,24 +3425,68 @@ async def cmd_arb(message: types.Message):
 STATS_DAYS = 35  # грузим чуть больше месяца: покупки до начала периода нужны для цены покупки
 
 
+_hist_lock = asyncio.Lock()
+_hist_last = {"t": 0.0}
+_hist_cache = {}   # (биржа, пара, начало, конец) → строки; только для окон, закончившихся давно
+
+
+async def _hist_req(fn, *args):
+    """Запрос истории с паузой между запросами и повтором при «слишком часто»:
+    истории много, а лимит запросов у бирж общий с торговлей."""
+    for attempt in range(6):
+        async with _hist_lock:
+            wait = _hist_last["t"] + 0.35 - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            _hist_last["t"] = time.time()
+        try:
+            return await fn(*args)
+        except ExchangeError as e:
+            if "rate" not in str(e).lower() and "too many" not in str(e).lower() and "429" not in str(e):
+                raise
+            await asyncio.sleep(2 * (attempt + 1))
+    return await fn(*args)
+
+
 async def htx_trades(symbol, since, until):
     """Все исполнения по паре на HTX за [since, until] (сек.). HTX отдаёт окнами по 48 ч."""
     out, seen = [], set()
-    t = since
+    # Окна выравниваем по сетке 48 ч — тогда прошедшие окна одинаковые от запуска к запуску
+    # и их можно не качать заново.
+    step = 48 * 3600
+    t = since - since % step
     while t < until:
-        end = min(t + 48 * 3600, until)  # окна встык (без зазора), повторы отсеиваем по id
-        params = {"symbol": symbol, "start-time": int(t * 1000), "end-time": int(end * 1000), "size": 500}
-        while True:
-            rows = await htx_req("GET", "/v1/order/matchresults", params) or []
-            new = [r for r in rows if r.get("id") not in seen]
-            for r in new:
+        end = t + step  # окна встык (без зазора), повторы отсеиваем по id
+        key = ("htx", symbol, t, end)
+        if key in _hist_cache:
+            rows_all = _hist_cache[key]
+        else:
+            rows_all = await _htx_window(symbol, t, end)
+            if end < time.time() - 600:
+                _hist_cache[key] = rows_all
+        for r in rows_all:
+            if r.get("id") not in seen and since <= r.get("created-at", 0) / 1000 <= until:
                 seen.add(r.get("id"))
-            out += new
-            if len(rows) < 500 or not new:
-                break
-            params["from"] = min(r["id"] for r in rows)
-            params["direct"] = "prev"
+                out.append(r)
         t = end
+    return out
+
+
+async def _htx_window(symbol, t, end):
+    """Одно окно истории HTX (до 48 ч) со всеми страницами по 500."""
+    out, seen = [], set()
+    # Окно [t, end) в мс: следующее начинается ровно там, где кончилось это, — без пропусков.
+    params = {"symbol": symbol, "start-time": int(t * 1000), "end-time": int(end * 1000) - 1, "size": 500}
+    while True:
+        rows = await _hist_req(htx_req, "GET", "/v1/order/matchresults", params) or []
+        new = [r for r in rows if r.get("id") not in seen]
+        for r in new:
+            seen.add(r.get("id"))
+        out += new
+        if len(rows) < 500 or not new:
+            break
+        params["from"] = min(r["id"] for r in rows)
+        params["direct"] = "prev"
     return out
 
 
@@ -3453,7 +3497,7 @@ async def htx_withdraw_fees(currency, since):
         params = {"currency": currency.lower(), "type": "withdraw", "size": 500, "direct": "prev"}
         if frm:
             params["from"] = frm
-        rows = await htx_req("GET", "/v1/query/deposit-withdraw", params) or []
+        rows = await _hist_req(htx_req, "GET", "/v1/query/deposit-withdraw", params) or []
         for r in rows:
             if r.get("created-at", 0) / 1000 >= since and r.get("state") not in ("canceled", "reject", "wallet-reject",
                                                                                    "repealed", "failed", "confirm-error"):
@@ -3471,8 +3515,8 @@ async def mexc_trades(sym, since, until):
         end = min(t + 7 * 86400, until)
         start = int(t * 1000)
         while True:
-            rows = await mexc_req("GET", "/api/v3/myTrades", {"symbol": sym, "startTime": start,
-                                                              "endTime": int(end * 1000), "limit": 100}) or []
+            rows = await _hist_req(mexc_req, "GET", "/api/v3/myTrades", {"symbol": sym, "startTime": start,
+                                                                         "endTime": int(end * 1000), "limit": 100}) or []
             new = [r for r in rows if (r.get("id"), r.get("orderId")) not in seen]
             for r in new:
                 seen.add((r.get("id"), r.get("orderId")))
@@ -3539,7 +3583,8 @@ async def cmd_stats(message: types.Message):
     """Сделки и прибыль за день / неделю / месяц по истории бирж."""
     if not await _guard(message):
         return
-    wait = await message.answer("⏳ Считаю по истории сделок HTX и MEXC…")
+    wait = await message.answer("⏳ Считаю по истории сделок HTX и MEXC… Первый раз — до пары минут "
+                                "(биржи ограничивают частоту запросов), дальше быстрее.")
     now = time.time()
     since_all = now - STATS_DAYS * 86400
     periods = [("Сутки", now - 86400), ("Неделя", now - 7 * 86400), ("Месяц", now - 30 * 86400)]
