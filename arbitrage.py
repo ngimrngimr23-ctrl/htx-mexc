@@ -2961,6 +2961,9 @@ async def finish_deal(d):
         return
     d["sold_qty"] = str(sold)
     pnl = proceeds - cost
+    hist = arb.setdefault("history", [])
+    hist.append({"t": time.time(), "coin": d["coin"], "cost": str(cost), "proceeds": str(proceeds)})
+    del hist[:-500]
     await notify(
         f"🏁 <b>{d['coin']}</b>: сделка завершена.\n"
         f"Куплено на HTX: {fmt(sum(D(b.get('bought', b['qty'])) for b in d['batches'] if b['ok']))} шт. "
@@ -3414,6 +3417,198 @@ async def cmd_arb(message: types.Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+# ================= СТАТИСТИКА (/arb_stats) =================
+#
+# Считаем по истории сделок САМИХ бирж, а не по памяти бота: так попадают и ручные
+# покупки/продажи, и всё, что бот мог «потерять» при перезапуске.
+
+STATS_DAYS = 35  # грузим чуть больше месяца: покупки до начала периода нужны для цены покупки
+
+
+async def htx_trades(symbol, since, until):
+    """Все исполнения по паре на HTX за [since, until] (сек.). HTX отдаёт окнами по 48 ч."""
+    out, seen = [], set()
+    t = since
+    while t < until:
+        end = min(t + 48 * 3600, until)  # окна встык (без зазора), повторы отсеиваем по id
+        params = {"symbol": symbol, "start-time": int(t * 1000), "end-time": int(end * 1000), "size": 500}
+        while True:
+            rows = await htx_req("GET", "/v1/order/matchresults", params) or []
+            new = [r for r in rows if r.get("id") not in seen]
+            for r in new:
+                seen.add(r.get("id"))
+            out += new
+            if len(rows) < 500 or not new:
+                break
+            params["from"] = min(r["id"] for r in rows)
+            params["direct"] = "prev"
+        t = end
+    return out
+
+
+async def htx_withdraw_fees(currency, since):
+    """Комиссии выводов монеты с HTX с момента since: [(время, комиссия в монетах)]."""
+    fee, frm = [], None
+    while True:
+        params = {"currency": currency.lower(), "type": "withdraw", "size": 500, "direct": "prev"}
+        if frm:
+            params["from"] = frm
+        rows = await htx_req("GET", "/v2/query/deposit-withdraw", params) or []
+        for r in rows:
+            if r.get("created-at", 0) / 1000 >= since and r.get("state") not in ("canceled", "reject", "wallet-reject",
+                                                                                   "repealed", "failed", "confirm-error"):
+                fee.append((r["created-at"] / 1000, D(str(r.get("fee") or 0))))
+        if len(rows) < 500 or min(r.get("created-at", 0) for r in rows) / 1000 < since:
+            return fee
+        frm = min(r["id"] for r in rows) - 1
+
+
+async def mexc_trades(sym, since, until):
+    """Все исполнения по паре на MEXC за [since, until] (сек.), окнами по 7 дней."""
+    out, seen = [], set()
+    t = since
+    while t < until:
+        end = min(t + 7 * 86400, until)
+        start = int(t * 1000)
+        while True:
+            rows = await mexc_req("GET", "/api/v3/myTrades", {"symbol": sym, "startTime": start,
+                                                              "endTime": int(end * 1000), "limit": 100}) or []
+            new = [r for r in rows if (r.get("id"), r.get("orderId")) not in seen]
+            for r in new:
+                seen.add((r.get("id"), r.get("orderId")))
+            out += new
+            if len(rows) < 100 or not new:
+                break
+            start = max(int(r["time"]) for r in rows)  # та же мс могла не влезть — повторы отсеем
+        t = end
+    return out
+
+
+async def coin_stats(coin, htx_symbol, htx_coin, since, until):
+    """Сделки монеты на обеих биржах: список событий (время, биржа, сторона, кол-во, $)."""
+    ev = []
+    for r in await htx_trades(htx_symbol, since, until):
+        q, p = D(str(r["filled-amount"])), D(str(r["price"]))
+        fee, fc = D(str(r.get("filled-fees") or 0)), str(r.get("fee-currency") or "").lower()
+        side = "buy" if str(r.get("type", "")).startswith("buy") else "sell"
+        usd = q * p
+        if side == "buy":
+            usd += fee if fc == "usdt" else 0
+            q -= fee if fc == htx_coin.lower() else 0     # комиссия монетой — монет пришло меньше
+        else:
+            usd -= fee if fc == "usdt" else 0
+        ev.append((r["created-at"] / 1000, "HTX", side, q, usd))
+    for r in await mexc_trades(f"{coin}USDT", since, until):
+        q, usd = D(str(r["qty"])), D(str(r["quoteQty"]))
+        fee, fc = D(str(r.get("commission") or 0)), str(r.get("commissionAsset") or "").upper()
+        side = "buy" if r.get("isBuyer") else "sell"
+        if fc == "USDT":
+            usd = usd + fee if side == "buy" else usd - fee
+        elif fc == coin.upper():
+            q = q - fee if side == "buy" else q
+        ev.append((int(r["time"]) / 1000, "MEXC", side, q, usd))
+    return ev
+
+
+def _period_sum(ev, wd, since):
+    """Итог за период. Прибыль — по проданному: выручка − кол-во × средняя цена покупки
+    (за весь загруженный срок, после торговых комиссий и комиссий вывода с HTX)."""
+    hb = [e for e in ev if e[1] == "HTX" and e[2] == "buy"]
+    bought_q = sum((e[3] for e in hb), D(0))
+    bought_usd = sum((e[4] for e in hb), D(0))
+    delivered = bought_q - sum((f for _, f in wd), D(0))
+    avg = bought_usd / delivered if delivered > 0 else None
+    p = [e for e in ev if e[0] >= since]
+    r = {k: D(0) for k in ("hb_usd", "hb_q", "ms_usd", "ms_q", "hs_usd", "hs_q", "mb_usd", "mb_q")}
+    n = {"hb": 0, "ms": 0, "hs": 0, "mb": 0}
+    for _, ex, side, q, usd in p:
+        k = ("h" if ex == "HTX" else "m") + ("b" if side == "buy" else "s")
+        r[k + "_usd"] += usd
+        r[k + "_q"] += q
+        n[k] += 1
+    sold_q = r["ms_q"] + r["hs_q"]
+    proceeds = r["ms_usd"] + r["hs_usd"]
+    r["pnl"] = proceeds - sold_q * avg if avg is not None and sold_q > 0 else None
+    r["wd_q"] = sum((f for t, f in wd if t >= since), D(0))
+    r["avg"] = avg
+    return r, n
+
+
+@router.message(Command("arb_stats"))
+async def cmd_stats(message: types.Message):
+    """Сделки и прибыль за день / неделю / месяц по истории бирж."""
+    if not await _guard(message):
+        return
+    wait = await message.answer("⏳ Считаю по истории сделок HTX и MEXC…")
+    now = time.time()
+    since_all = now - STATS_DAYS * 86400
+    periods = [("Сутки", now - 86400), ("Неделя", now - 7 * 86400), ("Месяц", now - 30 * 86400)]
+    coins = dict(arb.get("stats_coins") or {})
+    for c, cfg in arb["coins"].items():
+        coins[c] = cfg
+    for h in arb.get("history", []):
+        coins.setdefault(h["coin"], None)
+
+    async def one(coin):
+        cfg = arb["coins"].get(coin) or {}
+        hc = hcoin(coin, cfg)
+        sym = cfg.get("htx_symbol") or await htx_usdt_pair(hc)
+        if not sym:
+            return coin, None, None, "нет пары на HTX"
+        try:
+            ev, wd = await asyncio.gather(coin_stats(coin, sym, hc, since_all, now), htx_withdraw_fees(hc, since_all))
+            return coin, ev, wd, None
+        except Exception as e:
+            return coin, None, None, str(e)[:120]
+
+    results = await asyncio.gather(*[one(c) for c in coins])
+    out = ["📊 <b>Автоарбитраж: итоги по истории бирж</b>"]
+    errors = [f"{c}: {e}" for c, _, _, e in results if e]
+    for title, since in periods:
+        tot = {"hb": D(0), "ms": D(0), "hs": D(0), "pnl": D(0), "open": D(0)}
+        cnt = {"hb": 0, "ms": 0, "hs": 0}
+        rows = []
+        for coin, ev, wd, err in results:
+            if err or not ev:
+                continue
+            r, n = _period_sum(ev, wd, since)
+            if not (n["hb"] or n["ms"] or n["hs"]):
+                continue
+            tot["hb"] += r["hb_usd"]
+            tot["ms"] += r["ms_usd"]
+            tot["hs"] += r["hs_usd"]
+            for k in cnt:
+                cnt[k] += n[k]
+            if r["pnl"] is not None:
+                tot["pnl"] += r["pnl"]
+            # Куплено в периоде и ещё не продано — по цене покупки.
+            left = r["hb_q"] - r["wd_q"] - r["ms_q"] - r["hs_q"]
+            if left > 0 and r["avg"]:
+                tot["open"] += left * r["avg"]
+            rows.append(f"  {coin}: купл. {fmt(r['hb_usd'])}$ · продано {fmt(r['ms_usd'] + r['hs_usd'])}$ · "
+                        + (f"прибыль <b>{r['pnl']:+.2f}$</b>" if r["pnl"] is not None else "прибыль —"))
+        deals_n = sum(1 for h in arb.get("history", []) if h["t"] >= since)
+        out.append(f"\n<b>{title}</b> · завершённых сделок: {deals_n}")
+        if not rows:
+            out.append("  сделок на биржах не было")
+            continue
+        out.append(f"  HTX покупки: {cnt['hb']} шт. на {fmt(tot['hb'])}$ · MEXC продажи: {cnt['ms']} шт. на "
+                   f"{fmt(tot['ms'])}$" + (f" · HTX продажи (аварийные): {cnt['hs']} на {fmt(tot['hs'])}$"
+                                          if cnt["hs"] else ""))
+        out.append(f"  Прибыль по проданному: <b>{tot['pnl']:+.2f}$</b>"
+                   + (f" · ещё не продано из купленного: ~{fmt(tot['open'])}$" if tot["open"] > 1 else ""))
+        out += rows
+    out.append("\n<i>Прибыль = выручка − проданное × средняя цена покупки (с торговыми комиссиями и "
+               "комиссиями вывода HTX). Газ кошелька и пополнения USDT не учитываются.</i>")
+    if errors:
+        out.append("⚠️ Не удалось получить: " + "; ".join(errors))
+    text = "\n".join(out)
+    try:
+        await wait.edit_text(text[:4096], parse_mode="HTML")
+    except Exception:
+        await message.answer(text[:4096], parse_mode="HTML")
+
+
 @router.message(Command("arb_list"))
 async def cmd_list(message: types.Message):
     """Монеты в автоарбитраже с настройками — мгновенно, без запросов к биржам."""
@@ -3464,6 +3659,7 @@ async def cmd_help(message: types.Message):
         "   если тикер на HTX другой: <code>htxcoin=ТИКЕР</code>, напр. /arb_add MON 1.5 monad htxcoin=MONAD\n"
         "/arb_del PEPE — убрать монету\n"
         "/arb_list — список монет в автоарбитраже\n"
+        "/arb_stats — сделки и прибыль за сутки / неделю / месяц (по истории HTX и MEXC)\n"
         "/arb_confirm PEPE — подтвердить контракт вручную, если HTX его не отдал\n"
         "/arb_htx PEPE — что HTX реально отдаёт: сети, статусы, комиссии, контракты, лимиты, адресная книга\n"
         "/arb_chains PEPE — сети монеты на HTX и MEXC и что выбрал бот\n"
@@ -3566,6 +3762,7 @@ async def add_coin(coin, cfg):
     отчёт: пара на HTX, сети, контракт, адресная книга. Общая для /arb_add и
     кнопки «В автоарбитраж» под сигналом сканера."""
     net, pct = cfg["net"], cfg["pct"]
+    arb.setdefault("stats_coins", {}).setdefault(coin, None)
     text = f"✅ <b>{coin}</b>: от {pct:g}% · {NET_TITLES[net]} · " + \
            (f"проба {cfg['probe']:g}$ → весь баланс" if cfg["probe"] else "сразу весь баланс")
     # Тикер пишется как на MEXC (там продаём). Нет пары на MEXC — не добавляем.
@@ -4245,6 +4442,7 @@ BOT_COMMANDS = [
     ("arb", "Автоарбитраж: статус, спред, сделка, балансы"),
     ("arb_help", "Автоарбитраж: помощь"),
     ("arb_list", "Список монет в автоарбитраже"),
+    ("arb_stats", "Сделки и прибыль за сутки / неделю / месяц"),
     ("arb_add", "Добавить монету: PEPE 3 bsc [проба$]"),
     ("arb_del", "Убрать монету из автоарбитража"),
     ("arb_chains", "Сети монеты на HTX и MEXC"),
