@@ -3453,7 +3453,7 @@ async def htx_withdraw_fees(currency, since):
         params = {"currency": currency.lower(), "type": "withdraw", "size": 500, "direct": "prev"}
         if frm:
             params["from"] = frm
-        rows = await htx_req("GET", "/v2/query/deposit-withdraw", params) or []
+        rows = await htx_req("GET", "/v1/query/deposit-withdraw", params) or []
         for r in rows:
             if r.get("created-at", 0) / 1000 >= since and r.get("state") not in ("canceled", "reject", "wallet-reject",
                                                                                    "repealed", "failed", "confirm-error"):
@@ -3556,11 +3556,18 @@ async def cmd_stats(message: types.Message):
         if not sym:
             return coin, None, None, "нет пары на HTX"
         try:
-            ev, wd = await asyncio.gather(coin_stats(coin, sym, hc, since_all, now), htx_withdraw_fees(hc, since_all))
-            return coin, ev, wd, None
+            ev = await coin_stats(coin, sym, hc, since_all, now)
         except Exception as e:
             return coin, None, None, str(e)[:120]
+        try:
+            wd = await htx_withdraw_fees(hc, since_all)
+        except Exception as e:
+            # Без истории выводов сделки всё равно считаем, только без их комиссий.
+            wd_errors.append(f"{coin}: {str(e)[:80]}")
+            wd = []
+        return coin, ev, wd, None
 
+    wd_errors = []
     results = await asyncio.gather(*[one(c) for c in coins])
     out = ["📊 <b>Автоарбитраж: итоги по истории бирж</b>"]
     errors = [f"{c}: {e}" for c, _, _, e in results if e]
@@ -3601,7 +3608,9 @@ async def cmd_stats(message: types.Message):
     out.append("\n<i>Прибыль = выручка − проданное × средняя цена покупки (с торговыми комиссиями и "
                "комиссиями вывода HTX). Газ кошелька и пополнения USDT не учитываются.</i>")
     if errors:
-        out.append("⚠️ Не удалось получить: " + "; ".join(errors))
+        out.append("⚠️ Не удалось получить сделки: " + "; ".join(errors))
+    if wd_errors:
+        out.append("⚠️ Без комиссий вывода (HTX не отдал историю выводов): " + "; ".join(wd_errors))
     text = "\n".join(out)
     try:
         await wait.edit_text(text[:4096], parse_mode="HTML")
