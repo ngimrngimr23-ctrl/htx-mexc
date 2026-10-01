@@ -3422,7 +3422,7 @@ async def cmd_arb(message: types.Message):
 # Считаем по истории сделок САМИХ бирж, а не по памяти бота: так попадают и ручные
 # покупки/продажи, и всё, что бот мог «потерять» при перезапуске.
 
-STATS_DAYS = 35  # грузим чуть больше месяца: покупки до начала периода нужны для цены покупки
+STATS_DAYS = 40  # грузим чуть больше месяца: покупки до начала периода нужны для цены покупки
 
 
 _hist_lock = asyncio.Lock()
@@ -3588,28 +3588,74 @@ async def coin_stats(coin, htx_symbol, htx_coin, since, until):
     return ev
 
 
-def _period_sum(ev, wd, since):
-    """Итог за период. Прибыль — по проданному: выручка − кол-во × средняя цена покупки
-    (за весь загруженный срок, после торговых комиссий и комиссий вывода с HTX)."""
-    hb = [e for e in ev if e[1] == "HTX" and e[2] == "buy"]
-    bought_q = sum((e[3] for e in hb), D(0))
-    bought_usd = sum((e[4] for e in hb), D(0))
-    delivered = bought_q - sum((f for _, f in wd), D(0))
-    avg = bought_usd / delivered if delivered > 0 else None
-    p = [e for e in ev if e[0] >= since]
-    r = {k: D(0) for k in ("hb_usd", "hb_q", "ms_usd", "ms_q", "hs_usd", "hs_q", "mb_usd", "mb_q")}
-    n = {"hb": 0, "ms": 0, "hs": 0, "mb": 0}
-    for _, ex, side, q, usd in p:
-        k = ("h" if ex == "HTX" else "m") + ("b" if side == "buy" else "s")
-        r[k + "_usd"] += usd
-        r[k + "_q"] += q
-        n[k] += 1
-    sold_q = r["ms_q"] + r["hs_q"]
-    proceeds = r["ms_usd"] + r["hs_usd"]
-    r["pnl"] = proceeds - sold_q * avg if avg is not None and sold_q > 0 else None
-    r["wd_q"] = sum((f for t, f in wd if t >= since), D(0))
-    r["avg"] = avg
-    return r, n
+def fifo_ledger(ev, wd):
+    """Точный учёт по количеству монет (FIFO). Каждая покупка — партия (кол-во уже за
+    вычетом торговой комиссии монетами, цена — со всеми комиссиями). Продажа списывает
+    самые старые партии по ИХ цене; комиссия вывода с HTX — тоже списание монет, только
+    без выручки (чистый расход). Продано больше, чем найдено покупок, — эта часть
+    «без цены покупки» и в прибыль не идёт.
+    Возвращает (операции, остаток партий): операция — dict(t, kind, q, usd, cost, unmatched_q)."""
+    items = [(t, ex, side, q, usd) for t, ex, side, q, usd in ev] + [(t, "HTX", "fee", f, D(0)) for t, f in wd]
+    items.sort(key=lambda x: (x[0], 0 if x[2] == "buy" else 1))  # в одну секунду покупка раньше продажи
+    lots, ops = [], []
+    for t, ex, side, q, usd in items:
+        if q <= 0:
+            continue
+        if side == "buy":
+            lots.append([q, usd / q])
+            ops.append({"t": t, "kind": "buy", "ex": ex, "q": q, "usd": usd})
+            continue
+        need, cost = q, D(0)
+        while need > 0 and lots:
+            take = min(need, lots[0][0])
+            cost += take * lots[0][1]
+            lots[0][0] -= take
+            need -= take
+            if lots[0][0] <= 0:
+                lots.pop(0)
+        matched = q - need
+        ops.append({"t": t, "kind": side, "ex": ex, "q": q, "usd": usd, "cost": cost,
+                    "matched_q": matched, "unmatched_q": need,
+                    # выручка, приходящаяся на монеты с известной ценой покупки
+                    "usd_matched": usd * matched / q if q > 0 else D(0)})
+    return ops, lots
+
+
+def _period_report(ops, since):
+    r = {"buy_q": D(0), "buy_usd": D(0), "buy_n": 0, "sell_q": D(0), "sell_usd": D(0), "sell_n": 0,
+         "hs_n": 0, "hs_usd": D(0), "cost": D(0), "fee_q": D(0), "fee_cost": D(0),
+         "unm_q": D(0), "unm_usd": D(0), "pnl": D(0)}
+    for o in ops:
+        if o["t"] < since:
+            continue
+        if o["kind"] == "buy":
+            r["buy_q"] += o["q"]
+            r["buy_usd"] += o["usd"]
+            r["buy_n"] += 1
+        elif o["kind"] == "fee":
+            r["fee_q"] += o["matched_q"]
+            r["fee_cost"] += o["cost"]
+            r["pnl"] -= o["cost"]
+        else:
+            r["sell_q"] += o["q"]
+            r["sell_usd"] += o["usd"]
+            r["sell_n"] += 1
+            if o["ex"] == "HTX":
+                r["hs_n"] += 1
+                r["hs_usd"] += o["usd"]
+            r["cost"] += o["cost"]
+            r["pnl"] += o["usd_matched"] - o["cost"]
+            r["unm_q"] += o["unmatched_q"]
+            r["unm_usd"] += o["usd"] - o["usd_matched"]
+    return r
+
+
+def _money(x):
+    return f"{x:,.2f}".replace(",", " ")
+
+
+def _qty(x):
+    return f"{x:,.4f}".rstrip("0").rstrip(".").replace(",", " ")
 
 
 @router.message(Command("arb_stats"))
@@ -3671,44 +3717,53 @@ async def cmd_stats(message: types.Message):
     finally:
         prog.cancel()
     await _hist_cache_save()
-    out = ["📊 <b>Автоарбитраж: итоги по истории бирж</b>"]
+    out = ["📊 <b>Итоги автоарбитража</b> (по истории сделок HTX и MEXC)"]
     errors = [f"{c}: {e}" for c, _, _, e in results if e]
+    ledgers = {c: fifo_ledger(ev, wd) for c, ev, wd, err in results if not err and ev}
     for title, since in periods:
-        tot = {"hb": D(0), "ms": D(0), "hs": D(0), "pnl": D(0), "open": D(0)}
-        cnt = {"hb": 0, "ms": 0, "hs": 0}
+        tot = _period_report([], since)
         rows = []
-        for coin, ev, wd, err in results:
-            if err or not ev:
+        for coin, (ops, _) in ledgers.items():
+            r = _period_report(ops, since)
+            if not (r["buy_n"] or r["sell_n"] or r["fee_q"]):
                 continue
-            r, n = _period_sum(ev, wd, since)
-            if not (n["hb"] or n["ms"] or n["hs"]):
-                continue
-            tot["hb"] += r["hb_usd"]
-            tot["ms"] += r["ms_usd"]
-            tot["hs"] += r["hs_usd"]
-            for k in cnt:
-                cnt[k] += n[k]
-            if r["pnl"] is not None:
-                tot["pnl"] += r["pnl"]
-            # Куплено в периоде и ещё не продано — по цене покупки.
-            left = r["hb_q"] - r["wd_q"] - r["ms_q"] - r["hs_q"]
-            if left > 0 and r["avg"]:
-                tot["open"] += left * r["avg"]
-            rows.append(f"  {coin}: купл. {fmt(r['hb_usd'])}$ · продано {fmt(r['ms_usd'] + r['hs_usd'])}$ · "
-                        + (f"прибыль <b>{r['pnl']:+.2f}$</b>" if r["pnl"] is not None else "прибыль —"))
-        deals_n = sum(1 for h in arb.get("history", []) if h["t"] >= since)
-        out.append(f"\n<b>{title}</b> · завершённых сделок: {deals_n}")
+            for k in tot:
+                tot[k] += r[k]
+            pct = f" ({r['pnl'] / r['cost'] * 100:+.2f}%)" if r["cost"] > 0 else ""
+            line = (f"• <b>{coin}</b>: <b>{r['pnl']:+.2f}$</b>{pct}\n"
+                    f"   куплено {_qty(r['buy_q'])} шт. за {_money(r['buy_usd'])}$ · "
+                    f"продано {_qty(r['sell_q'])} шт. за {_money(r['sell_usd'])}$")
+            if r["sell_q"] > 0:
+                line += f"\n   проданные монеты стоили при покупке {_money(r['cost'])}$"
+            if r["fee_q"] > 0:
+                line += f" · комиссия вывода {_qty(r['fee_q'])} шт. ≈ {_money(r['fee_cost'])}$"
+            if r["unm_q"] > 0:
+                line += (f"\n   ⚠️ {_qty(r['unm_q'])} шт. ({_money(r['unm_usd'])}$) продано без найденной "
+                         f"покупки — в прибыль не входит")
+            rows.append(line)
+        out.append(f"\n📅 <b>{title}</b>")
         if not rows:
-            out.append("  сделок на биржах не было")
+            out.append("сделок не было")
             continue
-        out.append(f"  HTX покупки: {cnt['hb']} шт. на {fmt(tot['hb'])}$ · MEXC продажи: {cnt['ms']} шт. на "
-                   f"{fmt(tot['ms'])}$" + (f" · HTX продажи (аварийные): {cnt['hs']} на {fmt(tot['hs'])}$"
-                                          if cnt["hs"] else ""))
-        out.append(f"  Прибыль по проданному: <b>{tot['pnl']:+.2f}$</b>"
-                   + (f" · ещё не продано из купленного: ~{fmt(tot['open'])}$" if tot["open"] > 1 else ""))
+        pct = f" ({tot['pnl'] / tot['cost'] * 100:+.2f}%)" if tot["cost"] > 0 else ""
+        out.append(f"Прибыль: <b>{tot['pnl']:+.2f}$</b>{pct}")
+        out.append(f"Куплено на HTX: {_money(tot['buy_usd'])}$ ({tot['buy_n']} исполн.) · продано: "
+                   f"{_money(tot['sell_usd'])}$ ({tot['sell_n']} исполн."
+                   + (f", из них на HTX аварийно {tot['hs_n']} на {_money(tot['hs_usd'])}$" if tot["hs_n"] else "")
+                   + ")")
         out += rows
-    out.append("\n<i>Прибыль = выручка − проданное × средняя цена покупки (с торговыми комиссиями и "
-               "комиссиями вывода HTX). Газ кошелька и пополнения USDT не учитываются.</i>")
+    # Что куплено и ещё не продано (по цене покупки) — сейчас.
+    left = []
+    for coin, (_, lots) in ledgers.items():
+        q = sum((l[0] for l in lots), D(0))
+        c = sum((l[0] * l[1] for l in lots), D(0))
+        if c >= 1:
+            left.append(f"{coin} {_qty(q)} шт. ≈ {_money(c)}$")
+    if left:
+        out.append("\n📦 Куплено и ещё не продано (по цене покупки): " + "; ".join(left))
+    out.append("\n<i>Прибыль считается по количеству монет: каждая продажа списывает самые ранние "
+               "купленные монеты по их реальной цене (с торговыми комиссиями), комиссия вывода с HTX — "
+               "монеты, ушедшие без выручки. Не входят: газ кошелька, пополнения USDT, комиссии в MX.</i>")
     if errors:
         out.append("⚠️ Не удалось получить сделки: " + "; ".join(errors))
     if wd_errors:
