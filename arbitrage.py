@@ -180,7 +180,10 @@ def fee_extra_pct(fee_qty, mexc_bid, batch_cost):
     """Сколько % спреда съест комиссия вывода, размазанная на партию batch_cost $."""
     if batch_cost <= 0:
         return Decimal(10) ** 6
-    return fee_qty * mexc_bid / batch_cost * 100
+    extra = fee_qty * mexc_bid / batch_cost * 100
+    # Мизерная комиссия (< 0.01%) порог не двигает: иначе спред ровно на пороге
+    # отклонялся бы из-за тысячных долей цента.
+    return extra if extra >= Decimal("0.01") else Decimal(0)
 
 # Сделки по монетам: {монета: сделка}. Покупать может только одна (весь USDT в
 # ней), остальные в это время доводят свои партии до продажи.
