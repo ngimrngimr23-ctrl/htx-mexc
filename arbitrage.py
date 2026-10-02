@@ -3573,26 +3573,42 @@ _HTX_BAD_STATES = {"canceled", "reject", "wallet-reject", "repealed", "failed", 
                    "unknown", "verify-reject"}
 
 
-async def htx_transfers(since):
-    """Все депозиты и выводы HTX (по всем монетам) с момента since."""
-    out = []
-    for kind in ("withdraw", "deposit"):
+async def htx_transfers(since, currencies=()):
+    """Депозиты и выводы HTX с момента since: общий запрос по всем монетам плюс
+    отдельно по каждой из currencies — общий HTX отдаёт не всегда целиком.
+    Повторы (одна запись из обоих запросов) отсеиваем по id."""
+    seen, out = set(), []
+
+    async def query(kind, currency):
         frm = None
         while True:
             params = {"type": kind, "size": 500, "direct": "prev"}
+            if currency:
+                params["currency"] = currency.lower()
             if frm:
                 params["from"] = frm
             rows = await _hist_req(htx_req, "GET", "/v1/query/deposit-withdraw", params) or []
             for r in rows:
                 t = r.get("created-at", 0) / 1000
-                if t >= since and str(r.get("state", "")).lower() not in _HTX_BAD_STATES:
-                    amt, fee = D(str(r.get("amount") or 0)), D(str(r.get("fee") or 0))
-                    # С HTX списывается сумма + комиссия сверху (так выводит и бот).
-                    out.append({"ex": "HTX", "kind": kind, "asset": str(r.get("currency", "")).upper(), "t": t,
-                                "amount": amt + fee if kind == "withdraw" else amt})
+                key = (kind, r.get("id"))
+                if key in seen or t < since or str(r.get("state", "")).lower() in _HTX_BAD_STATES:
+                    continue
+                seen.add(key)
+                amt, fee = D(str(r.get("amount") or 0)), D(str(r.get("fee") or 0))
+                # С HTX списывается сумма + комиссия сверху (так выводит и бот).
+                out.append({"ex": "HTX", "kind": kind, "asset": str(r.get("currency", "")).upper(), "t": t,
+                            "amount": amt + fee if kind == "withdraw" else amt})
             if len(rows) < 500 or not rows or min(r.get("created-at", 0) for r in rows) / 1000 < since:
                 break
             frm = min(r["id"] for r in rows) - 1
+
+    for kind in ("withdraw", "deposit"):
+        try:
+            await query(kind, None)
+        except ExchangeError:
+            pass  # без currency HTX может и отказать — тогда только по монетам
+        for c in currencies:
+            await query(kind, c)
     return out
 
 
@@ -3657,7 +3673,8 @@ async def track_assets_loop():
     отдаёт историю только за 48 ч)."""
     while True:
         try:
-            found = await htx_recent_assets()
+            htx2asset = {cfg["htx_coin"].upper(): c.upper() for c, cfg in arb["coins"].items() if cfg.get("htx_coin")}
+            found = {htx2asset.get(a, a) for a in await htx_recent_assets()}
             known = arb.setdefault("stats_coins", {})
             new = [a for a in found if a not in known and a not in STABLES]
             for a in new:
@@ -3851,26 +3868,30 @@ async def cmd_stats(message: types.Message):
             problems.append(f"{name}: {str(e)[:100]}")
             return None
 
-    htx_tr, mexc_tr, hb, mb, recent = await asyncio.gather(
-        safe("HTX депозиты/выводы", htx_transfers(since_all)),
+    mexc_tr, hb, mb, recent = await asyncio.gather(
         safe("MEXC депозиты/выводы", mexc_transfers(since_all, now)),
         safe("HTX балансы", htx_all_balances()), safe("MEXC балансы", mexc_all_balances()),
         safe("HTX сделки за 48 ч", htx_recent_assets()))
-    transfers = []
-    for x in (htx_tr or []):
-        x["asset"] = htx2asset.get(x["asset"], x["asset"])
-        transfers.append(x)
-    transfers += mexc_tr or []
+    norm = lambda a: htx2asset.get(str(a).upper(), str(a).upper())  # PROPY → PRO, MONAD → MON
     balances = {}
     for c, v in (hb or {}).items():
-        a = htx2asset.get(c, c)
-        balances[a] = balances.get(a, D(0)) + v
+        balances[norm(c)] = balances.get(norm(c), D(0)) + v
     for c, v in (mb or {}).items():
         balances[c] = balances.get(c, D(0)) + v
-    assets = set(c.upper() for c in arb["coins"]) | set(c.upper() for c in (arb.get("stats_coins") or {}))
-    assets |= {x["asset"] for x in transfers} | set(balances) | {htx2asset.get(c, c) for c in (recent or set())}
-    assets = sorted(a for a in assets if a and a not in STABLES)
     known = arb.setdefault("stats_coins", {})
+    for k in [k for k in known if norm(k) != k.upper()]:
+        known.pop(k)  # тикер HTX у монеты с другим тикером на MEXC — это та же монета
+    assets = {norm(c) for c in arb["coins"]} | {norm(c) for c in known}
+    assets |= {norm(x["asset"]) for x in (mexc_tr or [])} | set(balances) | {norm(c) for c in (recent or set())}
+    assets = {a for a in assets if a and a not in STABLES}
+    htx_tr = await safe("HTX депозиты/выводы",
+                        htx_transfers(since_all, sorted(asset2htx.get(a, a) for a in assets)))
+    transfers = []
+    for x in (htx_tr or []) + (mexc_tr or []):
+        x["asset"] = norm(x["asset"]) if x["ex"] == "HTX" else x["asset"]
+        transfers.append(x)
+    assets |= {x["asset"] for x in transfers if x["asset"] not in STABLES}
+    assets = sorted(a for a in assets if a)
     for a in assets:
         known.setdefault(a, None)
 
@@ -3928,6 +3949,8 @@ async def cmd_stats(message: types.Message):
         books[asset] = (trades, tops, uses, lots, opening)
 
     blocks = ["📊 <b>Итоги по всем сделкам HTX и MEXC</b>"]
+    if problems:
+        blocks.append("⚠️ <b>Не удалось получить</b> (итог может быть неполным): " + "; ".join(problems))
     for title, since in periods:
         rows, tot = [], {"pnl": D(0), "cost": D(0), "buy_usd": D(0), "sell_usd": D(0), "buy_n": 0, "sell_n": 0}
         for asset, (trades, tops, uses, lots, opening) in books.items():
@@ -4005,8 +4028,6 @@ async def cmd_stats(message: types.Message):
                   "(где бы ни купили и ни продали), переводы между биржами — перемещение, комиссии вывода и газ — "
                   "расход. Пары только к USDT. Не входят: комиссии в MX/баллах HTX, газ токенами с кошелька, "
                   "пополнения USDT.</i>")
-    if problems:
-        blocks.append("⚠️ Не удалось получить: " + "; ".join(problems))
 
     # Телеграм — до 4096 символов в сообщении: режем по блокам.
     msgs, cur = [], ""
