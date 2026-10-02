@@ -553,12 +553,34 @@ async def htx_withdraw(address, coin, amount, chain_code, fee):
 
 # ================= MEXC =================
 
+_mexc_clock = {"offset_ms": 0}
+
+
+async def mexc_sync_clock():
+    """Поправка на расхождение часов сервера бота и MEXC (ошибка 700003 «outside of the recvWindow»)."""
+    t0 = time.time()
+    async with http().get("https://api.mexc.com/api/v3/time", timeout=TIMEOUT) as r:
+        data = json.loads(await r.text())
+    t1 = time.time()
+    _mexc_clock["offset_ms"] = int(data["serverTime"]) - int((t0 + t1) / 2 * 1000)
+
+
 async def mexc_req(method, path, params=None, signed=True):
+    try:
+        return await _mexc_req(method, path, params, signed)
+    except ExchangeError as e:
+        if not signed or "700003" not in str(e):
+            raise
+        await mexc_sync_clock()  # часы разошлись — подстраиваемся и повторяем один раз
+        return await _mexc_req(method, path, params, signed)
+
+
+async def _mexc_req(method, path, params=None, signed=True):
     params = dict(params or {})
     if signed:
         if not MEXC_API_KEY or not MEXC_API_SECRET:
             raise ExchangeError("не заданы MEXC_API_KEY / MEXC_API_SECRET")
-        params["timestamp"] = int(time.time() * 1000)
+        params["timestamp"] = int(time.time() * 1000) + _mexc_clock["offset_ms"]
         params.setdefault("recvWindow", 10000)
         query = urllib.parse.urlencode(params)
         sig = hmac.new(MEXC_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -3474,6 +3496,11 @@ async def _hist_req(fn, *args):
             res = await fn(*args)
             _hist_next["gap"] = max(0.6, _hist_next["gap"] * 0.97)  # проходит — понемногу ускоряемся
             return res
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            if attempt >= 4:
+                raise ExchangeError(f"сеть: {type(e).__name__} {e}".strip())
+            await asyncio.sleep(2 * (attempt + 1))  # обрыв/таймаут — повторяем
+            continue
         except ExchangeError as e:
             if not _is_rate_limit(e) or attempt == 9:
                 raise
@@ -3609,7 +3636,10 @@ async def htx_transfers(since, currencies=()):
         except ExchangeError:
             pass  # без currency HTX может и отказать — тогда только по монетам
         for c in currencies:
-            await query(kind, c)
+            try:
+                await query(kind, c)
+            except ExchangeError:
+                pass  # «currency not open» и т.п. — монеты нет на HTX, у неё и выводов нет
     return out
 
 
@@ -3829,7 +3859,7 @@ async def cmd_stats(message: types.Message):
         try:
             return await coro
         except Exception as e:
-            problems.append(f"{name}: {str(e)[:100]}")
+            problems.append(f"{name}: {(str(e) or type(e).__name__)[:100]}")
             return None
 
     mexc_tr, hb, mb, recent = await asyncio.gather(
@@ -3864,11 +3894,13 @@ async def cmd_stats(message: types.Message):
 
     async def load(asset):
         hc = asset2htx.get(asset, asset)
-        hsymb = None
-        try:
-            hsymb = await htx_usdt_pair(hc)
-        except Exception:
-            pass
+        hsymb = (arb["coins"].get(asset) or {}).get("htx_symbol")
+        if not hsymb:
+            try:
+                hsymb = await htx_usdt_pair(hc)
+            except Exception as e:
+                problems.append(f"{asset}: не узнал пару на HTX ({type(e).__name__} {str(e)[:60]})")
+                return asset, None
         hrows, mrows = [], []
         if hsymb:
             hrows = await safe(f"{asset} HTX сделки", htx_trades(hsymb, since_all, now))
