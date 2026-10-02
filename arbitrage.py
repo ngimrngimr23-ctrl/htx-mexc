@@ -4766,7 +4766,7 @@ TOPUP_NETS = [
     (42161, "Arbitrum One", "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),
 ]
 TOPUP_MIN = D(10)            # меньше не переводим
-TOPUP_COOLDOWN = 5 * 60      # после перевода столько не переводим снова (деньги в пути)
+TOPUP_COOLDOWN = 2 * 60      # после перевода столько не переводим снова (деньги в пути)
 
 
 async def _evm_net_by_chain_id(cid, query):
