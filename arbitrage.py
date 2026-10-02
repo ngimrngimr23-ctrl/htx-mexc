@@ -2186,6 +2186,9 @@ async def engine_loop():
                         except Exception as e:
                             await note_once(f"res:{coin}", f"⚠️ <b>{coin}</b>: не удалось найти монету на HTX: {e}",
                                             every=1800)
+                for c in list(arb.get("carry", {})):
+                    if c in arb["coins"] and c not in deals and not coin_paused(c):
+                        await flush_carry(c, arb["coins"][c])
                 for c in arb["coins"]:
                     if coin_paused(c):
                         why_not[c] = (time.time(), "на паузе после /stop аварии — /arb_resume")
@@ -2582,15 +2585,66 @@ async def _idle(d, why):
         await _stop_buying(d, why)
 
 
+FEE_NEGLIGIBLE_PCT = D("0.1")  # комиссия вывода ≤ 0.1% партии — выводим сразу, ждать нечего
+
+
 def _worth_withdrawing(d, mexc_bid):
-    """Выводить можно: после комиссии вывода по цене MEXC чистыми остаётся заданный %."""
+    """Выводить можно, если комиссия вывода мизерная (≤ FEE_NEGLIGIBLE_PCT партии) —
+    монеты уже куплены, держать их на HTX бессмысленно, даже если MEXC сейчас просел;
+    иначе — если после комиссии вывода по цене MEXC чистыми остаётся заданный %."""
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
     if unw_q <= 0 or unw_c < D(arb["batch_usd"]):
         return False
     if d.get("wd_fee") is None:  # сделка из старой версии
         return unw_c >= D(d.get("min_batch") or arb["batch_usd"])
-    net = net_pct(unw_q, unw_c, D(d["wd_fee"]), D(str(mexc_bid)))
+    bid = D(str(mexc_bid))
+    if bid > 0 and D(d["wd_fee"]) * bid <= unw_c * FEE_NEGLIGIBLE_PCT / 100:
+        return True
+    net = net_pct(unw_q, unw_c, D(d["wd_fee"]), bid)
     return net is not None and net >= D(d["cfg"]["pct"])
+
+
+_carry_tried = {}
+
+
+async def flush_carry(coin, cfg):
+    """Отложенные на HTX монеты (вывод тогда «не окупался») выводим, как только
+    комиссия вывода мизерная, — не дожидаясь следующей сделки по монете."""
+    if time.time() - _carry_tried.get(coin, 0) < 300 or arb["dry_run"]:
+        return
+    _carry_tried[coin] = time.time()
+    try:
+        res = await resolve_coin(coin, cfg)
+        if not res["htx_withdraw_ok"] or not res["mexc_deposit_ok"]:
+            return
+        mbids, _ = await mexc_depth(f"{coin}USDT")
+        if not mbids:
+            return
+        d = new_deal(coin, cfg, res)
+        d["wd_fee"] = str(res["htx_fee"])
+        d["buying"] = False
+        await _take_carry(d)
+        bid = mbids[0][0]
+        if _dd(d, "unw_cost") < D(arb["batch_usd"]) or \
+                D(d["wd_fee"]) * bid > _dd(d, "unw_cost") * FEE_NEGLIGIBLE_PCT / 100:
+            # комиссия всё ещё заметна — кладём обратно и ждём следующей сделки
+            if _dd(d, "unw_qty") > 0:
+                arb.setdefault("carry", {})[coin] = {"qty": d["unw_qty"], "cost": d["unw_cost"]}
+            return
+        await notify(f"📦 <b>{coin}</b>: вывожу отложенные на HTX {fmt(_dd(d, 'unw_qty'))} шт. "
+                     f"(куплено на {fmt(_dd(d, 'unw_cost'))}$) — комиссия вывода мизерная.")
+        deals[coin] = d
+        await withdraw_batch(d)
+        if _dd(d, "unw_qty") > 0 and not d["batches"]:
+            # HTX не принял (меньше минимума вывода и т.п.) — монеты остаются отложенными
+            arb.setdefault("carry", {})[coin] = {"qty": d["unw_qty"], "cost": d["unw_cost"]}
+            deals.pop(coin, None)
+            await save()
+            return
+        await save()
+        spawn(run_deal(d))
+    except Exception as e:
+        await note_once(f"carry:{coin}", f"⚠️ <b>{coin}</b>: не вывел отложенные монеты: <code>{e}</code>", every=3600)
 
 
 async def _take_carry(d):
