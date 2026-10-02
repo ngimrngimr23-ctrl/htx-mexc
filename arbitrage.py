@@ -2585,31 +2585,34 @@ async def _idle(d, why):
         await _stop_buying(d, why)
 
 
-FEE_NEGLIGIBLE_PCT = D("0.1")  # комиссия вывода ≤ 0.1% партии — выводим сразу, ждать нечего
+FEE_NEGLIGIBLE_PCT = D("0.1")  # пока покупка идёт: вывод частями, только если комиссия ≤ 0.1% партии
+FEE_SANE_PCT = D("10")          # после покупки: выводим всё, если комиссия не съедает > 10% партии
 
 
-def _worth_withdrawing(d, mexc_bid):
-    """Выводить можно, если комиссия вывода мизерная (≤ FEE_NEGLIGIBLE_PCT партии) —
-    монеты уже куплены, держать их на HTX бессмысленно, даже если MEXC сейчас просел;
-    иначе — если после комиссии вывода по цене MEXC чистыми остаётся заданный %."""
+def _worth_withdrawing(d, mexc_bid, final=False):
+    """Процент выгоды проверяется ПРИ ПОКУПКЕ (с учётом комиссии вывода). После покупки
+    условия по % нет — монеты выводим, чтобы продать по той выгоде, что есть:
+      * пока покупка идёт (final=False) — частями, только если комиссия мизерная (иначе
+        платили бы её за каждую мелкую партию, а покупка рассчитана на один вывод);
+      * покупка закончилась (final=True) — всё разом, если комиссия не абсурдная
+        (≤ FEE_SANE_PCT партии; на HTX остаётся только совсем мелочь)."""
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
     if unw_q <= 0 or unw_c < D(arb["batch_usd"]):
         return False
     if d.get("wd_fee") is None:  # сделка из старой версии
         return unw_c >= D(d.get("min_batch") or arb["batch_usd"])
     bid = D(str(mexc_bid))
-    if bid > 0 and D(d["wd_fee"]) * bid <= unw_c * FEE_NEGLIGIBLE_PCT / 100:
-        return True
-    net = net_pct(unw_q, unw_c, D(d["wd_fee"]), bid)
-    return net is not None and net >= D(d["cfg"]["pct"])
+    fee_usd = D(d["wd_fee"]) * (bid if bid > 0 else unw_c / unw_q)
+    limit = FEE_SANE_PCT if final else FEE_NEGLIGIBLE_PCT
+    return fee_usd <= unw_c * limit / 100
 
 
 _carry_tried = {}
 
 
 async def flush_carry(coin, cfg):
-    """Отложенные на HTX монеты (вывод тогда «не окупался») выводим, как только
-    комиссия вывода мизерная, — не дожидаясь следующей сделки по монете."""
+    """Отложенные на HTX монеты выводим сами, как только вывод имеет смысл (комиссия
+    не съедает больше FEE_SANE_PCT), — не дожидаясь следующей сделки по монете."""
     if time.time() - _carry_tried.get(coin, 0) < 300 or arb["dry_run"]:
         return
     _carry_tried[coin] = time.time()
@@ -2625,14 +2628,13 @@ async def flush_carry(coin, cfg):
         d["buying"] = False
         await _take_carry(d)
         bid = mbids[0][0]
-        if _dd(d, "unw_cost") < D(arb["batch_usd"]) or \
-                D(d["wd_fee"]) * bid > _dd(d, "unw_cost") * FEE_NEGLIGIBLE_PCT / 100:
+        if not _worth_withdrawing(d, bid, final=True):
             # комиссия всё ещё заметна — кладём обратно и ждём следующей сделки
             if _dd(d, "unw_qty") > 0:
                 arb.setdefault("carry", {})[coin] = {"qty": d["unw_qty"], "cost": d["unw_cost"]}
             return
         await notify(f"📦 <b>{coin}</b>: вывожу отложенные на HTX {fmt(_dd(d, 'unw_qty'))} шт. "
-                     f"(куплено на {fmt(_dd(d, 'unw_cost'))}$) — комиссия вывода мизерная.")
+                     f"(куплено на {fmt(_dd(d, 'unw_cost'))}$).")
         deals[coin] = d
         await withdraw_batch(d)
         if _dd(d, "unw_qty") > 0 and not d["batches"]:
@@ -2674,7 +2676,7 @@ async def _stop_buying(d, why):
             mbid = mbids[0][0] if mbids else D(0)
         except Exception:
             mbid = D(0)
-        if _worth_withdrawing(d, mbid):
+        if _worth_withdrawing(d, mbid, final=True):
             await withdraw_batch(d)
         elif unw_c < 1:
             d["unw_qty"] = d["unw_cost"] = "0"  # пыль после округлений — не откладываем
@@ -2683,11 +2685,11 @@ async def _stop_buying(d, why):
             arb.setdefault("carry", {})[d["coin"]] = {"qty": str(unw_q), "cost": str(unw_c)}
             d["unw_qty"] = d["unw_cost"] = "0"
             fee = D(d.get("wd_fee") or 0) * mbid
-            net = net_pct(unw_q, unw_c, D(d.get("wd_fee") or 0), mbid)
+            why_not = (f"меньше партии {fmt(D(arb['batch_usd']))}$" if unw_c < D(arb["batch_usd"]) else
+                       f"комиссия вывода ~{fmt(fee)}$ — больше {FEE_SANE_PCT}% от суммы")
             await notify(f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}). {fmt(unw_q)} шт. на {fmt(unw_c)}$ "
-                         f"не вывожу — после комиссии вывода ~{fmt(fee)}$ чистыми вышло бы "
-                         f"{(net if net is not None else D(0)):.2f}% (нужно {d['cfg']['pct']}%). Лежат на HTX, "
-                         f"следующая сделка по {d['coin']} докупит и выведет всё одной партией.")
+                         f"не вывожу: {why_not}. Лежат на HTX, следующая сделка по {d['coin']} докупит "
+                         f"и выведет всё одной партией.")
             await save()
             return
     if _dd(d, "bought_qty") > 0:
@@ -3493,8 +3495,9 @@ async def cmd_arb(message: types.Message):
         f"проверка вывода HTX через {arb['check_sec']} сек. · стакан MEXC при покупке: "
         f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}",
         f"покупка на HTX только у продавцов по цене с твоим %, своих ордеров в стакане нет · "
-        f"вывод партией от {arb.get('batch_usd', 15):g}$, только если чистыми после комиссии вывода "
-        f"остаётся заданный %",
+        f"твой % проверяется при покупке (с комиссией вывода); после покупки — вывод без условий по %: "
+        f"во время покупки частями, если комиссия ≤{FEE_NEGLIGIBLE_PCT}%, после — всё разом (от "
+        f"{arb.get('batch_usd', 15):g}$, если комиссия ≤{FEE_SANE_PCT}%)",
         (f"пополнение HTX: держу ≥{arb.get('topup_usd'):g} USDT (BNB / Arbitrum), проверка раз в минуту; "
          + (f"последняя {_ago(topup_status['t'])} назад: " if topup_status["t"] else "")
          + html.escape(topup_status["text"])
@@ -4124,7 +4127,8 @@ async def cmd_help(message: types.Message):
         "1. Покупка на HTX: если есть продавцы по цене, дающей твой % к MEXC, — выкупает их сразу. "
         "Своих ордеров на покупку в стакане не держит: покупает ордером «исполнить сразу» точно по ценам "
         "продавцов и не больше, чем MEXC сейчас заберёт с твоим %.\n"
-        "2. Вывод на кошелёк бота — партией, как только после комиссии вывода чистыми остаётся твой %. "
+        "2. Твой % проверяется при покупке (с учётом комиссии вывода). Купленное выводится на кошелёк бота "
+        "без условий по %: во время покупки — частями, если комиссия мизерная, после — всё разом. "
         "HTX отклонил вывод или через минуту партия всё ещё на балансе — покупка останавливается, монеты "
         "продаются на HTX вслед за ценой MEXC, спам до /stop.\n"
         "3. Каждая дошедшая партия пересылается на депозит MEXC.\n"
