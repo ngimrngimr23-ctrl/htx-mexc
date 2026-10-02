@@ -421,7 +421,20 @@ async def htx_place(sym, order_type, amount, price=None):
     }
     if price is not None:
         body["price"] = dstr(price)
-    return str(await htx_req("POST", "/v1/order/orders/place", body=body))
+    try:
+        return str(await htx_req("POST", "/v1/order/orders/place", body=body))
+    except ExchangeError as e:
+        # Защита цены HTX: лимитка не дальше определённой полосы от рынка («Buy price
+        # cannot be higher than 0.3671»). Прижимаем цену к границе и пробуем ещё раз:
+        # покупка дешевле / продажа дороже только лучше, просто исполнится меньше.
+        m = re.search(r"(higher|lower) than ([0-9]+(?:\.[0-9]+)?)", str(e))
+        if price is None or not m or "price-m" not in str(e):
+            raise
+        limit = D(m.group(2))
+        if (m.group(1) == "higher" and limit >= D(price)) or (m.group(1) == "lower" and limit <= D(price)):
+            raise
+        body["price"] = dstr(limit)
+        return str(await htx_req("POST", "/v1/order/orders/place", body=body))
 
 
 async def htx_order(order_id):
