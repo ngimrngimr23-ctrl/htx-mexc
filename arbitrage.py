@@ -4828,7 +4828,7 @@ def _deposit_for(p, rows, taken):
     for r in rows:
         if r.get("id") in taken:
             continue
-        if r.get("created-at", 0) / 1000 >= p["at"] - 120 and \
+        if r.get("created-at", 0) / 1000 >= p["at"] - 600 and \
                 abs(D(str(r.get("amount") or 0)) - D(p["amount"])) <= D(p["amount"]) * D("0.01"):
             return r
     return None
@@ -4852,11 +4852,13 @@ async def topup_step():
     inflight = list(arb.get("topup_inflight") or [])
     if arb.get("topup_pending"):  # из прошлой версии
         inflight.append(arb.pop("topup_pending"))
+    dep_err = ""
     if inflight:
         try:
             rows = await htx_usdt_deposits()
-        except Exception:
+        except Exception as e:
             rows = None
+            dep_err = f"; история депозитов HTX не отдалась: {str(e)[:80]}"
         taken, keep = set(), []
         for p in inflight:
             dep = _deposit_for(p, rows, taken) if rows is not None else None
@@ -4876,10 +4878,14 @@ async def topup_step():
         arb["topup_inflight"] = inflight
         await save()
     in_way = sum((D(p["amount"]) for p in inflight), D(0))
+    if inflight and rows:
+        last = rows[0]
+        dep_err += (f"; последний депозит USDT на HTX: {fmt(D(str(last.get('amount') or 0)))} "
+                    f"({last.get('state')}, {_ago(last.get('created-at', 0) / 1000)} назад)")
     need = need_level - have - in_way
     if need < TOPUP_MIN:
         if in_way > 0:
-            _topup_say(f"на HTX {fmt(have)} USDT + в пути {fmt(in_way)} USDT — хватает, жду зачисления")
+            _topup_say(f"на HTX {fmt(have)} USDT + в пути {fmt(in_way)} USDT — хватает, жду зачисления{dep_err}")
         return
     # Где на кошельке есть USDT: сначала сеть, где его больше.
     options = []
@@ -4913,9 +4919,10 @@ async def topup_step():
     amount = min(need, bal)
     amount = amount.quantize(D("0.01"), rounding=ROUND_DOWN)
     address, chain = await htx_usdt_deposit_address(net, token)
+    t_send = time.time()  # до отправки: HTX может зачислить раньше, чем мы дождёмся подтверждения в сети
     tx, sent_raw = await evm_send_all(net, token, address, int(amount * D(10) ** dec))
     sent = D(sent_raw) / D(10) ** dec
-    arb.setdefault("topup_inflight", []).append({"at": time.time(), "amount": str(sent), "net": NET_TITLES[net],
+    arb.setdefault("topup_inflight", []).append({"at": t_send, "amount": str(sent), "net": NET_TITLES[net],
                                                  "tx": tx, "htx_before": str(have)})
     await save()
     _topup_say(f"перевёл {fmt(sent)} USDT ({NET_TITLES[net]}), жду зачисления")
