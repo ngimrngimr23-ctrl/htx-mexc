@@ -4708,6 +4708,24 @@ async def htx_usdt_deposit_address(net, contract):
 topup_status = {"t": 0.0, "text": "ещё не проверял"}
 
 
+async def htx_usdt_deposit_arrived(p):
+    """Пришёл ли наш перевод на HTX — по истории депозитов USDT (хеш транзакции, иначе
+    сумма после отправки), а не по балансу: баланс тем временем тратится на покупки."""
+    rows = await htx_req("GET", "/v1/query/deposit-withdraw",
+                         {"currency": "usdt", "type": "deposit", "size": 100, "direct": "prev"}) or []
+    tx = str(p.get("tx") or "").lower().removeprefix("0x")
+    for r in rows:
+        if str(r.get("state", "")).lower() not in ("confirmed", "safe"):
+            continue
+        h = str(r.get("tx-hash") or "").lower().removeprefix("0x")
+        if tx and h == tx:
+            return True
+        if r.get("created-at", 0) / 1000 >= p["at"] - 60 and \
+                abs(D(str(r.get("amount") or 0)) - D(p["amount"])) <= D(p["amount"]) * D("0.01"):
+            return True
+    return False
+
+
 def _topup_say(text):
     topup_status.update(t=time.time(), text=text)
 
@@ -4723,7 +4741,11 @@ async def topup_step():
     _topup_say(f"на HTX {fmt(have)} USDT — пополнять не нужно")
     p = arb.get("topup_pending")
     if p:
-        if have >= D(p["htx_before"]) + D(p["amount"]) * D("0.9"):
+        try:
+            arrived = await htx_usdt_deposit_arrived(p)
+        except Exception:
+            arrived = have >= D(p["htx_before"]) + D(p["amount"]) * D("0.9")  # запасной способ
+        if arrived:
             arb["topup_pending"] = None
             await save()
             await notify(f"✅ Пополнение HTX зачислено: {fmt(D(p['amount']))} USDT ({p['net']}).")
