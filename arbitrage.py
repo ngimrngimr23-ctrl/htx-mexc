@@ -3419,8 +3419,9 @@ async def cmd_arb(message: types.Message):
         f"покупка на HTX только у продавцов по цене с твоим %, своих ордеров в стакане нет · "
         f"вывод партией от {arb.get('batch_usd', 15):g}$, только если чистыми после комиссии вывода "
         f"остаётся заданный %",
-        (f"пополнение HTX: держу ≥{arb.get('topup_usd'):g} USDT, перевожу с кошелька из BNB / Arbitrum"
-         + (f" · ждёт зачисления {fmt(D(arb['topup_pending']['amount']))} USDT" if arb.get("topup_pending") else "")
+        (f"пополнение HTX: держу ≥{arb.get('topup_usd'):g} USDT (BNB / Arbitrum), проверка раз в минуту; "
+         + (f"последняя {_ago(topup_status['t'])} назад: " if topup_status["t"] else "")
+         + html.escape(topup_status["text"])
          if arb.get("topup_usd") else "пополнение HTX с кошелька: выкл"),
         "",
         _keys_text(),
@@ -3445,7 +3446,6 @@ async def cmd_arb(message: types.Message):
 
 STATS_DAYS = 40   # история грузится с запасом: продажам в начале месяца нужны их покупки
 STABLES = {"USDT", "USDC", "FDUSD", "TUSD", "DAI", "BUSD", "USDE", "USD1", "PYUSD", "USDD", "UST", "HUSD"}
-TRANSFER_WINDOW = 12 * 3600   # депозит на другой бирже ищем в течение 12 ч после вывода
 
 _hist_lock = asyncio.Lock()
 _hist_next = {"t": 0.0, "gap": 0.6}  # следующий запрос истории не раньше t; пауза gap подстраивается
@@ -3597,7 +3597,8 @@ async def htx_transfers(since, currencies=()):
                 amt, fee = D(str(r.get("amount") or 0)), D(str(r.get("fee") or 0))
                 # С HTX списывается сумма + комиссия сверху (так выводит и бот).
                 out.append({"ex": "HTX", "kind": kind, "asset": str(r.get("currency", "")).upper(), "t": t,
-                            "amount": amt + fee if kind == "withdraw" else amt})
+                            "amount": amt + fee if kind == "withdraw" else amt,
+                            "fee": fee if kind == "withdraw" else D(0)})
             if len(rows) < 500 or not rows or min(r.get("created-at", 0) for r in rows) / 1000 < since:
                 break
             frm = min(r["id"] for r in rows) - 1
@@ -3627,7 +3628,8 @@ async def mexc_transfers(since, until):
             if int(r.get("status", 0)) not in (8, 9):  # 8 — ошибка, 9 — отменён
                 # На MEXC комиссия вывода входит в сумму: списывается amount.
                 out.append({"ex": "MEXC", "kind": "withdraw", "asset": str(r.get("coin", "")).upper(),
-                            "t": int(r.get("applyTime", 0)) / 1000, "amount": D(str(r.get("amount") or 0))})
+                            "t": int(r.get("applyTime", 0)) / 1000, "amount": D(str(r.get("amount") or 0)),
+                            "fee": D(str(r.get("transactionFee") or 0))})
         t = end
     return out
 
@@ -3712,44 +3714,6 @@ def _trade_events(asset, htx_rows, htx_coin, mexc_rows):
             coin_fee = fee
         ev.append((int(r["time"]) / 1000, "MEXC", side, q, usd, coin_fee))
     return ev
-
-
-def _match_transfers(transfers, now):
-    """Связывает выводы с одной биржи и депозиты на другой (HTX → кошелёк → MEXC и
-    обратно): депозит = сумма одного или нескольких выводов до него (бот может
-    переслать несколько партий одним переводом). amount вывода — сколько монет
-    СПИСАНО с биржи (с комиссией), так что потеря = списано − зачислено и включает
-    и комиссию вывода, и газ (не больше 10%).
-    Возвращает операции: fee (комиссия/газ — расход), out (ушло с бирж насовсем),
-    in (пришло извне, цена покупки неизвестна)."""
-    wds = sorted([x for x in transfers if x["kind"] == "withdraw"], key=lambda x: x["t"])
-    deps = sorted([x for x in transfers if x["kind"] == "deposit"], key=lambda x: x["t"])
-    used = set()
-    ops = []
-    for dep in deps:
-        cand = [i for i, w in enumerate(wds) if i not in used and w["ex"] != dep["ex"]
-                and 0 <= dep["t"] - w["t"] <= TRANSFER_WINDOW]
-        got, total = [], D(0)
-        for i in cand:
-            got.append(i)
-            total += wds[i]["amount"]
-            if total * D("0.9") <= dep["amount"] <= total * D("1.0001"):
-                break
-        if got and total * D("0.9") <= dep["amount"] <= total * D("1.0001"):
-            used.update(got)
-            loss = total - dep["amount"]
-            if loss > 0:
-                ops.append({"t": dep["t"], "kind": "fee", "q": loss, "why": "комиссия вывода и газ"})
-        else:
-            ops.append({"t": dep["t"], "kind": "in", "q": dep["amount"]})
-    for i, w in enumerate(wds):
-        if i in used:
-            continue
-        if now - w["t"] > TRANSFER_WINDOW:
-            ops.append({"t": w["t"], "kind": "out", "q": w["amount"]})
-        else:
-            ops.append({"t": w["t"], "kind": "transit", "q": w["amount"]})  # ещё едет — монеты наши
-    return ops
 
 
 def asset_ledger(trades, transfer_ops):
@@ -3942,8 +3906,10 @@ async def cmd_stats(message: types.Message):
     for asset, trades in loaded:
         if trades is None:
             continue
-        tops = _match_transfers([x for x in transfers if x["asset"] == asset], now)
-        if not trades and not any(o["kind"] in ("fee",) for o in tops):
+        # Переводы между биржами монет не меняют — учитываем только комиссии вывода (монетами).
+        tops = [{"t": x["t"], "kind": "fee", "q": x["fee"]} for x in transfers
+                if x["asset"] == asset and x["kind"] == "withdraw" and x.get("fee", 0) > 0]
+        if not trades:
             continue
         uses, lots, opening = asset_ledger(trades, tops)
         books[asset] = (trades, tops, uses, lots, opening)
@@ -3952,82 +3918,35 @@ async def cmd_stats(message: types.Message):
     if problems:
         blocks.append("⚠️ <b>Не удалось получить</b> (итог может быть неполным): " + "; ".join(problems))
     for title, since in periods:
-        rows, tot = [], {"pnl": D(0), "cost": D(0), "buy_usd": D(0), "sell_usd": D(0), "buy_n": 0, "sell_n": 0}
+        rows, tot = [], {"pnl": D(0), "cost": D(0), "buy_usd": D(0), "sell_usd": D(0)}
         for asset, (trades, tops, uses, lots, opening) in books.items():
             r = asset_period(trades, uses, since)
             if not (r["buy_n"] or r["sell_n"]):
                 continue
-            for k in ("pnl", "cost", "buy_usd", "sell_usd", "buy_n", "sell_n"):
+            for k in ("pnl", "cost", "buy_usd", "sell_usd"):
                 tot[k] += r[k]
-            head = f"<b>{r['pnl']:+.2f}$</b>" + (f" ({r['pnl'] / r['cost'] * 100:+.2f}%)" if r["cost"] else "")
-            line = f"• <b>{asset}</b>: {head}"
-            if r["buy_n"]:
-                line += (f"\n   куплено {_qty(r['buy_q'])} шт. за {_money(r['buy_usd'])}$ "
-                         f"({'+'.join(sorted(r['buy_ex']))}, ср. {fmt(r['buy_usd'] / r['buy_q'])})")
-            if r["sell_n"]:
-                line += (f"\n   продано {_qty(r['sell_q'])} шт. за {_money(r['sell_usd'])}$ "
-                         f"({'+'.join(sorted(r['sell_ex']))}, ср. {fmt(r['sell_usd'] / r['sell_q'])})")
-            if r["p_bought"] > 0:
-                tol = r["p_bought"] * D("0.002")
-                line += (f"\n   сверка купленного: {_qty(r['p_bought'])} = продано {_qty(r['p_sold'])}"
-                         f" + комиссии/газ {_qty(r['p_fee'])}"
-                         + (f" + выведено с бирж {_qty(r['p_out'])}" if r["p_out"] > 0 else "")
-                         + f" + осталось {_qty(r['p_left'])}"
-                         + (" ✅" if abs(r["p_left"]) <= tol else
-                            f" ⏳ (≈{_money(r['p_left'] * r['buy_usd'] / r['buy_q'])}$ ещё не продано)"
-                            if r["p_left"] > 0 else " ⚠️"))
-            if r["early_q"] > r["sell_q"] * D("0.001"):
-                line += f"\n   ещё продано {_qty(r['early_q'])} шт. из покупок до периода (их прибыль учтена)"
-            if r["fee_cost"] >= D("0.01"):
-                line += f"\n   комиссии вывода и газ: −{_money(r['fee_cost'])}$ (учтено)"
+            pct = f" ({r['pnl'] / r['cost'] * 100:+.2f}%)" if r["cost"] else ""
+            line = (f"• <b>{asset}</b> <b>{r['pnl']:+.2f}$</b>{pct}: куплено {_qty(r['buy_q'])} шт. за "
+                    f"{_money(r['buy_usd'])}$, продано {_qty(r['sell_q'])} шт. за {_money(r['sell_usd'])}$")
+            notes = []
             if r["unm_q"] > r["sell_q"] * D("0.001"):
-                line += (f"\n   ⚠️ {_qty(r['unm_q'])} шт. ({_money(r['unm_usd'])}$) продано из старых запасов / "
-                         f"пришедших извне — цена покупки неизвестна, в прибыль не входит")
+                notes.append(f"⚠️ {_qty(r['unm_q'])} шт. продано без покупки за {STATS_DAYS} дн. (старые) — не в прибыли")
+            if r["p_left"] > r["p_bought"] * D("0.002") and r["buy_q"]:
+                notes.append(f"⏳ не продано {_qty(r['p_left'])} шт.")
+            if notes:
+                line += "\n   " + " · ".join(notes)
             rows.append((abs(r["pnl"]), line))
         block = f"\n📅 <b>{title}</b>"
         if not rows:
-            blocks.append(block + "\nсделок не было")
+            blocks.append(block + ": сделок не было")
             continue
         pct = f" ({tot['pnl'] / tot['cost'] * 100:+.2f}%)" if tot["cost"] > 0 else ""
-        block += (f"\nПрибыль: <b>{tot['pnl']:+.2f}$</b>{pct}\n"
-                  f"Покупки: {_money(tot['buy_usd'])}$ ({tot['buy_n']} исполн.) · "
-                  f"продажи: {_money(tot['sell_usd'])}$ ({tot['sell_n']} исполн.)")
+        block += (f": прибыль <b>{tot['pnl']:+.2f}$</b>{pct} · куплено на {_money(tot['buy_usd'])}$ · "
+                  f"продано на {_money(tot['sell_usd'])}$")
         blocks.append(block)
         blocks += [line for _, line in sorted(rows, key=lambda x: -x[0])]
-
-    # --- сверка с реальными балансами ---
-    # По истории: на биржах должно лежать (старые запасы − списанные из них) + остаток
-    # купленного + едущее между биржами. Старые запасы неизвестны, но не могут быть < 0:
-    # если выходит < 0 — значит, в истории не хватает продаж/выводов.
-    check = ["\n🔎 <b>Сверка с балансами бирж</b> (что по истории должно лежать на HTX+MEXC)"]
-    ok_assets = []
-    for asset, (trades, tops, uses, lots, opening) in books.items():
-        left = sum((l[0] for l in lots), D(0))
-        transit = sum((o["q"] for o in tops if o["kind"] == "transit"), D(0))
-        actual = balances.get(asset, D(0))
-        # На биржах = (старые запасы, оставшиеся непроданными) + (купленное, не проданное и не в пути).
-        expected = left - transit
-        implied_old = actual - expected  # сколько старых запасов осталось; < 0 быть не может
-        tol = max(left, actual, D(1)) * D("0.005")
-        if implied_old < -tol:
-            check.append(f"⚠️ <b>{asset}</b>: по истории должно быть ≥{_qty(expected)} шт., а на биржах "
-                         f"{_qty(actual)} — какие-то продажи/выводы не попали в историю")
-        elif left > tol or implied_old > tol:
-            note = []
-            if left > tol:
-                note.append(f"не продано {_qty(left)} шт." + (f" (из них в пути {_qty(transit)})" if transit else ""))
-            if implied_old > tol:
-                note.append(f"старые запасы ~{_qty(implied_old)} шт.")
-            check.append(f"✅ <b>{asset}</b>: сходится — на биржах {_qty(actual)} шт.: " + ", ".join(note))
-        else:
-            ok_assets.append(asset)
-    if ok_assets:
-        check.append("✅ всё продано, остатков нет: " + ", ".join(ok_assets))
-    blocks.append("\n".join(check))
-    blocks.append("\n<i>Учёт по монете общий для обеих бирж: продажа списывает последние купленные до неё монеты "
-                  "(где бы ни купили и ни продали), переводы между биржами — перемещение, комиссии вывода и газ — "
-                  "расход. Пары только к USDT. Не входят: комиссии в MX/баллах HTX, газ токенами с кошелька, "
-                  "пополнения USDT.</i>")
+    blocks.append("\n<i>Продажа (на любой бирже) списывает купленные до неё монеты по их цене, комиссия "
+                  "вывода — расход. Пары к USDT.</i>")
 
     # Телеграм — до 4096 символов в сообщении: режем по блокам.
     msgs, cur = [], ""
@@ -4786,13 +4705,22 @@ async def htx_usdt_deposit_address(net, contract):
     return row["address"], hit.get("chain")
 
 
+topup_status = {"t": 0.0, "text": "ещё не проверял"}
+
+
+def _topup_say(text):
+    topup_status.update(t=time.time(), text=text)
+
+
 async def topup_step():
     """USDT на HTX меньше порога — переводим недостающее с кошелька бота (BNB / Arbitrum)."""
     need_level = D(str(arb.get("topup_usd") or 0))
     if need_level <= 0 or not arb["enabled"] or arb["dry_run"]:
+        _topup_say("выключено: нужно /arb_on и /arb_live on, и порог /arb_set topup > 0")
         return
     free, frozen = await htx_balance("usdt")
     have = free + frozen
+    _topup_say(f"на HTX {fmt(have)} USDT — пополнять не нужно")
     p = arb.get("topup_pending")
     if p:
         if have >= D(p["htx_before"]) + D(p["amount"]) * D("0.9"):
@@ -4800,6 +4728,8 @@ async def topup_step():
             await save()
             await notify(f"✅ Пополнение HTX зачислено: {fmt(D(p['amount']))} USDT ({p['net']}).")
         elif time.time() - p["at"] < TOPUP_WAIT:
+            _topup_say(f"на HTX {fmt(have)} USDT; жду зачисления прошлого перевода {fmt(D(p['amount']))} USDT "
+                       f"({p['net']}, отправлен {_ago(p['at'])} назад)")
             return  # ждём зачисления, второй раз не шлём
         else:
             arb["topup_pending"] = None
@@ -4819,16 +4749,20 @@ async def topup_step():
             bal = D(await evm_balance(net, token)) / D(10) ** dec
             gas = await evm_balance(net, None)
         except Exception as e:
+            _topup_say(f"сеть {query} недоступна: {str(e)[:100]}")
             await note_once(f"topupnet:{cid}", f"⚠️ Пополнение HTX: сеть {query} недоступна: <code>{e}</code>",
                             every=6 * 3600)
             continue
         if bal >= TOPUP_MIN:
             if gas <= 0:
+                _topup_say(f"на кошельке {fmt(bal)} USDT в сети {NET_TITLES[net]}, но нет {NATIVE_COIN[net]} на газ")
                 await note_once(f"topupgas:{cid}", f"⚠️ Пополнение HTX: на кошельке {fmt(bal)} USDT в сети "
                                                    f"{NET_TITLES[net]}, но нет {NATIVE_COIN[net]} на газ.", every=6 * 3600)
                 continue
             options.append((bal, net, token, dec))
     if not options:
+        _topup_say(f"на HTX {fmt(have)} USDT (< {fmt(need_level)}), но на кошельке нет USDT "
+                   f"(от {fmt(TOPUP_MIN)}) с газом в сетях BNB / Arbitrum")
         await note_once("topup_empty", f"ℹ️ На HTX {fmt(have)} USDT (меньше {fmt(need_level)}), "
                                        f"а на кошельке бота нет USDT в сетях BNB / Arbitrum для пополнения.",
                         every=6 * 3600)
@@ -4842,6 +4776,7 @@ async def topup_step():
     arb["topup_pending"] = {"at": time.time(), "amount": str(sent), "net": NET_TITLES[net],
                             "tx": tx, "htx_before": str(have)}
     await save()
+    _topup_say(f"перевёл {fmt(sent)} USDT ({NET_TITLES[net]}), жду зачисления")
     await notify(f"💵 На HTX {fmt(have)} USDT — меньше {fmt(need_level)}. Перевёл {fmt(sent)} USDT "
                  f"с кошелька бота в сети {NET_TITLES[net]} на депозит HTX ({chain}).\ntx: <code>{tx}</code>")
 
@@ -4852,6 +4787,7 @@ async def topup_loop():
             await topup_step()
         except Exception as e:
             print(f"[arb] topup: {traceback.format_exc()}", flush=True)
+            _topup_say(f"ошибка: {str(e)[:150]}")
             await note_once("topup_err", f"⚠️ Пополнение HTX с кошелька: ошибка <code>{e}</code>", every=1800)
         await asyncio.sleep(60)
 
