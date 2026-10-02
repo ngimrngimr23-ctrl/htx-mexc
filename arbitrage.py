@@ -4766,7 +4766,7 @@ TOPUP_NETS = [
     (42161, "Arbitrum One", "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),
 ]
 TOPUP_MIN = D(10)            # меньше не переводим
-TOPUP_WAIT = 45 * 60         # столько ждём зачисления прошлого перевода
+TOPUP_COOLDOWN = 5 * 60      # после перевода столько не переводим снова (деньги в пути)
 
 
 async def _evm_net_by_chain_id(cid, query):
@@ -4807,33 +4807,6 @@ async def htx_usdt_deposit_address(net, contract):
 topup_status = {"t": 0.0, "text": "ещё не проверял"}
 
 
-async def htx_usdt_deposits():
-    """Последние депозиты USDT на HTX (любой статус, кроме отказных)."""
-    rows = await htx_req("GET", "/v1/query/deposit-withdraw",
-                         {"currency": "usdt", "type": "deposit", "size": 100, "direct": "prev"}) or []
-    return [r for r in rows if str(r.get("state", "")).lower() not in _HTX_BAD_STATES]
-
-
-def _deposit_for(p, rows, taken):
-    """Депозит HTX, который соответствует нашему переводу p: по хешу транзакции,
-    иначе по сумме (±1%) после отправки. Уже сопоставленные депозиты не берём.
-    Статус «ещё подтверждается» тоже считаем: деньги идут, второй раз слать не надо."""
-    tx = str(p.get("tx") or "").lower().removeprefix("0x")
-    for r in rows:
-        if r.get("id") in taken:
-            continue
-        h = str(r.get("tx-hash") or "").lower().removeprefix("0x")
-        if tx and h == tx:
-            return r
-    for r in rows:
-        if r.get("id") in taken:
-            continue
-        if r.get("created-at", 0) / 1000 >= p["at"] - 600 and \
-                abs(D(str(r.get("amount") or 0)) - D(p["amount"])) <= D(p["amount"]) * D("0.01"):
-            return r
-    return None
-
-
 def _topup_say(text):
     topup_status.update(t=time.time(), text=text)
 
@@ -4847,45 +4820,17 @@ async def topup_step():
     free, frozen = await htx_balance("usdt")
     have = free + frozen
     _topup_say(f"на HTX {fmt(have)} USDT — пополнять не нужно")
-    # Переводы в пути. Ждём их, но остальное пополнение не блокируем: в пути учитываем
-    # как уже пришедшее, а недостающее сверх этого переводим.
-    inflight = list(arb.get("topup_inflight") or [])
-    if arb.get("topup_pending"):  # из прошлой версии
-        inflight.append(arb.pop("topup_pending"))
-    dep_err = ""
-    if inflight:
-        try:
-            rows = await htx_usdt_deposits()
-        except Exception as e:
-            rows = None
-            dep_err = f"; история депозитов HTX не отдалась: {str(e)[:80]}"
-        taken, keep = set(), []
-        for p in inflight:
-            dep = _deposit_for(p, rows, taken) if rows is not None else None
-            if dep is not None:
-                taken.add(dep.get("id"))
-                state = str(dep.get("state", "")).lower()
-                if state in ("confirmed", "safe"):
-                    await notify(f"✅ Пополнение HTX зачислено: {fmt(D(p['amount']))} USDT ({p['net']}).")
-                    continue
-                keep.append(p)  # HTX уже видит, ещё подтверждает
-            elif time.time() - p["at"] < TOPUP_WAIT:
-                keep.append(p)
-            else:
-                await notify(f"⚠️ Пополнение HTX {fmt(D(p['amount']))} USDT ({p['net']}, tx <code>{p['tx']}</code>) "
-                             f"за {TOPUP_WAIT // 60} мин. не появилось в депозитах HTX — проверь.")
-        inflight = keep
-        arb["topup_inflight"] = inflight
-        await save()
-    in_way = sum((D(p["amount"]) for p in inflight), D(0))
-    if inflight and rows:
-        last = rows[0]
-        dep_err += (f"; последний депозит USDT на HTX: {fmt(D(str(last.get('amount') or 0)))} "
-                    f"({last.get('state')}, {_ago(last.get('created-at', 0) / 1000)} назад)")
-    need = need_level - have - in_way
+    # Зачисление на HTX не отслеживаем — только пауза после перевода, чтобы, пока
+    # деньги идут по сети, не отправить ту же сумму второй раз.
+    arb.pop("topup_inflight", None)
+    arb.pop("topup_pending", None)
+    last = arb.get("topup_last") or 0
+    if time.time() - last < TOPUP_COOLDOWN:
+        _topup_say(f"на HTX {fmt(have)} USDT; перевёл {_ago(last)} назад — пауза {TOPUP_COOLDOWN // 60} мин., "
+                   f"пока деньги идут")
+        return
+    need = need_level - have
     if need < TOPUP_MIN:
-        if in_way > 0:
-            _topup_say(f"на HTX {fmt(have)} USDT + в пути {fmt(in_way)} USDT — хватает, жду зачисления{dep_err}")
         return
     # Где на кошельке есть USDT: сначала сеть, где его больше.
     options = []
@@ -4908,8 +4853,7 @@ async def topup_step():
                 continue
             options.append((bal, net, token, dec))
     if not options:
-        _topup_say(f"на HTX {fmt(have)} USDT" + (f" + в пути {fmt(in_way)}" if in_way else "")
-                   + f" (< {fmt(need_level)}), но на кошельке нет USDT "
+        _topup_say(f"на HTX {fmt(have)} USDT (< {fmt(need_level)}), но на кошельке нет USDT "
                    f"(от {fmt(TOPUP_MIN)}) с газом в сетях BNB / Arbitrum")
         await note_once("topup_empty", f"ℹ️ На HTX {fmt(have)} USDT (меньше {fmt(need_level)}), "
                                        f"а на кошельке бота нет USDT в сетях BNB / Arbitrum для пополнения.",
@@ -4919,13 +4863,12 @@ async def topup_step():
     amount = min(need, bal)
     amount = amount.quantize(D("0.01"), rounding=ROUND_DOWN)
     address, chain = await htx_usdt_deposit_address(net, token)
-    t_send = time.time()  # до отправки: HTX может зачислить раньше, чем мы дождёмся подтверждения в сети
+    t_send = time.time()
     tx, sent_raw = await evm_send_all(net, token, address, int(amount * D(10) ** dec))
     sent = D(sent_raw) / D(10) ** dec
-    arb.setdefault("topup_inflight", []).append({"at": t_send, "amount": str(sent), "net": NET_TITLES[net],
-                                                 "tx": tx, "htx_before": str(have)})
+    arb["topup_last"] = t_send
     await save()
-    _topup_say(f"перевёл {fmt(sent)} USDT ({NET_TITLES[net]}), жду зачисления")
+    _topup_say(f"перевёл {fmt(sent)} USDT ({NET_TITLES[net]})")
     await notify(f"💵 На HTX {fmt(have)} USDT — меньше {fmt(need_level)}. Перевёл {fmt(sent)} USDT "
                  f"с кошелька бота в сети {NET_TITLES[net]} на депозит HTX ({chain}).\ntx: <code>{tx}</code>")
 
