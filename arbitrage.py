@@ -2825,6 +2825,19 @@ async def transport_step(d):
             return
         d["forwarding"] = False
 
+    # Кошелёк пересылает на MEXC ВСЁ, что на нём есть: партия, пришедшая раньше, чем
+    # прошла её проверка вывода, могла уехать вместе с предыдущей. Переслано больше,
+    # чем числится за отмеченными партиями, — этим излишком закрываем следующие.
+    extra = _dd(d, "forwarded") - sum((D(b["amount"]) for b in d["batches"] if b["fwd"]), D(0))
+    for b in list(waiting):
+        if extra >= D(b["amount"]) * D("0.9"):
+            b["fwd"] = True
+            extra -= D(b["amount"])
+            waiting.remove(b)
+    if not waiting:
+        await save()
+        return
+
     if bal < D(waiting[0]["amount"]) * D("0.9"):
         if time.time() - waiting[0]["at"] > 1800 and not waiting[0].get("warned"):
             waiting[0]["warned"] = True
