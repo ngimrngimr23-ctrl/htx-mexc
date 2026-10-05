@@ -752,62 +752,9 @@ async def _rpc_once(url, net, method, params):
     return data.get("result")
 
 
-# Sui закрыл JSON-RPC на своих публичных нодах — держим список сторонних нод, где он
-# ещё работает. Своя нода (с ключом провайдера) — переменная SUI_RPC_URL, она первая.
-SUI_RPCS = [u for u in [os.environ.get("SUI_RPC_URL"),
-                        "https://sui-rpc.publicnode.com",
-                        "https://rpc-mainnet.suiscan.xyz",
-                        "https://sui-mainnet-endpoint.blockvision.org",
-                        "https://mainnet.suiet.app",
-                        "https://sui-mainnet.nodeinfra.com",
-                        "https://fullnode.mainnet.sui.io:443"] if u]
-
-
-def _sui_unsupported(e):
-    t = str(e).lower()
-    return "-32601" in t or "method not found" in t or "deprecated" in t or "not supported" in t \
-        or "not available" in t or "unauthorized" in t or "rate limit" in t or "429" in t
-
-
-async def _sui_rpc(method, params):
-    """JSON-RPC Sui по очереди через ноды из SUI_RPCS: «метод не найден / JSON-RPC
-    отключён» или нода не отвечает — пробуем следующую и запоминаем рабочую."""
-    urls = [RPC_URLS["sui"]] + [u for u in SUI_RPCS if u != RPC_URLS["sui"]]
-    last = None
-    for url in urls:
-        try:
-            res = await _rpc_once(url, "sui", method, params)
-        except ExchangeError as e:
-            if not _sui_unsupported(e):
-                raise  # нода ответила по существу (нет монет, ошибка транзакции…)
-            last = e
-            continue
-        except Exception as e:
-            last = e
-            continue
-        RPC_URLS["sui"] = url
-        return res
-    raise ExchangeError(f"Sui: ни одна нода не выполнила {method} — официальные ноды закрыли JSON-RPC. "
-                        f"Нужна нода с JSON-RPC: задай переменную SUI_RPC_URL (например, бесплатный ключ "
-                        f"BlockVision / QuickNode / Ankr). Последняя ошибка: {str(last)[:150]}")
-
-
-SUI_GRAPHQL = "https://graphql.mainnet.sui.io/graphql"
-
-
-async def _sui_gql(query, variables):
-    async with http().post(SUI_GRAPHQL, json={"query": query, "variables": variables}, timeout=TIMEOUT) as r:
-        data = await r.json(content_type=None)
-    if data.get("errors"):
-        raise ExchangeError(f"Sui GraphQL: {str(data['errors'])[:200]}")
-    return data.get("data") or {}
-
-
 async def rpc(net, method, params):
     """JSON-RPC к ноде сети. Если нода не отвечает, а у сети есть проверенные
     запасные (сети, найденные автоматически), — пробуем их и переходим на рабочую."""
-    if net == "sui":
-        return await _sui_rpc(method, params)
     try:
         return await _rpc_once(RPC_URLS[net], net, method, params)
     except ExchangeError:
@@ -986,56 +933,149 @@ def sui_sign(tx_bytes_b64):
     return base64.b64encode(b"\x00" + priv.sign(digest) + pub).decode()
 
 
-async def sui_balance(coin_type):
-    coin_type = coin_type or SUI_NATIVE_TYPE
+# ---- Sui через GraphQL ----
+# JSON-RPC на нодах Sui отключён (полное удаление — середина октября 2026), поэтому всё
+# через GraphQL RPC: баланс, монеты, цена газа, отправка. Транзакцию перевода
+# (programmable transaction) собираем и сериализуем в BCS сами, подписываем ed25519.
+
+def _uleb(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _sui_addr(a):
+    return bytes.fromhex(a[2:].rjust(64, "0") if a.startswith("0x") else a.rjust(64, "0"))
+
+
+def _sui_objref(c):
+    """ObjectRef = (ObjectID, SequenceNumber u64, ObjectDigest — 32 байта с длиной)."""
+    digest = b58decode(c["digest"])
+    return _sui_addr(c["id"]) + int(c["version"]).to_bytes(8, "little") + _uleb(len(digest)) + digest
+
+
+def sui_transfer_bytes(sender, to, coin_type, coins, gas_coins, gas_price, gas_budget):
+    """BCS TransactionData::V1 с programmable transaction:
+      * SUI целиком: оплата газа всеми монетами SUI, TransferObjects([GasCoin], to) —
+        получателю уходит всё, кроме газа;
+      * токен: MergeCoins всех монет токена в первую, TransferObjects([первая], to),
+        газ — монетами SUI."""
+    if coin_type == SUI_NATIVE_TYPE:
+        inputs = [b"\x00" + _uleb(32) + _sui_addr(to)]                       # Pure(адрес)
+        cmds = [b"\x01" + _uleb(1) + b"\x00" + b"\x01" + (0).to_bytes(2, "little")]  # Transfer([Gas], In0)
+        payment = coins
+    else:
+        inputs = [b"\x01\x00" + _sui_objref(c) for c in coins]                  # Object(ImmOrOwned)
+        inputs.append(b"\x00" + _uleb(32) + _sui_addr(to))
+        arg = lambda i: b"\x01" + i.to_bytes(2, "little")                      # Argument::Input(i)
+        cmds = []
+        if len(coins) > 1:                                                      # MergeCoins(In0, [In1..])
+            cmds.append(b"\x03" + arg(0) + _uleb(len(coins) - 1) + b"".join(arg(i) for i in range(1, len(coins))))
+        cmds.append(b"\x01" + _uleb(1) + arg(0) + arg(len(coins)))           # TransferObjects([In0], to)
+        payment = gas_coins
+    pt = _uleb(len(inputs)) + b"".join(inputs) + _uleb(len(cmds)) + b"".join(cmds)
+    gas = (_uleb(len(payment)) + b"".join(_sui_objref(c) for c in payment) + _sui_addr(sender)
+           + int(gas_price).to_bytes(8, "little") + int(gas_budget).to_bytes(8, "little"))
+    # TransactionData::V1, TransactionKind::ProgrammableTransaction, …, TransactionExpiration::None
+    return b"\x00" + b"\x00" + pt + _sui_addr(sender) + gas + b"\x00"
+
+
+SUI_GRAPHQL = os.environ.get("SUI_GRAPHQL_URL") or "https://graphql.mainnet.sui.io/graphql"
+
+
+async def _sui_gql(query):
+    async with http().post(SUI_GRAPHQL, json={"query": query}, timeout=TIMEOUT) as r:
+        text = await r.text()
     try:
-        res = await rpc("sui", "suix_getBalance", [sui_keys()[2], coin_type])
-        return int(res.get("totalBalance", 0))
-    except ExchangeError:
-        # Ни одна нода с JSON-RPC — баланс через официальный GraphQL.
-        data = await _sui_gql("query($a: SuiAddress!, $t: String!) { address(address: $a) "
-                              "{ balance(type: $t) { totalBalance } } }", {"a": sui_keys()[2], "t": coin_type})
-        return int((((data.get("address") or {}).get("balance")) or {}).get("totalBalance") or 0)
+        data = json.loads(text)
+    except Exception:
+        raise ExchangeError(f"Sui GraphQL: HTTP {r.status} {text[:200]}")
+    if data.get("errors"):
+        raise ExchangeError(f"Sui GraphQL: {str(data['errors'])[:300]}")
+    return data.get("data") or {}
+
+
+def _gq(v):
+    return json.dumps(str(v))  # строка для подстановки в запрос GraphQL (в кавычках, экранированная)
+
+
+async def sui_balance(coin_type):
+    """Баланс в монетах-объектах (coinBalance) — именно их бот умеет переслать.
+    Средства «на балансе адреса» (addressBalance) перевод монетами не трогает."""
+    data = await _sui_gql(f"{{ address(address: {_gq(sui_keys()[2])}) {{ balance(coinType: "
+                          f"{_gq(coin_type or SUI_NATIVE_TYPE)}) {{ coinBalance totalBalance }} }} }}")
+    bal = ((data.get("address") or {}).get("balance")) or {}
+    return int(bal.get("coinBalance") if bal.get("coinBalance") is not None else bal.get("totalBalance") or 0)
 
 
 async def sui_decimals(coin_type):
     if not coin_type or coin_type == SUI_NATIVE_TYPE:
         return 9
-    try:
-        meta = await rpc("sui", "suix_getCoinMetadata", [coin_type])
-        return int(meta["decimals"])
-    except ExchangeError:
-        data = await _sui_gql("query($t: String!) { coinMetadata(coinType: $t) { decimals } }", {"t": coin_type})
-        return int((data.get("coinMetadata") or {})["decimals"])
+    data = await _sui_gql(f"{{ coinMetadata(coinType: {_gq(coin_type)}) {{ decimals }} }}")
+    meta = data.get("coinMetadata")
+    if not meta or meta.get("decimals") is None:
+        raise ExchangeError(f"Sui: нет данных о токене {coin_type}")
+    return int(meta["decimals"])
+
+
+async def sui_coins(owner, coin_type):
+    """Монеты (объекты Coin<T>) адреса: [{id, version, digest, balance}]."""
+    out, after = [], None
+    while True:
+        page = f", after: {_gq(after)}" if after else ""
+        data = await _sui_gql(
+            f"{{ objects(filter: {{owner: {_gq(owner)}, type: {_gq('0x2::coin::Coin<' + coin_type + '>')}}}, "
+            f"first: 50{page}) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ address version digest "
+            f"asMoveObject {{ contents {{ json }} }} }} }} }}")
+        conn = data.get("objects") or {}
+        for n in conn.get("nodes") or []:
+            js = (((n.get("asMoveObject") or {}).get("contents")) or {}).get("json") or {}
+            out.append({"id": n["address"], "version": n["version"], "digest": n["digest"],
+                        "balance": int(js.get("balance") or 0)})
+        info = conn.get("pageInfo") or {}
+        if not info.get("hasNextPage") or len(out) >= 500:
+            return out
+        after = info.get("endCursor")
+
+
+SUI_GAS_BUDGET = 10_000_000  # 0.01 SUI — потолок газа на простой перевод (списывается фактический)
 
 
 async def sui_send_all(coin_type, to):
-    addr = sui_keys()[2]
+    _, _, addr = sui_keys()
     coin_type = coin_type or SUI_NATIVE_TYPE
-    coins, cursor = [], None
-    while True:
-        page = await rpc("sui", "suix_getCoins", [addr, coin_type, cursor, 50])
-        coins += page.get("data", [])
-        if not page.get("hasNextPage"):
-            break
-        cursor = page.get("nextCursor")
+    coins = [c for c in await sui_coins(addr, coin_type) if c["balance"] > 0]
     if not coins:
         raise ExchangeError("Sui: на кошельке нет монет для пересылки")
-    ids = [c["coinObjectId"] for c in coins]
-    total = sum(int(c["balance"]) for c in coins)
-    gas_budget = "20000000"
+    epoch = (await _sui_gql("{ epoch { referenceGasPrice } }")).get("epoch") or {}
+    gas_price = int(epoch.get("referenceGasPrice") or 1000)
+    total = sum(c["balance"] for c in coins)
     if coin_type == SUI_NATIVE_TYPE:
-        tx = await rpc("sui", "unsafe_payAllSui", [addr, ids, to, gas_budget])
-        amount = total - int(gas_budget)
+        coins = coins[:250]  # оплата газа — не больше 256 объектов
+        total = sum(c["balance"] for c in coins)
+        if total <= SUI_GAS_BUDGET:
+            raise ExchangeError("Sui: SUI на кошельке меньше, чем нужно на газ")
+        gas_coins, amount = coins, total - SUI_GAS_BUDGET  # точнее — за вычетом фактического газа
     else:
-        tx = await rpc("sui", "unsafe_pay", [addr, ids, [to], [str(total)], None, gas_budget])
+        gas_coins = sorted([c for c in await sui_coins(addr, SUI_NATIVE_TYPE) if c["balance"] > 0],
+                           key=lambda c: -c["balance"])[:50]
+        if sum(c["balance"] for c in gas_coins) < SUI_GAS_BUDGET:
+            raise ExchangeError("Sui: на кошельке нет SUI на газ для перевода токена")
+        coins = coins[:500]
         amount = total
-    res = await rpc("sui", "sui_executeTransactionBlock", [
-        tx["txBytes"], [sui_sign(tx["txBytes"])], {"showEffects": True}, "WaitForLocalExecution"])
-    status = ((res.get("effects") or {}).get("status") or {})
-    if status.get("status") != "success":
-        raise ExchangeError(f"Sui: транзакция не прошла: {status.get('error') or res}")
-    return res.get("digest"), amount
+    tx = sui_transfer_bytes(addr, to, coin_type, coins, gas_coins, gas_price, SUI_GAS_BUDGET)
+    tx_b64 = base64.b64encode(tx).decode()
+    res = await _sui_gql(
+        f"mutation {{ executeTransaction(transactionDataBcs: {_gq(tx_b64)}, signatures: [{_gq(sui_sign(tx_b64))}]) "
+        f"{{ effects {{ status transaction {{ digest }} }} }} }}")
+    eff = (res.get("executeTransaction") or {}).get("effects") or {}
+    if str(eff.get("status", "")).upper() != "SUCCESS":
+        raise ExchangeError(f"Sui: транзакция не прошла: {str(res)[:300]}")
+    return (eff.get("transaction") or {}).get("digest"), amount
 
 
 # ---- Cosmos Hub (ATOM) ----
