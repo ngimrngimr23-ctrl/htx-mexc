@@ -414,6 +414,42 @@ async def htx_depth(sym):
     return bids, asks
 
 
+_my_asks_cache = {}
+
+
+async def htx_my_asks(sym):
+    """Наши открытые ордера на продажу по паре на HTX: {цена: остаток}. Кэш 3 сек."""
+    hit = _my_asks_cache.get(sym)
+    if hit and time.time() - hit[0] < 3:
+        return hit[1]
+    rows = await htx_req("GET", "/v1/order/openOrders", {
+        "account-id": str(await htx_account_id()), "symbol": sym.lower(), "side": "sell", "size": 500}) or []
+    mine = {}
+    for o in rows:
+        left = D(str(o.get("amount") or 0)) - D(str(o.get("filled-amount") or o.get("field-amount") or 0))
+        if left > 0:
+            p = D(str(o.get("price") or 0)).normalize()
+            mine[p] = mine.get(p, D(0)) + left
+    _my_asks_cache[sym] = (time.time(), mine)
+    return mine
+
+
+async def without_my_asks(sym, asks):
+    """Стакан продавцов HTX, у которых можно купить, не задев НАШИ ордера на продажу:
+    только цены строго ниже нашего самого дешёвого ордера. Ордер «исполнить сразу»
+    с ценой P сводится со всеми продавцами до P — в том числе с нашим, если он
+    дешевле или на той же цене раньше в очереди. Если свои ордера узнать не
+    удалось — считаем, что их нет (как раньше)."""
+    try:
+        mine = await htx_my_asks(sym)
+    except Exception:
+        return asks
+    if not mine:
+        return asks
+    cut = min(mine)
+    return [(p, q) for p, q in asks if D(p) < cut]
+
+
 async def htx_place(sym, order_type, amount, price=None):
     body = {
         "account-id": str(await htx_account_id()),
@@ -2169,6 +2205,11 @@ async def check_opportunity(coin, cfg):
         return None
     mexc_bid = mbids[0][0]
     max_price = mexc_bid / (1 + D(cfg["pct"]) / 100)
+    if hasks[0][0] <= max_price:
+        # Продавец по нужной цене есть — проверяем, не наш ли это ордер.
+        hasks = await without_my_asks(hpair, hasks)
+        if not hasks:
+            return None
     base = {"mexc_bid": mexc_bid, "max_price": max_price, "asks": hasks, "bids": mbids, "pct": D(cfg["pct"])}
     if hasks[0][0] <= max_price:
         # Продавцы в пределах процента — можно выкупать сразу.
@@ -2646,7 +2687,10 @@ async def buy_step(d):
             await _stop_buying(d, "весь баланс USDT на HTX потрачен")
         return
 
-    # 1) Есть продавцы в пределах процента — выкупаем сразу.
+    # 1) Есть продавцы в пределах процента — выкупаем сразу (только чужих: свои ордера
+    #    на продажу из стакана вычитаем).
+    if hasks and hasks[0][0] <= max_price:
+        hasks = await without_my_asks(hpair, hasks)
     if hasks and hasks[0][0] <= max_price:
         await _cancel_order(d)
         free_usdt, _ = await htx_balance("usdt")
