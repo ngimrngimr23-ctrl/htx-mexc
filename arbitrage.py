@@ -752,9 +752,62 @@ async def _rpc_once(url, net, method, params):
     return data.get("result")
 
 
+# Sui закрыл JSON-RPC на своих публичных нодах — держим список сторонних нод, где он
+# ещё работает. Своя нода (с ключом провайдера) — переменная SUI_RPC_URL, она первая.
+SUI_RPCS = [u for u in [os.environ.get("SUI_RPC_URL"),
+                        "https://sui-rpc.publicnode.com",
+                        "https://rpc-mainnet.suiscan.xyz",
+                        "https://sui-mainnet-endpoint.blockvision.org",
+                        "https://mainnet.suiet.app",
+                        "https://sui-mainnet.nodeinfra.com",
+                        "https://fullnode.mainnet.sui.io:443"] if u]
+
+
+def _sui_unsupported(e):
+    t = str(e).lower()
+    return "-32601" in t or "method not found" in t or "deprecated" in t or "not supported" in t \
+        or "not available" in t or "unauthorized" in t or "rate limit" in t or "429" in t
+
+
+async def _sui_rpc(method, params):
+    """JSON-RPC Sui по очереди через ноды из SUI_RPCS: «метод не найден / JSON-RPC
+    отключён» или нода не отвечает — пробуем следующую и запоминаем рабочую."""
+    urls = [RPC_URLS["sui"]] + [u for u in SUI_RPCS if u != RPC_URLS["sui"]]
+    last = None
+    for url in urls:
+        try:
+            res = await _rpc_once(url, "sui", method, params)
+        except ExchangeError as e:
+            if not _sui_unsupported(e):
+                raise  # нода ответила по существу (нет монет, ошибка транзакции…)
+            last = e
+            continue
+        except Exception as e:
+            last = e
+            continue
+        RPC_URLS["sui"] = url
+        return res
+    raise ExchangeError(f"Sui: ни одна нода не выполнила {method} — официальные ноды закрыли JSON-RPC. "
+                        f"Нужна нода с JSON-RPC: задай переменную SUI_RPC_URL (например, бесплатный ключ "
+                        f"BlockVision / QuickNode / Ankr). Последняя ошибка: {str(last)[:150]}")
+
+
+SUI_GRAPHQL = "https://graphql.mainnet.sui.io/graphql"
+
+
+async def _sui_gql(query, variables):
+    async with http().post(SUI_GRAPHQL, json={"query": query, "variables": variables}, timeout=TIMEOUT) as r:
+        data = await r.json(content_type=None)
+    if data.get("errors"):
+        raise ExchangeError(f"Sui GraphQL: {str(data['errors'])[:200]}")
+    return data.get("data") or {}
+
+
 async def rpc(net, method, params):
     """JSON-RPC к ноде сети. Если нода не отвечает, а у сети есть проверенные
     запасные (сети, найденные автоматически), — пробуем их и переходим на рабочую."""
+    if net == "sui":
+        return await _sui_rpc(method, params)
     try:
         return await _rpc_once(RPC_URLS[net], net, method, params)
     except ExchangeError:
@@ -934,15 +987,26 @@ def sui_sign(tx_bytes_b64):
 
 
 async def sui_balance(coin_type):
-    res = await rpc("sui", "suix_getBalance", [sui_keys()[2], coin_type or SUI_NATIVE_TYPE])
-    return int(res.get("totalBalance", 0))
+    coin_type = coin_type or SUI_NATIVE_TYPE
+    try:
+        res = await rpc("sui", "suix_getBalance", [sui_keys()[2], coin_type])
+        return int(res.get("totalBalance", 0))
+    except ExchangeError:
+        # Ни одна нода с JSON-RPC — баланс через официальный GraphQL.
+        data = await _sui_gql("query($a: SuiAddress!, $t: String!) { address(address: $a) "
+                              "{ balance(type: $t) { totalBalance } } }", {"a": sui_keys()[2], "t": coin_type})
+        return int((((data.get("address") or {}).get("balance")) or {}).get("totalBalance") or 0)
 
 
 async def sui_decimals(coin_type):
     if not coin_type or coin_type == SUI_NATIVE_TYPE:
         return 9
-    meta = await rpc("sui", "suix_getCoinMetadata", [coin_type])
-    return int(meta["decimals"])
+    try:
+        meta = await rpc("sui", "suix_getCoinMetadata", [coin_type])
+        return int(meta["decimals"])
+    except ExchangeError:
+        data = await _sui_gql("query($t: String!) { coinMetadata(coinType: $t) { decimals } }", {"t": coin_type})
+        return int((data.get("coinMetadata") or {})["decimals"])
 
 
 async def sui_send_all(coin_type, to):
