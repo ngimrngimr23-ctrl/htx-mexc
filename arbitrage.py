@@ -2697,12 +2697,31 @@ async def buy_step(d):
         budget = free_usdt * D("0.995")
         if d["probe_left"] is not None:
             budget = min(budget, D(d["probe_left"]))
-        if arb.get("mexc_depth", True):
-            qty, _, last = plan_buy(hasks, max_price, budget, mbids, pct)
-            price = min(max_price, round_up(last, tick)) if last is not None else max_price
+        # Покупаем только объём, который выгодно сразу вывести: комиссию вывода
+        # раскладываем на РЕАЛЬНУЮ покупку (+ уже купленное, не выведенное), а не на
+        # весь баланс; цена от этого строже — пересчитываем, пока не сойдётся.
+        base_pct, unw_c = D(cfg["pct"]), _dd(d, "unw_cost")
+        wd_fee = D(d["wd_fee"]) if d.get("wd_fee") is not None else None
+        cap_pct = base_pct
+        for _ in range(5):
+            cap = round_down(mbids[0][0] / (1 + cap_pct / 100), tick)
+            if arb.get("mexc_depth", True):
+                qty, cost, last = plan_buy(hasks, cap, budget, mbids, cap_pct)
+            else:
+                qty, cost, last = plan_buy(hasks, cap, budget)
+            need_pct = base_pct + (fee_extra_pct(wd_fee, mbids[0][0], unw_c + cost)
+                                   if wd_fee is not None and unw_c + cost > 0 else D(0))
+            if need_pct <= cap_pct + D("0.0001"):
+                break
+            cap_pct = need_pct
         else:
-            qty, _, _ = plan_buy(hasks, max_price, budget)
-            price = max_price
+            qty = D(0)
+        if unw_c + cost < D(arb["batch_usd"]) or qty <= 0:
+            # Продавцов по нужной цене меньше, чем на партию для вывода — мелочь не берём,
+            # ждём, пока их станет больше.
+            await _idle(d, f"продавцов по нужной цене меньше, чем на партию {fmt(D(arb['batch_usd']))}$")
+            return
+        price = min(cap, round_up(last, tick)) if (last is not None and arb.get("mexc_depth", True)) else cap
         qty = round_down(qty, info["step"])
         if qty > 0 and qty >= info["min_qty"] and qty * price >= info["min_value"]:
             d["ioc"] = "pending"
