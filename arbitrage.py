@@ -2236,6 +2236,8 @@ def plan_buy(asks, max_price, budget, bids=None, pct=None):
             matched = D(0)
             while bi < len(bids) and bids[bi][0] >= need and matched < avail:
                 t = min(bid_left, avail - matched)
+                if matched + t == matched:  # хвост за пределами точности — дальше не сдвинемся
+                    break
                 matched += t
                 bid_left -= t
                 if bid_left <= 0:
@@ -2463,7 +2465,7 @@ async def try_start(coin, cfg, opp, check_only=False):
         usdt_free = D(0)
     carry = arb.get("carry", {}).get(coin)
     have = usdt_free * D("0.995") + (D(carry["cost"]) if carry else 0)
-    if have < D(arb["batch_usd"]):
+    if have < D(5):
         if not check_only:
             await note_once(f"nousdt:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но на HTX свободно только "
                                               f"{fmt(usdt_free)} USDT (деньги в другой сделке или ждут пополнения) — "
@@ -2488,6 +2490,7 @@ async def try_start(coin, cfg, opp, check_only=False):
         return True
     d = new_deal(coin, cfg, res)
     d["wd_fee"] = str(res["htx_fee"])
+    d["wd_min"] = str(res["htx_min_withdraw"])
     await _take_carry(d)
     deals[coin] = d
     await save()
@@ -2716,10 +2719,13 @@ async def buy_step(d):
             cap_pct = need_pct
         else:
             qty = D(0)
-        if unw_c + cost < D(arb["batch_usd"]) or qty <= 0:
-            # Продавцов по нужной цене меньше, чем на партию для вывода — мелочь не берём,
-            # ждём, пока их станет больше.
-            await _idle(d, f"продавцов по нужной цене меньше, чем на партию {fmt(D(arb['batch_usd']))}$")
+        # Вывести можно не меньше минимума HTX (плюс комиссия сверху); торговая
+        # комиссия монетами съест ~0.2% — берём с запасом.
+        wd_min = D(d.get("wd_min") or 0) + (wd_fee or D(0))
+        if qty <= 0 or cost <= 0 or (_dd(d, "unw_qty") + qty * D("0.997")) < wd_min:
+            # Объём у продавцов по цене, дающей твой % ПОСЛЕ комиссии вывода, слишком мал
+            # (или меньше минимума вывода HTX) — не покупаем, ждём.
+            await _idle(d, "продавцов по цене, выгодной с учётом комиссии вывода, нет")
             return
         price = min(cap, round_up(last, tick)) if (last is not None and arb.get("mexc_depth", True)) else cap
         qty = round_down(qty, info["step"])
@@ -2773,7 +2779,11 @@ def _worth_withdrawing(d, mexc_bid, final=False):
       * покупка закончилась (final=True) — всё разом, если комиссия не абсурдная
         (≤ FEE_SANE_PCT партии; на HTX остаётся только совсем мелочь)."""
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
-    if unw_q <= 0 or unw_c < D(arb["batch_usd"]):
+    # Пока покупка идёт — частями от batch_usd; после покупки — любой объём, который
+    # HTX даст вывести (выгодность с комиссией уже проверена при покупке).
+    if unw_q <= 0 or unw_c < (D(1) if final else D(arb["batch_usd"])):
+        return False
+    if final and unw_q - D(d.get("wd_fee") or 0) < D(d.get("wd_min") or 0):
         return False
     if d.get("wd_fee") is None:  # сделка из старой версии
         return unw_c >= D(d.get("min_batch") or arb["batch_usd"])
@@ -2801,6 +2811,7 @@ async def flush_carry(coin, cfg):
             return
         d = new_deal(coin, cfg, res)
         d["wd_fee"] = str(res["htx_fee"])
+        d["wd_min"] = str(res["htx_min_withdraw"])
         d["buying"] = False
         await _take_carry(d)
         bid = mbids[0][0]
@@ -2861,7 +2872,7 @@ async def _stop_buying(d, why):
             arb.setdefault("carry", {})[d["coin"]] = {"qty": str(unw_q), "cost": str(unw_c)}
             d["unw_qty"] = d["unw_cost"] = "0"
             fee = D(d.get("wd_fee") or 0) * mbid
-            why_not = (f"меньше партии {fmt(D(arb['batch_usd']))}$" if unw_c < D(arb["batch_usd"]) else
+            why_not = ("меньше минимума вывода HTX" if unw_q - D(d.get("wd_fee") or 0) < D(d.get("wd_min") or 0) else
                        f"комиссия вывода ~{fmt(fee)}$ — больше {FEE_SANE_PCT}% от суммы")
             # Не чаще раза в час на монету: мелкие докупки повторяются часто, а
             # отложенное видно в /arb (📦).
