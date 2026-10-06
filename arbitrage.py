@@ -2271,7 +2271,7 @@ _skip_notes = {}
 # Почему бот сейчас не покупает монету: {монета: (когда, текст)} — для /arb.
 # В чат такие причины пишутся редко (note_once), а тут видна свежая.
 why_not = {}
-_INFO_KEYS = ("addr1",)  # это не отказ, а пояснение
+_INFO_KEYS = ("addr1", "carrymsg")  # это не отказ, а пояснение
 
 
 def _html_to_text(t):
@@ -2844,9 +2844,13 @@ async def _stop_buying(d, why):
             fee = D(d.get("wd_fee") or 0) * mbid
             why_not = (f"меньше партии {fmt(D(arb['batch_usd']))}$" if unw_c < D(arb["batch_usd"]) else
                        f"комиссия вывода ~{fmt(fee)}$ — больше {FEE_SANE_PCT}% от суммы")
-            await notify(f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}). {fmt(unw_q)} шт. на {fmt(unw_c)}$ "
-                         f"не вывожу: {why_not}. Лежат на HTX, следующая сделка по {d['coin']} докупит "
-                         f"и выведет всё одной партией.")
+            # Не чаще раза в час на монету: мелкие докупки повторяются часто, а
+            # отложенное видно в /arb (📦).
+            await note_once(f"carrymsg:{d['coin']}",
+                            f"ℹ️ <b>{d['coin']}</b>: покупка закончена ({why}). {fmt(unw_q)} шт. на {fmt(unw_c)}$ "
+                            f"не вывожу: {why_not}. Лежат на HTX, следующая сделка по {d['coin']} докупит "
+                            f"и выведет всё одной партией. (Дальше по {d['coin']} об этом — не чаще раза в час, "
+                            f"отложенное видно в /arb.)", every=3600)
             await save()
             return
     if _dd(d, "bought_qty") > 0:
