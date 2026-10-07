@@ -2871,6 +2871,9 @@ async def _stop_buying(d, why):
             # Вывод такой партии съест выгоду — не выводим, копим до следующей сделки.
             arb.setdefault("carry", {})[d["coin"]] = {"qty": str(unw_q), "cost": str(unw_c)}
             d["unw_qty"] = d["unw_cost"] = "0"
+            if _dd(d, "bought_qty") <= 0:
+                await save()
+                return  # в этой сделке ничего не куплено — старый остаток просто лёг обратно, молча
             fee = D(d.get("wd_fee") or 0) * mbid
             why_not = ("меньше минимума вывода HTX" if unw_q - D(d.get("wd_fee") or 0) < D(d.get("wd_min") or 0) else
                        f"комиссия вывода ~{fmt(fee)}$ — больше {FEE_SANE_PCT}% от суммы")
