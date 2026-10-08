@@ -2273,7 +2273,7 @@ _skip_notes = {}
 # Почему бот сейчас не покупает монету: {монета: (когда, текст)} — для /arb.
 # В чат такие причины пишутся редко (note_once), а тут видна свежая.
 why_not = {}
-_INFO_KEYS = ("addr1", "carrymsg")  # это не отказ, а пояснение
+_INFO_KEYS = ("addr1", "carrymsg", "dealerr", "auth")  # это не отказ по монете, а пояснение
 
 
 def _html_to_text(t):
@@ -2294,6 +2294,31 @@ async def note_once(key, text, every=1800):
 
 
 engine_state = {"last_pass": 0.0}
+
+# Ошибки ключа API: ключ удалён / истёк (MEXC отключает ключ без привязки к IP через
+# 90 дней) / нет прав / неверная подпись. Повтор не поможет — нужен новый ключ.
+_AUTH_MARKERS = ("10072", "700002", "700007", "api key info invalid", "invalid api-key",
+                 "api-signature-not-valid", "invalid-access-key", "login-required", "api-key-invalid")
+
+
+def is_auth_error(e):
+    t = str(e).lower()
+    return any(m in t for m in _AUTH_MARKERS)
+
+
+async def notify_auth_error(e):
+    """Один раз в час на биржу — вместо ошибки от каждой сделки каждые 5 минут."""
+    t = str(e)
+    ex = "MEXC" if "MEXC" in t else "HTX" if "HTX" in t else "биржи"
+    stuck = ", ".join(sorted(deals)) or "—"
+    await note_once(f"auth:{ex}", (
+        f"⛔ <b>Ключ API {ex} не принимается</b>: <code>{html.escape(t[:200])}</code>\n"
+        f"Пока ключ не заменят, сделки стоят (повторяю сами, монеты никуда не деваются): {stuck}.\n"
+        f"Что сделать: создай на {ex} новый API-ключ (права: просмотр аккаунта, спот-торговля, просмотр "
+        f"депозитов{' и вывод' if ex == 'HTX' else ''}), впиши его в Render в "
+        f"{'MEXC_API_KEY / MEXC_API_SECRET' if ex == 'MEXC' else 'HTX_API_KEY / HTX_API_SECRET'} и перезапусти бота.\n"
+        f"Чтобы ключ не отключался через 90 дней, привяжи его к IP сервера (Render → сервис → Connect → "
+        f"Outbound IP).\nОб этом — не чаще раза в час."), every=3600)
 PAUSE_SEC = 300
 # Продажа по ордерам на покупку MEXC (если цели нет, но покупателей много):
 # лимитка по лучшему покупателю, ждём SELL_HOLD_SEC; потом по следующему
@@ -2482,6 +2507,9 @@ async def try_start(coin, cfg, opp, check_only=False):
     try:
         await mexc_free(coin)
     except ExchangeError as e:
+        if is_auth_error(e):
+            await notify_auth_error(e)
+            return False
         await note_once("mexc_perm", f"⛔ Не начинаю сделки: ключ MEXC не видит баланс — <code>{e}</code>\n"
                                      f"Включи ключу на MEXC право «Аккаунт: просмотр информации об аккаунте» "
                                      f"(и «Спот: торговля», «Кошелёк: просмотр депозитов»).", every=1800)
@@ -2571,8 +2599,15 @@ async def run_deal(d):
                 break
         except Exception as e:
             print(f"[arb] сделка {d['coin']}: {traceback.format_exc()}", flush=True)
-            await note_once(f"deal_err:{d['id']}", f"⚠️ <b>{d['coin']}</b>: ошибка в сделке: <code>{e}</code>\n"
-                                                    f"Повторю через 15 сек.", every=300)
+            if is_auth_error(e):
+                await notify_auth_error(e)
+            else:
+                # Одна и та же ошибка у разных сделок — одно сообщение раз в 30 мин., а не по
+                # сообщению от каждой сделки каждые 5 мин.
+                key = re.sub(r"\d{5,}", "#", str(e))[:150]
+                await note_once(f"dealerr:{key}", f"⚠️ <b>{d['coin']}</b>: ошибка в сделке: "
+                                                  f"<code>{html.escape(str(e)[:300])}</code>\nПовторяю каждые 15 сек.; "
+                                                  f"об этой ошибке — не чаще раза в 30 мин.", every=1800)
             await asyncio.sleep(15)
             continue
         await asyncio.sleep(arb["poll_sec"] if d["buying"] or d["sell"] else 3)
