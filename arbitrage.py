@@ -49,11 +49,11 @@ router = Router()
 # HTX: ключ с правами Read + Trade + Withdraw, привязанный к IP сервера. На HTX
 # обязательно включить вывод только на адреса из адресной книги и добавить туда
 # адреса кошельков бота (EVM и Sui) — тогда даже утёкший ключ не выведет чужому.
-HTX_API_KEY = os.environ.get("HTX_API_KEY")
-HTX_API_SECRET = os.environ.get("HTX_API_SECRET")
+HTX_API_KEY = (os.environ.get("HTX_API_KEY") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
+HTX_API_SECRET = (os.environ.get("HTX_API_SECRET") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
 # MEXC: достаточно Read + Trade. Права на вывод НЕ нужны.
-MEXC_API_KEY = os.environ.get("MEXC_API_KEY")
-MEXC_API_SECRET = os.environ.get("MEXC_API_SECRET")
+MEXC_API_KEY = (os.environ.get("MEXC_API_KEY") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
+MEXC_API_SECRET = (os.environ.get("MEXC_API_SECRET") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
 # Кошельки бота: один EVM-ключ на ETH/BNB/Monad (адрес одинаковый) + ключ Sui.
 EVM_PRIVATE_KEY = os.environ.get("EVM_PRIVATE_KEY")
 SUI_PRIVATE_KEY = os.environ.get("SUI_PRIVATE_KEY")
@@ -2310,7 +2310,7 @@ async def notify_auth_error(e):
     """Один раз в час на биржу — вместо ошибки от каждой сделки каждые 5 минут."""
     t = str(e)
     ex = "MEXC" if "MEXC" in t else "HTX" if "HTX" in t else "биржи"
-    stuck = ", ".join(sorted(deals)) or "—"
+    stuck = ", ".join(sorted(deals)) or "новые сделки не начинаются"
     await note_once(f"auth:{ex}", (
         f"⛔ <b>Ключ API {ex} не принимается</b>: <code>{html.escape(t[:200])}</code>\n"
         f"Пока ключ не заменят, сделки стоят (повторяю сами, монеты никуда не деваются): {stuck}.\n"
@@ -2359,6 +2359,9 @@ async def engine_loop():
                             await notify(f"🔎 <b>{coin}</b>: на HTX это <b>{res['htx_ticker']}</b>, пара "
                                          f"<code>{res['htx_pair']}</code> — дальше считаю спред по ней.")
                         except Exception as e:
+                            if is_auth_error(e):
+                                await notify_auth_error(e)
+                                continue
                             await note_once(f"res:{coin}", f"⚠️ <b>{coin}</b>: не удалось найти монету на HTX: {e}",
                                             every=1800)
                 for c in list(arb.get("carry", {})):
@@ -2418,6 +2421,9 @@ async def try_start(coin, cfg, opp, check_only=False):
                         every=3 * 3600)
         return False
     except Exception as e:
+        if is_auth_error(e):
+            await notify_auth_error(e)  # одно сообщение на все монеты, раз в час
+            return False
         await note_once(f"cfg:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}% есть, но сделку начать нельзя:\n{e}")
         return False
     if res["htx_ticker_auto"]:

@@ -26,8 +26,8 @@ if not BOT_TOKEN:
 # Опционально: read-only ключ MEXC для проверки реальных контрактов монет
 # (эндпоинт /api/v3/capital/config/getall — ПОДПИСЫВАЕМЫЙ, без ключа недоступен).
 # Если не заданы — бот просто не проверяет контракты и работает как раньше.
-MEXC_API_KEY = os.environ.get("MEXC_API_KEY")
-MEXC_API_SECRET = os.environ.get("MEXC_API_SECRET")
+MEXC_API_KEY = (os.environ.get("MEXC_API_KEY") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
+MEXC_API_SECRET = (os.environ.get("MEXC_API_SECRET") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
 
 # Опционально: Upstash Redis (REST API) для сохранения настроек/ЧС/мутов между
 # перезапусками (Render на бесплатном тарифе перезапускает процесс регулярно —
