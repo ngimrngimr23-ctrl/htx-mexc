@@ -2897,6 +2897,11 @@ async def _take_carry(d):
 async def _stop_buying(d, why):
     await _cancel_order(d)
     d["buying"] = False
+    if _dd(d, "unw_qty") > 0:
+        try:
+            await _absorb_htx_rest(d)
+        except Exception:
+            pass
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
     if unw_q > 0:
         try:
@@ -2907,11 +2912,11 @@ async def _stop_buying(d, why):
         if _worth_withdrawing(d, mbid, final=True):
             await withdraw_batch(d)
         elif unw_c < 1:
-            d["unw_qty"] = d["unw_cost"] = "0"  # пыль после округлений — не откладываем
+            d["unw_qty"] = d["unw_cost"] = d["htx_rest"] = "0"  # пыль после округлений — не откладываем
         else:
             # Вывод такой партии съест выгоду — не выводим, копим до следующей сделки.
             arb.setdefault("carry", {})[d["coin"]] = {"qty": str(unw_q), "cost": str(unw_c)}
-            d["unw_qty"] = d["unw_cost"] = "0"
+            d["unw_qty"] = d["unw_cost"] = d["htx_rest"] = "0"
             if _dd(d, "bought_qty") <= 0:
                 await save()
                 return  # в этой сделке ничего не куплено — старый остаток просто лёг обратно, молча
@@ -2934,15 +2939,36 @@ async def _stop_buying(d, why):
 
 # ---------- вывод партий ----------
 
+async def _absorb_htx_rest(d):
+    """Перед выводом смотрим баланс HTX: всё свободное сверх купленного этой сделкой
+    (остатки прошлых сделок и т.п.) уходит тем же выводом — комиссия вывода
+    фиксированная, оставлять монеты на потом значит платить её ещё раз. Цена таких
+    монет — из отложенных, а без неё — средняя цена этой покупки. Монеты, которые
+    сейчас продаёт аварийная продажа на HTX, не трогаем. Возвращает свободный баланс."""
+    hc = hcoin(d["coin"], d["cfg"])
+    free, _ = await htx_balance(hc)
+    unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
+    extra = free - unw_q
+    if extra <= 0 or unw_q <= 0 or any(r["coin"] == hc for r in rescues):
+        return free
+    cost = extra * unw_c / unw_q
+    c = arb.get("carry", {}).pop(d["coin"], None)
+    if c and D(c["qty"]) > 0:
+        cq = min(D(c["qty"]), extra)
+        cost = D(c["cost"]) * cq / D(c["qty"]) + (extra - cq) * unw_c / unw_q
+    _add(d, "unw_qty", extra)
+    _add(d, "unw_cost", cost)
+    _add(d, "htx_rest", extra)
+    return free
+
+
 async def withdraw_batch(d):
     coin, cfg = d["coin"], d["cfg"]
     res = await resolve_coin(coin, cfg)
     hc = hcoin(coin, cfg)
-    free, _ = await htx_balance(hc)
+    free = await _absorb_htx_rest(d)
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
-    # Выводим только то, что купила эта сделка (HTX уже удержал из него торговую
-    # комиссию монетами), а не весь баланс: чужие монеты без цены покупки
-    # исказили бы безубыток. Комиссию вывода HTX берёт сверху суммы.
+    extra_q = min(_dd(d, "htx_rest"), unw_q)
     base = min(free, unw_q) - res["htx_fee"]
     breakeven = unw_c / unw_q if unw_q > 0 else None
     wid, errors, amount = None, [], D(0)
@@ -2979,11 +3005,12 @@ async def withdraw_batch(d):
     # qty партии — сколько РЕАЛЬНО ушло с HTX: по нему считается безубыток.
     d["batches"].append({"id": str(wid), "at": time.time(), "amount": str(amount),
                          "qty": str(amount), "bought": str(unw_q), "cost": str(unw_c), "ok": False, "fwd": False})
-    d["unw_qty"] = d["unw_cost"] = "0"
+    d["unw_qty"] = d["unw_cost"] = d["htx_rest"] = "0"
     await save()
-    await notify(f"📤 <b>{coin}</b>: вывожу партию {fmt(amount)} шт. (куплено {fmt(unw_q)} шт. на {fmt(unw_c)}$, "
-                 f"остальное — торговая комиссия и комиссия вывода {fmt(res['htx_fee'])} шт.; "
-                 f"безубыток {fmt(unw_c / amount)}) "
+    was = (f"куплено сейчас {fmt(unw_q - extra_q)} шт. + лежало на HTX {fmt(extra_q)} шт., всего на {fmt(unw_c)}$"
+           if extra_q > 0 else f"куплено {fmt(unw_q)} шт. на {fmt(unw_c)}$")
+    await notify(f"📤 <b>{coin}</b>: вывожу всё с HTX — {fmt(amount)} шт. ({was}; "
+                 f"комиссия вывода {fmt(res['htx_fee'])} шт.; безубыток {fmt(unw_c / amount)}) "
                  f"в сети {res['htx_chain']}; проверю через {arb['check_sec']} сек."
                  + (" Ордер на покупку продолжает стоять." if d["order"] else ""))
 
@@ -2992,7 +3019,7 @@ async def _batch_failed(d, breakeven, reason):
     """Вывод не прошёл: покупку прекращаем, монеты на HTX продаём в ноль."""
     await _cancel_order(d)
     d["buying"] = False
-    d["unw_qty"] = d["unw_cost"] = "0"
+    d["unw_qty"] = d["unw_cost"] = d["htx_rest"] = "0"
     r = {"id": uuid.uuid4().hex[:8], "coin": hcoin(d["coin"], d["cfg"]), "symbol": hsym(d["coin"], d["cfg"]),
          "mexc_coin": d["coin"], "breakeven": str(breakeven or 0), "reason": reason,
          "order_id": None, "price": None, "created": time.time()}
