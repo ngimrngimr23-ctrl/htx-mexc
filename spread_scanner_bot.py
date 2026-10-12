@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from aiohttp import web
+import html
 import time
 import os
 import hmac
@@ -600,11 +601,14 @@ async def status_cmd(message: types.Message):
     turnover_display = "Выкл" if settings["min_turnover_usd"] == 0 else f"{settings['min_turnover_usd']:,.0f}$"
     spm_display = "Выкл (общий /sp)" if settings["spread_percent_mexc_to_htx"] == 0 else f"{settings['spread_percent_mexc_to_htx']}%"
     spmax_display = "Выкл" if settings["max_spread_percent"] == 0 else f"{settings['max_spread_percent']}%"
-    upstash_line = (
-        "<b>Подключён</b>" if UPSTASH_REDIS_REST_URL
-        else "<b>⚠️ НЕ НАСТРОЕН</b> — настройки слетят при перезапуске Render "
-             "(задай их через переменные BOT_*, они переживают рестарт)"
-    )
+    if not UPSTASH_REDIS_REST_URL:
+        upstash_line = ("<b>⚠️ НЕ НАСТРОЕН</b> — настройки слетят при перезапуске Render "
+                        "(задай их через переменные BOT_*, они переживают рестарт)")
+    elif redis_state["err"] or not state_loaded["ok"]:
+        upstash_line = (f"<b>⚠️ не отвечает</b>: <code>{html.escape(redis_state['err'] or 'состояние не прочитано')}</code> — "
+                        f"ничего не сохраняю, пока не прочитаю; пробую раз в минуту")
+    else:
+        upstash_line = "<b>Подключён</b>"
     await message.answer(
         "📊 <b>Статус</b>\n"
         f"🏷 Сборка: <code>{BUILD_TAG}</code> · коммит <code>{BUILD_COMMIT}</code>\n"
@@ -1129,9 +1133,18 @@ async def get_mexc_book(symbol):
 
 # ================= UPSTASH (персистентность настроек) =================
 
+# Последняя ошибка Upstash (None — последний запрос прошёл) и прочитано ли
+# состояние при старте: пока не прочитано, ничего не пишем — иначе дефолты
+# затрут настоящие настройки, как только Upstash снова начнёт отвечать.
+redis_state = {"err": None}
+state_loaded = {"ok": False}
+
+
 async def redis_cmd(*args):
     """Одна команда к Upstash Redis через REST API (POST с JSON-массивом
-    команды). Возвращает result или None при ошибке/если Upstash не настроен."""
+    команды). Возвращает result (None — ключа нет) или None, если Upstash не
+    настроен. Ошибку (лимит запросов, неверный токен, обрыв) бросает: «ключа
+    нет» и «не смогли прочитать» — разные вещи, путать их нельзя."""
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return None
     try:
@@ -1141,13 +1154,22 @@ async def redis_cmd(*args):
             headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
             timeout=TIMEOUT_REDIS,
         ) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            return data.get("result")
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                data = {"error": (await resp.text())[:200]}
+            if not isinstance(data, dict):
+                data = {"error": str(data)[:200]}
+            if resp.status != 200 or data.get("error"):
+                raise RuntimeError(data.get("error") or f"HTTP {resp.status}")
     except Exception as e:
-        print(f"Upstash ошибка: {e}", flush=True)
-        return None
+        err = str(e)[:200] or type(e).__name__
+        if redis_state["err"] != err:
+            print(f"Upstash ошибка: {err}", flush=True)
+        redis_state["err"] = err
+        raise
+    redis_state["err"] = None
+    return data.get("result")
 
 
 # Event loop держит на задачи только СЛАБЫЕ ссылки: если не сохранить ссылку на
@@ -1168,7 +1190,7 @@ async def save_state():
     """Сохраняет settings/blacklist/muted_until в Upstash. Вызывается сразу
     после любого изменения (fire-and-forget из команд), плюс раз в проход
     сканера как подстраховка."""
-    if not UPSTASH_REDIS_REST_URL:
+    if not UPSTASH_REDIS_REST_URL or not state_loaded["ok"]:
         return
     await asyncio.gather(
         redis_cmd("SET", "spread_bot:settings", json.dumps(settings)),
@@ -1190,6 +1212,11 @@ async def load_state():
         redis_cmd("GET", "spread_bot:muted"),
         return_exceptions=True,
     )
+    failed = [r for r in (raw_settings, raw_blacklist, raw_muted) if isinstance(r, Exception)]
+    if failed:
+        print(f"--- Upstash не ответил, состояние не прочитано: {failed[0]} — "
+              f"не сохраняю, пока не прочитаю ---", flush=True)
+        return
     try:
         if isinstance(raw_settings, str):
             loaded = json.loads(raw_settings)
@@ -1208,7 +1235,15 @@ async def load_state():
             muted_until.update(json.loads(raw_muted))
     except Exception as e:
         print(f"Upstash: не удалось разобрать muted: {e}", flush=True)
+    state_loaded["ok"] = True
     print("--- Состояние восстановлено из Upstash ---", flush=True)
+
+
+async def retry_load_state():
+    """Upstash не ответил при старте — читаем состояние раз в минуту, пока не выйдет."""
+    while not state_loaded["ok"]:
+        await asyncio.sleep(60)
+        await load_state()
 
 
 # ================= ОСНОВНОЙ ЦИКЛ =================
@@ -1676,6 +1711,7 @@ async def main():
     http_session = aiohttp.ClientSession(connector=connector)
 
     scanner = None
+    state_retry = None
     arb_tasks = []
 
     def _set_chat(chat_id):
@@ -1694,6 +1730,8 @@ async def main():
         # перезапуск Render) → Upstash (живое состояние, выставленное командами).
         apply_env_overrides()
         await load_state()  # восстанавливаем settings/blacklist/muted из Upstash, если настроен
+        if UPSTASH_REDIS_REST_URL and not state_loaded["ok"]:
+            state_retry = asyncio.create_task(retry_load_state())
 
         print(f"--- Старт: сборка {BUILD_TAG} ({BUILD_COMMIT}), "
               f"mt={settings['min_turnover_usd']}, sp={settings['spread_percent']}, "
@@ -1712,6 +1750,8 @@ async def main():
         # не оставлять недописанное состояние и открытые соединения.
         if scanner is not None:
             scanner.cancel()
+        if state_retry is not None:
+            state_retry.cancel()
         for t in arb_tasks:
             t.cancel()
         await save_state()

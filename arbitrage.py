@@ -2088,7 +2088,8 @@ def _contract_line(coin, cfg, res):
 # ================= TELEGRAM: уведомления и спам =================
 
 async def notify(text, kb=None):
-    chat = ctx.chat_get()
+    # Чат не известен (настройки сканера не прочитались) — пишем админу напрямую.
+    chat = ctx.chat_get() or next(iter(ADMIN_IDS), None)
     if not chat:
         print(f"[arb] нет chat_id, сообщение: {text}", flush=True)
         return
@@ -2149,27 +2150,56 @@ def _json_default(o):
     raise TypeError(type(o))
 
 
+# Прочитано ли состояние из Upstash. Пока нет — ничего не пишем и новых сделок не
+# начинаем: пустой список монет затёр бы настоящий, а сделка без сохранения
+# потерялась бы при перезапуске.
+store = {"loaded": False, "err": None}
+_saved = {}  # ключ Upstash → что в нём сейчас лежит (одно и то же не переписываем)
+# «Когда последний раз смотрели» меняется каждые несколько секунд; ради одного этого
+# в Upstash не пишем — после перезапуска проверка просто случится сразу.
+_VOLATILE = ("last_wallet_check", "last_mexc_check")
+
+
 async def save():
-    if not ctx.redis:
+    if not ctx.redis or not store["loaded"]:
         return
-    await asyncio.gather(
-        ctx.redis("SET", "arb:config", json.dumps(arb)),
-        ctx.redis("SET", "arb:deals", json.dumps(deals, default=_json_default)),
-        ctx.redis("SET", "arb:rescues", json.dumps(rescues, default=_json_default)),
-        return_exceptions=True,
-    )
+    sig = {
+        "arb:config": json.dumps(arb),
+        "arb:deals": json.dumps({c: {k: v for k, v in d.items() if k not in _VOLATILE}
+                                 for c, d in deals.items()}, default=_json_default),
+        "arb:rescues": json.dumps(rescues, default=_json_default),
+    }
+    todo = [k for k, s in sig.items() if _saved.get(k) != s]
+    if not todo:
+        return
+    full = dict(sig, **{"arb:deals": json.dumps(deals, default=_json_default)})
+    res = await asyncio.gather(*[ctx.redis("SET", k, full[k]) for k in todo], return_exceptions=True)
+    for k, r in zip(todo, res):
+        if not isinstance(r, Exception):
+            _saved[k] = sig[k]
 
 
 async def load():
+    """Читает состояние из Upstash. False — Upstash не ответил, состояние не прочитано."""
     global deals, rescues
     if not ctx.redis:
-        return
-    raw_cfg, raw_deal, raw_resc = await asyncio.gather(
+        store["loaded"] = True
+        return True
+    raw = await asyncio.gather(
         ctx.redis("GET", "arb:config"), ctx.redis("GET", "arb:deals"),
         ctx.redis("GET", "arb:rescues"), return_exceptions=True)
+    err = next((r for r in raw if isinstance(r, Exception)), None)
+    if err is not None:
+        store["err"] = str(err)[:200] or type(err).__name__
+        print(f"[arb] Upstash не ответил, состояние не прочитано: {store['err']}", flush=True)
+        return False
+    raw_cfg, raw_deal, raw_resc = raw
     try:
         if isinstance(raw_cfg, str):
+            # Монеты, добавленные, пока Upstash не отвечал, не теряем.
+            added = arb["coins"]
             arb.update(json.loads(raw_cfg))
+            arb["coins"].update(added)
             for name, n in arb.get("networks", {}).items():
                 register_net(name, n["rpc"], n["native"], n.get("aliases", []))
             for name, url in arb.get("rpc_override", {}).items():
@@ -2188,6 +2218,8 @@ async def load():
                 await ctx.redis("SET", "arb:deal", "null")
     except Exception as e:
         print(f"[arb] не удалось восстановить состояние: {e}", flush=True)
+    store["loaded"], store["err"] = True, None
+    return True
 
 
 # ================= ПОИСК ВОЗМОЖНОСТИ =================
@@ -2346,7 +2378,10 @@ async def engine_loop():
     while True:
         engine_state["last_pass"] = time.time()
         try:
-            if arb["enabled"] and arb["coins"]:
+            if not store["loaded"]:
+                for c in arb["coins"]:
+                    why_not[c] = (time.time(), "Upstash не отвечает — сделки не начинаю, пока не прочитаю состояние")
+            elif arb["enabled"] and arb["coins"]:
                 # Все монеты списка проверяются ПАРАЛЛЕЛЬНО: время прохода = одному
                 # запросу, а не сумме по монетам. Первой пробуем монету с большим спредом.
                 # Сначала — монеты, для которых ещё не найдена настоящая пара на HTX:
@@ -3675,6 +3710,8 @@ async def cmd_arb(message: types.Message):
         f"{'🧪 тест' if arb['dry_run'] else '💸 реальные сделки'} · "
         f"цикл был {_ago(engine_state['last_pass'])} назад (каждые {arb['poll_sec']:g} сек)",
     ]
+    if _store_warning():
+        lines.append(_store_warning())
 
     # --- Спреды сейчас (стаканы тянем заново, параллельно по всем монетам) ---
     async def spread_now(coin, cfg):
@@ -3844,9 +3881,12 @@ async def _hist_req(fn, *args):
 async def _hist_cache_load():
     if _hist_loaded["ok"] or not ctx.redis:
         return
-    _hist_loaded["ok"] = True
     try:
         raw = await ctx.redis("GET", "arb:hist")
+    except Exception:
+        return  # не прочитали — и не пишем: старую историю HTX уже не отдаст
+    _hist_loaded["ok"] = True
+    try:
         if raw:
             _hist_cache.update(json.loads(raw))
     except Exception:
@@ -3854,7 +3894,7 @@ async def _hist_cache_load():
 
 
 async def _hist_cache_save():
-    if not ctx.redis:
+    if not ctx.redis or not _hist_loaded["ok"]:
         return
     try:
         await ctx.redis("SET", "arb:hist", json.dumps(_hist_cache))
@@ -4335,7 +4375,7 @@ async def cmd_list(message: types.Message):
     if not await _guard(message):
         return
     if not arb["coins"]:
-        await message.answer("Список автоарбитража пуст. Добавить: /arb_add PEPE 3 bsc")
+        await message.answer(_store_warning() or "Список автоарбитража пуст. Добавить: /arb_add PEPE 3 bsc")
         return
     lines = [f"📋 <b>Монеты в автоарбитраже ({len(arb['coins'])})</b> · "
              f"{'▶️ ВКЛ' if arb['enabled'] else '⏸ ВЫКЛ'} · {'🧪 тест' if arb['dry_run'] else '💸 реальные сделки'}", ""]
@@ -5079,6 +5119,9 @@ def _topup_say(text):
 
 async def topup_step():
     """USDT на HTX меньше порога — переводим недостающее с кошелька бота (BNB / Arbitrum)."""
+    if not store["loaded"]:
+        _topup_say("Upstash не отвечает — не пополняю, пока не прочитаю, когда был прошлый перевод")
+        return
     need_level = D(str(arb.get("topup_usd") or 0))
     if need_level <= 0 or not arb["enabled"] or arb["dry_run"]:
         _topup_say("выключено: нужно /arb_on и /arb_live on, и порог /arb_set topup > 0")
@@ -5150,11 +5193,40 @@ async def topup_loop():
         await asyncio.sleep(60)
 
 
+def _store_warning():
+    if store["loaded"]:
+        return None
+    return (f"⚠️ <b>Upstash не отвечает</b>: <code>{html.escape(store['err'] or '?')}</code>\n"
+            f"Список монет и сделки не прочитаны. Новых сделок не начинаю и ничего не сохраняю, "
+            f"чтобы не затереть данные; пробую прочитать раз в минуту.")
+
+
+async def _reload_loop():
+    while True:
+        await asyncio.sleep(60)
+        if await load():
+            await notify(f"✅ Upstash снова отвечает: прочитал состояние автоарбитража "
+                         f"(монет: {len(arb['coins'])}, сделок: {len(deals)}) — продолжаю.")
+            await _resume()
+            return
+
+
 async def start():
     """Восстанавливает состояние и запускает фоновые задачи. Возвращает их список."""
-    await load()
+    loaded = await load()
     tasks = [asyncio.create_task(spam_loop()), asyncio.create_task(engine_loop()),
              asyncio.create_task(topup_loop()), asyncio.create_task(track_assets_loop())]
+    if loaded:
+        tasks += await _resume()
+    else:
+        await notify(_store_warning())
+        tasks.append(asyncio.create_task(_reload_loop()))
+    return tasks
+
+
+async def _resume():
+    """Продолжает сделки и аварийные продажи, прочитанные из Upstash."""
+    tasks = []
     for coin, d in list(deals.items()):
         if d.get("v") != 2:
             await notify(f"⚠️ Незавершённая сделка <b>{coin}</b> из прошлой версии бота сброшена — "
