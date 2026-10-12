@@ -2312,26 +2312,41 @@ def _html_to_text(t):
     return re.sub(r"<[^>]+>", "", t)
 
 
-DAILY = 24 * 3600  # «спред есть, но не торгую» по монете — не чаще раза в сутки
+DAILY = 24 * 3600  # отказы по монете — одно сообщение на монету в сутки
+CHK_FAIL_SEC = 600  # спред не проверяется подряд столько — тогда уже сообщаем
+_chk_fail = {}      # монета → с какого времени спред не проверяется подряд
+
+
+def _err(e):
+    return str(e) or type(e).__name__
+
+
+def _is_net_error(e):
+    """Обрыв связи / таймаут / 5xx биржи — пройдёт само, на следующем проходе."""
+    return (isinstance(e, (asyncio.TimeoutError, aiohttp.ClientError))
+            or bool(re.search(r"HTTP 5\d\d", str(e))))
 
 
 async def note_once(key, text, every=1800):
     """Сообщение не чаще раза в every секунд на ключ (чтобы не засыпать чат).
-    Суточные — запоминаем в Upstash, чтобы перезапуск бота не слал их заново."""
+    Суточные отказы по монете — одно сообщение на монету, какой бы ни была причина;
+    время запоминаем в Upstash, чтобы перезапуск бота не слал их заново."""
     now = time.time()
     kind, _, coin = key.partition(":")
     if coin and kind not in _INFO_KEYS:
         why_not[coin] = (now, _html_to_text(text).split("\n")[0])
     elif key == "mexc_perm":
         why_not["*"] = (now, _html_to_text(text).split("\n")[0])
-    sent = arb.setdefault("notes_sent", {}) if every >= DAILY else None
-    last = max(_skip_notes.get(key, 0), sent.get(key, 0) if sent is not None else 0)
+    daily = every >= DAILY
+    slot = f"day:{coin}" if daily and coin and kind not in _INFO_KEYS else key
+    sent = arb.setdefault("notes_sent", {}) if daily else None
+    last = max(_skip_notes.get(slot, 0), sent.get(slot, 0) if sent is not None else 0)
     if now - last >= every:
-        _skip_notes[key] = now
+        _skip_notes[slot] = now
         if sent is not None:
             for k in [k for k, t in sent.items() if now - t >= DAILY]:
                 sent.pop(k)
-            sent[key] = now
+            sent[slot] = now
             await save()
         await notify(text)
 
@@ -2408,8 +2423,11 @@ async def engine_loop():
                             if is_auth_error(e):
                                 await notify_auth_error(e)
                                 continue
-                            await note_once(f"res:{coin}", f"⚠️ <b>{coin}</b>: не удалось найти монету на HTX: {e}",
-                                            every=1800)
+                            if _is_net_error(e):
+                                why_not[coin] = (time.time(), f"нет связи с биржей: {_err(e)}")
+                                continue
+                            await note_once(f"res:{coin}", f"⚠️ <b>{coin}</b>: не удалось найти монету на HTX: "
+                                                           f"{html.escape(_err(e))}", every=DAILY)
                 for c in list(arb.get("carry", {})):
                     if c in arb["coins"] and c not in deals and not coin_paused(c):
                         await flush_carry(c, arb["coins"][c])
@@ -2421,10 +2439,19 @@ async def engine_loop():
                 opps = await asyncio.gather(*[check_opportunity(c, cfg) for c, cfg in coins],
                                             return_exceptions=True)
                 found = []
+                now = time.time()
                 for (coin, cfg), opp in zip(coins, opps):
                     if isinstance(opp, Exception):
-                        await note_once(f"chk:{coin}", f"⚠️ <b>{coin}</b>: не удалось проверить спред: <code>{opp}</code>", every=1800)
-                    elif opp:
+                        # Разовый обрыв связи — не повод писать: через секунду проверим снова.
+                        since = _chk_fail.setdefault(coin, now)
+                        if now - since >= CHK_FAIL_SEC:
+                            await note_once(f"chk:{coin}", f"⚠️ <b>{coin}</b>: спред не проверяется уже {_ago(since)}: "
+                                                           f"<code>{html.escape(_err(opp))}</code>", every=DAILY)
+                        else:
+                            why_not[coin] = (now, f"не удалось проверить спред: {_err(opp)}")
+                        continue
+                    _chk_fail.pop(coin, None)
+                    if opp:
                         found.append((opp["spread"], coin, cfg, opp))
                 found.sort(key=lambda x: x[0], reverse=True)
                 buyer = next((d for d in deals.values() if d.get("buying")), None)
@@ -2470,8 +2497,11 @@ async def try_start(coin, cfg, opp, check_only=False):
         if is_auth_error(e):
             await notify_auth_error(e)  # одно сообщение на все монеты, раз в час
             return False
-        await note_once(f"cfg:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}% есть, но сделку начать нельзя:\n{e}",
-                        every=DAILY)
+        if _is_net_error(e):
+            why_not[coin] = (time.time(), f"нет связи с биржей: {_err(e)}")  # следующий проход повторит
+            return False
+        await note_once(f"cfg:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}% есть, но сделку начать нельзя:\n"
+                                       f"{html.escape(_err(e))}", every=DAILY)
         return False
     if res["htx_ticker_auto"]:
         # Тикер на HTX только что найден — этот спред считался по ЧУЖОЙ монете
