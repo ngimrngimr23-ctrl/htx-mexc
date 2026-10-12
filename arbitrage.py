@@ -2312,16 +2312,27 @@ def _html_to_text(t):
     return re.sub(r"<[^>]+>", "", t)
 
 
+DAILY = 24 * 3600  # «спред есть, но не торгую» по монете — не чаще раза в сутки
+
+
 async def note_once(key, text, every=1800):
-    """Сообщение не чаще раза в every секунд на ключ (чтобы не засыпать чат)."""
+    """Сообщение не чаще раза в every секунд на ключ (чтобы не засыпать чат).
+    Суточные — запоминаем в Upstash, чтобы перезапуск бота не слал их заново."""
     now = time.time()
     kind, _, coin = key.partition(":")
     if coin and kind not in _INFO_KEYS:
         why_not[coin] = (now, _html_to_text(text).split("\n")[0])
     elif key == "mexc_perm":
         why_not["*"] = (now, _html_to_text(text).split("\n")[0])
-    if now - _skip_notes.get(key, 0) >= every:
+    sent = arb.setdefault("notes_sent", {}) if every >= DAILY else None
+    last = max(_skip_notes.get(key, 0), sent.get(key, 0) if sent is not None else 0)
+    if now - last >= every:
         _skip_notes[key] = now
+        if sent is not None:
+            for k in [k for k, t in sent.items() if now - t >= DAILY]:
+                sent.pop(k)
+            sent[key] = now
+            await save()
         await notify(text)
 
 
@@ -2449,17 +2460,18 @@ async def try_start(coin, cfg, opp, check_only=False):
         wallet_address(cfg["net"])
     except ContractMismatch as e:
         await note_once(f"ca:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {e}\nНе торгую.",
-                        every=6 * 3600)
+                        every=DAILY)
         return False
     except NetworkMissing as e:
         await note_once(f"nonet:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {e} — пропускаю.",
-                        every=3 * 3600)
+                        every=DAILY)
         return False
     except Exception as e:
         if is_auth_error(e):
             await notify_auth_error(e)  # одно сообщение на все монеты, раз в час
             return False
-        await note_once(f"cfg:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}% есть, но сделку начать нельзя:\n{e}")
+        await note_once(f"cfg:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}% есть, но сделку начать нельзя:\n{e}",
+                        every=DAILY)
         return False
     if res["htx_ticker_auto"]:
         # Тикер на HTX только что найден — этот спред считался по ЧУЖОЙ монете
@@ -2472,10 +2484,12 @@ async def try_start(coin, cfg, opp, check_only=False):
         st = res.get("htx_withdraw_status")
         why = (f"HTX пишет, что вывод в сети {res['htx_chain']} закрыт" if st == "prohibited" or (st == "allowed") else
                f"статус вывода в сети {res['htx_chain']} неизвестен (HTX отдал: {st or 'ничего'})")
-        await note_once(f"wd:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {why} — не покупаю.")
+        await note_once(f"wd:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {why} — не покупаю.",
+                        every=DAILY)
         return False
     if not res["mexc_deposit_ok"]:
-        await note_once(f"dep:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но на MEXC закрыт депозит в этой сети — пропускаю.")
+        await note_once(f"dep:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но на MEXC закрыт депозит в этой сети — пропускаю.",
+                        every=DAILY)
         return False
     if not arb["dry_run"]:
         addr = wallet_address(cfg["net"])
@@ -2483,17 +2497,17 @@ async def try_start(coin, cfg, opp, check_only=False):
         if saved is None:
             await note_once(f"addr1:{coin}", f"ℹ️ <b>{coin}</b>: адрес бота для вывода с HTX {how}. "
                                              f"Если вывод не пройдёт — продам на HTX по цене MEXC и запомню.",
-                            every=6 * 3600)
+                            every=DAILY)
         if saved is False:
             why = f"адрес бота для вывода с HTX не принят ({how})"
             await note_once(f"book:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но не покупаю — {why}.\n"
                                             f"{address_book_hint(res['htx_ticker'], res['htx_chain'], addr)}\n"
                                             f"Проверить: /arb_htx {res['htx_ticker']} (раздел 4)",
-                            every=1800)
+                            every=DAILY)
             return False
     if not arb["dry_run"] and not contract_confirmed(cfg, res):
         await note_once(f"unconf:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но контракт не сверен.\n"
-                                          f"{contract_line(coin, cfg, res)}", every=3 * 3600)
+                                          f"{contract_line(coin, cfg, res)}", every=DAILY)
         return False
 
     if arb["dry_run"] and check_only:
@@ -2535,14 +2549,14 @@ async def try_start(coin, cfg, opp, check_only=False):
         if not check_only:
             await note_once(f"nousdt:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но на HTX свободно только "
                                               f"{fmt(usdt_free)} USDT (деньги в другой сделке или ждут пополнения) — "
-                                              f"пропускаю.", every=600)
+                                              f"пропускаю.", every=DAILY)
         return False
     extra = fee_extra_pct(res["htx_fee"], opp["mexc_bid"], have)
     if D(str(opp["spread"])) < D(cfg["pct"]) + extra:
         if not check_only:
             await note_once(f"fee:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но комиссия вывода с HTX "
                                            f"~{fmt(fee_usd)}$ даже на весь баланс {fmt(have)}$ съест {extra:.2f}% — "
-                                           f"чистыми меньше {cfg['pct']}%. Не покупаю.", every=3 * 3600)
+                                           f"чистыми меньше {cfg['pct']}%. Не покупаю.", every=DAILY)
         return False
     # Ключ MEXC должен видеть балансы — иначе сделка встанет на первом же шаге.
     try:
