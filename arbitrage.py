@@ -2923,6 +2923,13 @@ async def flush_carry(coin, cfg):
         return
     _carry_tried[coin] = time.time()
     try:
+        # Монет на HTX нет (вывели или продали руками, запись устарела) — выводить нечего:
+        # запись убираем молча, без проверок сетей и без сообщений.
+        free, _ = await htx_balance(hcoin(coin, cfg))
+        if free <= 0:
+            arb.get("carry", {}).pop(coin, None)
+            await save()
+            return
         res = await resolve_coin(coin, cfg)
         if not res["htx_withdraw_ok"] or not res["mexc_deposit_ok"]:
             return
@@ -2953,7 +2960,10 @@ async def flush_carry(coin, cfg):
         await save()
         spawn(run_deal(d))
     except Exception as e:
-        await note_once(f"carry:{coin}", f"⚠️ <b>{coin}</b>: не вывел отложенные монеты: <code>{e}</code>", every=3600)
+        if _is_net_error(e):
+            return  # обрыв связи — через 5 мин. попробуем снова
+        await note_once(f"carry:{coin}", f"⚠️ <b>{coin}</b>: не вывел отложенные монеты: "
+                                         f"<code>{html.escape(_err(e))}</code>", every=DAILY)
 
 
 async def _take_carry(d):
