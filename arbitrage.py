@@ -597,6 +597,18 @@ async def htx_withdraw(address, coin, amount, chain_code, fee):
 # ================= GATE =================
 # Биржа продажи. API v4: подпись HMAC-SHA512 от «метод\nпуть\nзапрос\nsha512(тело)\nвремя».
 
+GATE_KEY_SOURCE = {"from": "env" if GATE_API_KEY else None}
+
+
+def set_gate_key(key, secret, source):
+    """Ключ Gate из команды /arb_key (хранится в Upstash) — важнее переменных окружения:
+    его задали позже и руками."""
+    global GATE_API_KEY, GATE_API_SECRET
+    GATE_API_KEY, GATE_API_SECRET = (key or None), (secret or None)
+    GATE_KEY_SOURCE["from"] = source if key else None
+    _gate_mode["ts"] = 0.0  # режим счёта — перепроверить уже с новым ключом
+
+
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 _gate_clock = {"offset": 0.0}
@@ -2308,13 +2320,19 @@ async def load():
         return True
     raw = await asyncio.gather(
         ctx.redis("GET", "arb:config"), ctx.redis("GET", "arb:deals"),
-        ctx.redis("GET", "arb:rescues"), return_exceptions=True)
+        ctx.redis("GET", "arb:rescues"), ctx.redis("GET", "arb:gate_key"), return_exceptions=True)
     err = next((r for r in raw if isinstance(r, Exception)), None)
     if err is not None:
         store["err"] = str(err)[:200] or type(err).__name__
         print(f"[arb] Upstash не ответил, состояние не прочитано: {store['err']}", flush=True)
         return False
-    raw_cfg, raw_deal, raw_resc = raw
+    raw_cfg, raw_deal, raw_resc, raw_key = raw
+    try:
+        k = json.loads(raw_key) if isinstance(raw_key, str) else None
+        if k and k.get("key") and k.get("secret"):
+            set_gate_key(k["key"], k["secret"], "upstash")
+    except Exception as e:
+        print(f"[arb] ключ Gate из Upstash не разобран: {type(e).__name__}", flush=True)
     try:
         if isinstance(raw_cfg, str):
             # Монеты, добавленные, пока Upstash не отвечал, не теряем.
@@ -4670,6 +4688,7 @@ async def cmd_help(message: types.Message):
         "/arb_set topup 600 — держать на HTX не меньше 600 USDT: недостающее бот сам переводит с кошелька "
         "из сетей BNB / Arbitrum (0 — выкл)\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
+        "/arb_key — IP бота и ключ Gate; задать: /arb_key gate КЛЮЧ СЕКРЕТ (сообщение удалится)\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
         "/arb_net — список сетей · /arb_net del mapo — удалить свою сеть\n"
@@ -5210,6 +5229,94 @@ async def cmd_set(message: types.Message, command: CommandObject):
     await message.answer(f"✅ {args[0]} = {arb[key]}")
 
 
+async def outbound_ips(tries=6):
+    """Исходящие IP бота: с них он ходит на биржи (у хостинга их бывает несколько —
+    спрашиваем несколько раз и собираем все)."""
+    ips = set()
+
+    async def ask(url):
+        try:
+            async with http().get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                ip = (await r.text()).strip()
+            if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", ip):
+                ips.add(ip)
+        except Exception:
+            pass
+
+    urls = ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]
+    await asyncio.gather(*[ask(urls[i % len(urls)]) for i in range(tries)])
+    return sorted(ips)
+
+
+def _mask(x):
+    x = str(x or "")
+    return x[:4] + "…" + x[-4:] if len(x) > 10 else "…"
+
+
+@router.message(Command("arb_key"))
+async def cmd_key(message: types.Message, command: CommandObject):
+    """Ключ Gate без доступа к Render: /arb_key gate КЛЮЧ СЕКРЕТ. Сообщение с ключом бот
+    сразу удаляет, ключ хранит в Upstash. Без аргументов — что сейчас задано и IP бота."""
+    if not await _guard(message):
+        return
+    args = (command.args or "").split()
+    if len(args) == 3 and args[0].lower() == "gate":
+        try:
+            await message.delete()  # ключ не должен висеть в переписке
+            gone = "сообщение с ключом удалил"
+        except Exception:
+            gone = "⚠️ сообщение с ключом удалить не смог — удали его сам"
+        old = (GATE_API_KEY, GATE_API_SECRET, GATE_KEY_SOURCE["from"])
+        set_gate_key(args[1], args[2], "upstash")
+        try:
+            usdt = await gate_free("USDT")
+        except Exception as e:
+            set_gate_key(*old)
+            await message.answer(f"❌ Gate этот ключ не принял: <code>{html.escape(_err(e)[:200])}</code>\n"
+                                 f"Ключ не сохранил ({gone}). Проверь права (Спот: чтение и торговля, "
+                                 f"Кошелёк: чтение) и IP — /arb_key покажет IP бота.", parse_mode="HTML")
+            return
+        saved = "сохранён в Upstash"
+        if ctx.redis:
+            try:
+                await ctx.redis("SET", "arb:gate_key", json.dumps({"key": args[1], "secret": args[2]}))
+            except Exception as e:
+                saved = f"⚠️ в Upstash не сохранился ({html.escape(_err(e)[:80])}) — после перезапуска задай снова"
+        else:
+            saved = "⚠️ Upstash не настроен — после перезапуска задай снова"
+        await message.answer(f"✅ Ключ Gate <code>{_mask(args[1])}</code> работает: на Gate {fmt(usdt)} USDT. "
+                             f"Ключ {saved}; {gone}.", parse_mode="HTML")
+        return
+    if len(args) == 2 and args[0].lower() == "gate" and args[1].lower() == "off":
+        set_gate_key(None, None, None)
+        if ctx.redis:
+            try:
+                await ctx.redis("DEL", "arb:gate_key")
+            except Exception:
+                pass
+        await message.answer("🗑 Ключ Gate, заданный командой, удалён. Торговля на Gate остановится, "
+                             "пока не задашь новый.")
+        return
+    if args:
+        await message.answer("Пример: <code>/arb_key gate КЛЮЧ СЕКРЕТ</code> · удалить: <code>/arb_key gate off</code>",
+                             parse_mode="HTML")
+        return
+    wait = await message.answer("⏳ Узнаю IP бота…")
+    ips = await outbound_ips()
+    src = {"env": "из Render (GATE_API_KEY)", "upstash": "задан командой /arb_key"}.get(GATE_KEY_SOURCE["from"])
+    text = ("🔑 Ключ Gate: " + (f"<code>{_mask(GATE_API_KEY)}</code> — {src}" if GATE_API_KEY else "не задан") +
+            "\n🌐 IP бота для белого списка ключа: " +
+            (", ".join(f"<code>{ip}</code>" for ip in ips) if ips else "не удалось узнать") +
+            "\n<i>Хостинг может ходить в сеть с нескольких IP — впиши все. Если ключ вдруг перестанет "
+            "приниматься с ошибкой FORBIDDEN — проверь /arb_key ещё раз: мог появиться новый IP.</i>\n"
+            "Задать ключ: <code>/arb_key gate КЛЮЧ СЕКРЕТ</code> (права: Спот — чтение и торговля, "
+            "Кошелёк — чтение; вывод НЕ включать).")
+    try:
+        await wait.edit_text(text, parse_mode="HTML")
+    except Exception:
+        await message.answer(text, parse_mode="HTML")
+
+
 @router.message(Command("arb_wallet"))
 async def cmd_wallet(message: types.Message):
     if not await _guard(message):
@@ -5505,6 +5612,7 @@ BOT_COMMANDS = [
     ("arb_live", "Реальные сделки on / тест off"),
     ("arb_set", "Параметры лесенки и проверок"),
     ("arb_wallet", "Кошельки бота"),
+    ("arb_key", "Ключ Gate без Render и IP бота"),
     ("arb_resume", "Снять паузу с монеты после /stop"),
     ("stop", "Остановить спам"),
 ]
