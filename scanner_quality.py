@@ -72,7 +72,7 @@ def norm_contract(x):
     if not x or x in ("0", "-", "null", "None"):
         return None
     m = re.fullmatch(r"(?:0x)?(41[0-9a-fA-F]{40})", x)
-    if m:  # Tron в hex → base58check (T…), как отдаёт MEXC
+    if m:  # Tron в hex → base58check (T…), как отдаёт Gate
         import hashlib
         payload = bytes.fromhex(m.group(1))
         payload += hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
@@ -96,11 +96,11 @@ def norm_contract(x):
     return None
 
 
-def find_route(direction, htx_chains, mexc_nets):
+def find_route(direction, htx_chains, gate_nets):
     """
-    direction: "HTX" (купить на HTX → вывести → депозит на MEXC) или "MEXC".
+    direction: "HTX" (купить на HTX → вывести → депозит на Gate) или "Gate".
     htx_chains: [{"chain", "names": [...], "withdraw", "deposit", "fee", "ca"}]
-    mexc_nets:  [{"network", "names": [...], "withdraw_enable", "deposit_enable",
+    gate_nets:  [{"network", "names": [...], "withdraw_enable", "deposit_enable",
                   "withdraw_fee", "contract"}]
 
     Возвращает dict:
@@ -114,7 +114,7 @@ def find_route(direction, htx_chains, mexc_nets):
       best:     лучшая открытая пара (самая дешёвая по комиссии вывода) или None
       pairs:    все сопоставленные пары (для текста алерта)
     """
-    if not htx_chains or not mexc_nets:
+    if not htx_chains or not gate_nets:
         return {"state": "nodata", "contract": "unknown", "best": None, "pairs": []}
 
     pairs, mismatched = [], []
@@ -122,7 +122,7 @@ def find_route(direction, htx_chains, mexc_nets):
     for h in htx_chains:
         h_ids = net_ids(*h.get("names", []))
         h_ca = norm_contract(h.get("ca"))
-        for m in mexc_nets:
+        for m in gate_nets:
             m_ids = net_ids(*m.get("names", []))
             m_ca = norm_contract(m.get("contract"))
             same_ca = bool(h_ca and m_ca and h_ca == m_ca)
@@ -136,7 +136,7 @@ def find_route(direction, htx_chains, mexc_nets):
                 else:
                     is_open = bool(m.get("withdraw_enable")) and bool(h.get("deposit"))
                     fee = m.get("withdraw_fee")
-                pairs.append({"htx": h, "mexc": m, "open": is_open, "fee": fee, "same_ca": same_ca})
+                pairs.append({"htx": h, "gate": m, "open": is_open, "fee": fee, "same_ca": same_ca})
             elif by_name and diff_ca:
                 mismatched.append((h, m))
 

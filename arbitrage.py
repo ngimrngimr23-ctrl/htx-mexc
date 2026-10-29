@@ -1,11 +1,11 @@
 """
 Автоарбитраж СТРОГО в одну сторону: купить на HTX → вывести на СВОЙ кошелёк →
-переслать с кошелька на MEXC → продать на MEXC.
+переслать с кошелька на Gate → продать на Gate.
 
 Подключается к основному боту (spread_scanner_bot.py) через setup() + router.
 
 Логика одной сделки (подробно — в /arb_help):
-  1. Монета из списка /arb_add, спред (грязный, MEXC bid против HTX ask) не
+  1. Монета из списка /arb_add, спред (грязный, Gate bid против HTX ask) не
      ниже заданного минимума. Покупка на HTX выкупом ордеров на продажу
      (buy-ioc) по цене не выше той, где спред ещё равен минимуму. На весь
      USDT-баланс, либо (режим «проба») сперва на N$, а после успешного вывода
@@ -13,8 +13,8 @@
   2. Вывод с HTX на свой адрес. Если HTX вернул ошибку — сразу аварийная
      продажа на HTX в ноль. Если заявку принял — через минуту смотрим
      СВОБОДНЫЙ баланс монеты: не обнулился = вывод не прошёл → продажа в ноль.
-  3. Ждём монеты на кошельке, пересылаем всё на депозитный адрес MEXC.
-  4. Ждём зачисления на MEXC. Продажа: сразу по ордерам на покупку, пока цена
+  3. Ждём монеты на кошельке, пересылаем всё на депозитный адрес Gate.
+  4. Ждём зачисления на Gate. Продажа: сразу по ордерам на покупку, пока цена
      даёт минимальный %; остаток — лимиткой в безубыток (или чуть ниже
      ближайшего продавца, если он стоит ниже безубытка), каждые N минут минус
      шаг, до пола. Как только плановую выгоду взять не удалось — спам в
@@ -51,7 +51,11 @@ router = Router()
 # адреса кошельков бота (EVM и Sui) — тогда даже утёкший ключ не выведет чужому.
 HTX_API_KEY = (os.environ.get("HTX_API_KEY") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
 HTX_API_SECRET = (os.environ.get("HTX_API_SECRET") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
-# MEXC: достаточно Read + Trade. Права на вывод НЕ нужны.
+# Gate: достаточно «Спот: торговля» + «Кошелёк: чтение» (адрес депозита, история). Права на вывод НЕ нужны.
+GATE_API_KEY = (os.environ.get("GATE_API_KEY") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
+GATE_API_SECRET = (os.environ.get("GATE_API_SECRET") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
+# MEXC ушла из РФ — торговли там больше нет. Ключ (если задан) нужен только /arb_stats:
+# прочитать старые продажи на MEXC, чтобы итоги за месяц не потеряли их.
 MEXC_API_KEY = (os.environ.get("MEXC_API_KEY") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
 MEXC_API_SECRET = (os.environ.get("MEXC_API_SECRET") or "").strip() or None  # пробел/перенос при вставке в Render ломает ключ
 # Кошельки бота: один EVM-ключ на ETH/BNB/Monad (адрес одинаковый) + ключ Sui.
@@ -141,19 +145,19 @@ TIMEOUT = aiohttp.ClientTimeout(total=15)
 arb = {
     "enabled": False,     # /arb_on /arb_off
     "dry_run": True,      # тестовый режим: только сообщает, что сделал бы
-    # "PEPE": {"pct": 3.0, "net": "bsc", "probe": 0, "htx_chain": None, "mexc_net": None}
+    # "PEPE": {"pct": 3.0, "net": "bsc", "probe": 0, "htx_chain": None, "gate_net": None}
     "coins": {},
     # Свои EVM-сети: "mapo": {"rpc": "https://...", "native": "MAPO", "aliases": ["MAPO", "MAP"]}
     "networks": {},
-    "step_pct": 0.3,       # шаг снижения лимитки на MEXC, % от безубытка
+    "step_pct": 0.3,       # шаг снижения лимитки на Gate, % от безубытка
     "step_sec": 120,       # как часто снижать, сек
     "floor_pct": 1.2,      # ниже безубытка минус этот % не опускаемся
     "check_sec": 60,       # через сколько после заявки на вывод смотреть баланс HTX
     "spam_sec": 1.0,       # период спама при аварии
     "poll_sec": 1.0,       # как часто проверять спред по монетам из списка (/arb_set poll)
-    # Учитывать стакан MEXC при покупке: брать на HTX только столько, сколько на
-    # MEXC сейчас покупают с нужным %, а не ориентироваться на одну лучшую цену.
-    "mexc_depth": True,
+    # Учитывать стакан Gate при покупке: брать на HTX только столько, сколько на
+    # Gate сейчас покупают с нужным %, а не ориентироваться на одну лучшую цену.
+    "book_depth": True,
     # С какой суммы купленного сразу выводить партию, не снимая ордер (/arb_set batch).
     "batch_usd": 15.0,
     # Монеты, на которые бот временно «забил» после /stop аварии: {монета: до_когда}.
@@ -168,19 +172,19 @@ arb = {
 
 
 
-def net_pct(qty, cost, fee_qty, mexc_bid):
+def net_pct(qty, cost, fee_qty, gate_bid):
     """Выгода партии в % ЧИСТЫМИ — после комиссии вывода с HTX (в монетах):
-    на MEXC дойдёт qty − fee_qty монет, продать их можно по mexc_bid."""
+    на Gate дойдёт qty − fee_qty монет, продать их можно по gate_bid."""
     if qty <= 0 or cost <= 0:
         return None
-    return ((qty - fee_qty) * mexc_bid - cost) / cost * 100
+    return ((qty - fee_qty) * gate_bid - cost) / cost * 100
 
 
-def fee_extra_pct(fee_qty, mexc_bid, batch_cost):
+def fee_extra_pct(fee_qty, gate_bid, batch_cost):
     """Сколько % спреда съест комиссия вывода, размазанная на партию batch_cost $."""
     if batch_cost <= 0:
         return Decimal(10) ** 6
-    extra = fee_qty * mexc_bid / batch_cost * 100
+    extra = fee_qty * gate_bid / batch_cost * 100
     # Мизерная комиссия (< 0.01%) порог не двигает: иначе спред ровно на пороге
     # отклонялся бы из-за тысячных долей цента.
     return extra if extra >= Decimal("0.01") else Decimal(0)
@@ -235,12 +239,12 @@ class NetworkMissing(ExchangeError):
     """Нужной сети у монеты на бирже просто нет — не ошибка, а повод пропустить монету."""
 
 
-class CoinNotOnMexc(NetworkMissing):
-    """Монеты с таким тикером на MEXC нет — добавлять её в список бессмысленно."""
+class CoinNotOnGate(NetworkMissing):
+    """Монеты с таким тикером (или её пары к USDT) на Gate нет — добавлять её в список бессмысленно."""
 
 
 class ContractMismatch(ExchangeError):
-    """Контракты на HTX и MEXC разные — это две разные монеты с одним тикером."""
+    """Контракты на HTX и Gate разные — это две разные монеты с одним тикером."""
 
 
 # ================= ЧИСЛА =================
@@ -590,7 +594,256 @@ async def htx_withdraw(address, coin, amount, chain_code, fee):
     return await htx_req("POST", "/v1/dw/withdraw/api/create", body=body)
 
 
-# ================= MEXC =================
+# ================= GATE =================
+# Биржа продажи. API v4: подпись HMAC-SHA512 от «метод\nпуть\nзапрос\nsha512(тело)\nвремя».
+
+GATE_HOST = "https://api.gateio.ws"
+GATE_PREFIX = "/api/v4"
+_gate_clock = {"offset": 0.0}
+
+
+def gsym(coin):
+    """Пара монеты к USDT на Gate: PEPE → PEPE_USDT."""
+    return f"{str(coin).upper()}_USDT"
+
+
+async def gate_sync_clock():
+    """Поправка на расхождение часов сервера бота и Gate (ошибка REQUEST_EXPIRED)."""
+    t0 = time.time()
+    async with http().get(f"{GATE_HOST}{GATE_PREFIX}/spot/time", timeout=TIMEOUT) as r:
+        data = json.loads(await r.text())
+    t1 = time.time()
+    _gate_clock["offset"] = int(data["server_time"]) / 1000 - (t0 + t1) / 2
+
+
+async def gate_req(method, path, params=None, body=None, signed=True):
+    try:
+        return await _gate_req(method, path, params, body, signed)
+    except ExchangeError as e:
+        if not signed or "REQUEST_EXPIRED" not in str(e):
+            raise
+        await gate_sync_clock()  # часы разошлись — подстраиваемся и повторяем один раз
+        return await _gate_req(method, path, params, body, signed)
+
+
+async def _gate_req(method, path, params=None, body=None, signed=True):
+    query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
+    payload = json.dumps(body) if body is not None else ""
+    url = f"{GATE_HOST}{GATE_PREFIX}{path}" + (f"?{query}" if query else "")
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if signed:
+        if not GATE_API_KEY or not GATE_API_SECRET:
+            raise ExchangeError("Gate: не заданы GATE_API_KEY / GATE_API_SECRET")
+        ts = str(int(time.time() + _gate_clock["offset"]))
+        sign_str = "\n".join([method, GATE_PREFIX + path, urllib.parse.unquote_plus(query),
+                              hashlib.sha512(payload.encode()).hexdigest(), ts])
+        headers.update({"KEY": GATE_API_KEY, "Timestamp": ts,
+                        "SIGN": hmac.new(GATE_API_SECRET.encode(), sign_str.encode(), hashlib.sha512).hexdigest()})
+    async with http().request(method, url, headers=headers, data=payload or None, timeout=TIMEOUT) as r:
+        text = await r.text()
+        status = r.status
+    try:
+        data = json.loads(text) if text.strip() else None
+    except Exception:
+        raise ExchangeError(f"Gate {path}: HTTP {status} {text[:200]}")
+    if status >= 400 or (isinstance(data, dict) and data.get("label")):
+        msg = (data.get("message") or data.get("detail")) if isinstance(data, dict) else text[:200]
+        label = data.get("label") if isinstance(data, dict) else None
+        raise ExchangeError(f"Gate {path}: {msg} ({label or status})")
+    return data
+
+
+async def gate_depth(sym):
+    data = await gate_req("GET", "/spot/order_book", {"currency_pair": sym, "limit": 100}, signed=False)
+    bids = [(D(p), D(q)) for p, q in (data or {}).get("bids", [])]
+    asks = [(D(p), D(q)) for p, q in (data or {}).get("asks", [])]
+    return bids, asks
+
+
+_gate_sym_cache = {}
+
+
+async def gate_symbol(sym):
+    """Шаги цены/количества пары и минимальная сумма ордера. Пары нет — CoinNotOnGate."""
+    hit = _gate_sym_cache.get(sym)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    try:
+        row = await gate_req("GET", f"/spot/currency_pairs/{sym}", signed=False)
+    except ExchangeError as e:
+        if "INVALID_CURRENCY" in str(e):
+            raise CoinNotOnGate(f"на Gate нет пары {sym.replace('_', '/')}")
+        raise
+    info = {
+        "tick": step_of(row.get("precision", 8)),
+        "step": step_of(row.get("amount_precision", 8)),
+        "min_value": D(row.get("min_quote_amount") or 1),
+        "min_qty": D(row.get("min_base_amount") or 0),
+        "status": row.get("trade_status"),
+    }
+    _gate_sym_cache[sym] = (time.time(), info)
+    return info
+
+
+_gate_mode = {"ts": 0.0, "unified": False}
+
+
+async def gate_unified():
+    """Включён ли на Gate «Единый счёт»: тогда балансы — в /unified/accounts, а ордера —
+    с account=unified. Режим перепроверяем раз в 10 мин.; нет прав на запрос — считаем обычный."""
+    if time.time() - _gate_mode["ts"] > 600:
+        try:
+            data = await gate_req("GET", "/unified/unified_mode")
+            _gate_mode["unified"] = str((data or {}).get("mode") or "classic") != "classic"
+        except ExchangeError:
+            _gate_mode["unified"] = False
+        _gate_mode["ts"] = time.time()
+    return _gate_mode["unified"]
+
+
+async def _gate_balances(currency=None):
+    """{монета: (свободно, в ордерах)} на спотовом (или едином) счёте Gate."""
+    out = {}
+    if await gate_unified():
+        data = await gate_req("GET", "/unified/accounts", {"currency": currency.upper() if currency else None})
+        for c, b in ((data or {}).get("balances") or {}).items():
+            out[str(c).upper()] = (D(b.get("available") or 0), D(b.get("freeze") or 0))
+        return out
+    for b in await gate_req("GET", "/spot/accounts", {"currency": currency.upper() if currency else None}) or []:
+        out[str(b.get("currency", "")).upper()] = (D(b.get("available") or 0), D(b.get("locked") or 0))
+    return out
+
+
+async def _gate_account(asset):
+    return (await _gate_balances(asset)).get(asset.upper(), (D(0), D(0)))
+
+
+async def gate_free(asset):
+    return (await _gate_account(asset))[0]
+
+
+async def gate_total(asset):
+    """Свободно + в ордерах."""
+    free, locked = await _gate_account(asset)
+    return free + locked
+
+
+async def gate_trades(sym, since, until):
+    """Все свои исполнения по паре на Gate за [since, until] (сек.). Gate отдаёт историю
+    окнами не длиннее 30 дней и не больше 100 страниц — берём окнами по 7 дней."""
+    out, seen = [], set()
+    t = since
+    while t < until:
+        end = min(t + 7 * 86400, until)
+        page = 1
+        while page <= 100:
+            rows = await _hist_req(gate_req, "GET", "/spot/my_trades", {
+                "currency_pair": sym, "from": int(t), "to": int(end) + 1, "limit": 1000, "page": page}) or []
+            for r in rows:
+                if r.get("id") not in seen:
+                    seen.add(r.get("id"))
+                    out.append(r)
+            if len(rows) < 1000:
+                break
+            page += 1
+        t = end
+    return out
+
+
+async def gate_sold_since(sym, since):
+    """Продажи по паре на Gate с момента since (сек.): (кол-во, выручка $ за вычетом
+    комиссии в USDT) — по истории сделок, кто бы ни продавал: бот или ты вручную."""
+    qty, quote = D(0), D(0)
+    for t in await gate_trades(sym, since, time.time()):
+        if t.get("side") != "sell":
+            continue
+        q = D(t["amount"])
+        qty += q
+        quote += q * D(t["price"])
+        if str(t.get("fee_currency", "")).upper() == "USDT":
+            quote -= D(t.get("fee") or 0)
+    return qty, quote
+
+
+async def gate_place(sym, side, tif, qty, price):
+    """Лимитный ордер. tif: gtc — стоит в стакане, ioc — только по встречным ордерам."""
+    data = await gate_req("POST", "/spot/orders", body={
+        "currency_pair": sym, "side": side, "type": "limit", "time_in_force": tif,
+        "amount": dstr(qty), "price": dstr(price), "text": "t-arb",
+        "account": "unified" if await gate_unified() else "spot",
+    })
+    return str(data["id"])
+
+
+def _gate_order_view(o):
+    amount, left = D(o.get("amount") or 0), D(o.get("left") or 0)
+    filled = D(o["filled_amount"]) if o.get("filled_amount") not in (None, "") else amount - left
+    status = {"closed": "FILLED", "cancelled": "CANCELED"}.get(o.get("status"), "NEW")
+    return {"status": status, "filled": filled, "quote": D(o.get("filled_total") or o.get("fill_price") or 0)}
+
+
+async def gate_order(sym, order_id):
+    return _gate_order_view(await gate_req("GET", f"/spot/orders/{order_id}", {"currency_pair": sym}))
+
+
+async def gate_cancel(sym, order_id):
+    try:
+        await gate_req("DELETE", f"/spot/orders/{order_id}", {"currency_pair": sym})
+    except ExchangeError:
+        pass  # уже исполнен / снят
+
+
+async def gate_wait_final(sym, order_id, timeout=15):
+    deadline = time.time() + timeout
+    while True:
+        o = await gate_order(sym, order_id)
+        if o["status"] in ("FILLED", "CANCELED") or time.time() > deadline:
+            return o
+        await asyncio.sleep(1)
+
+
+_gate_nets_cache = {}
+
+
+async def gate_networks(coin):
+    """Сети монеты на Gate: [{chain, name, contract, deposit_ok}]. Монеты нет — []. Кэш 2 мин."""
+    c = coin.upper()
+    hit = _gate_nets_cache.get(c)
+    if hit and time.time() - hit[0] < 120:
+        return hit[1]
+    try:
+        rows = await gate_req("GET", "/wallet/currency_chains", {"currency": c}, signed=False)
+    except ExchangeError as e:
+        if "INVALID_CURRENCY" not in str(e):
+            raise
+        rows = []
+    nets = [{"chain": str(x.get("chain") or ""), "name": str(x.get("name_en") or x.get("chain") or ""),
+             "contract": str(x.get("contract_address") or "").strip(),
+             "deposit_ok": not int(x.get("is_disabled") or 0) and not int(x.get("is_deposit_disabled") or 0)}
+            for x in rows or []]
+    _gate_nets_cache[c] = (time.time(), nets)
+    return nets
+
+
+def gate_net_names(n):
+    """Названия сети Gate для сопоставления. У кодов Gate с хвостом EVM/ETH добавляем и
+    слово без хвоста: SCROLLETH → SCROLL, ZILEVM → ZIL, ARBEVM → ARB."""
+    c = str(n.get("chain") or "").upper()
+    short = c[:-3] if len(c) > 4 and c.endswith(("EVM", "ETH")) else None
+    return tuple(x for x in (n.get("chain"), n.get("name"), short) if x)
+
+
+async def gate_deposit_address(coin, net_entry):
+    data = await gate_req("GET", "/wallet/deposit_address", {"currency": coin.upper()})
+    for row in (data or {}).get("multichain_addresses") or []:
+        if row.get("chain") == net_entry["chain"]:
+            if int(row.get("obtain_failed") or 0) or not row.get("address"):
+                break
+            return row["address"], (row.get("payment_id") or None)
+    raise ExchangeError(f"Gate: не удалось получить адрес депозита {coin} в сети {net_entry['chain']}")
+
+
+# ================= MEXC (только старая история для /arb_stats) =================
 
 _mexc_clock = {"offset_ms": 0}
 
@@ -642,139 +895,6 @@ async def _mexc_req(method, path, params=None, signed=True):
         code = data.get("code") if isinstance(data, dict) else status
         raise ExchangeError(f"MEXC {path}: {msg} ({code})")
     return data
-
-
-async def mexc_depth(sym):
-    data = await mexc_req("GET", "/api/v3/depth", {"symbol": sym, "limit": 100}, signed=False)
-    bids = [(D(p), D(q)) for p, q in data.get("bids", [])]
-    asks = [(D(p), D(q)) for p, q in data.get("asks", [])]
-    return bids, asks
-
-
-_mexc_sym_cache = {}
-
-
-async def mexc_symbol(sym):
-    if sym in _mexc_sym_cache:
-        return _mexc_sym_cache[sym]
-    data = await mexc_req("GET", "/api/v3/exchangeInfo", {"symbol": sym}, signed=False)
-    row = (data.get("symbols") or [None])[0]
-    if not row:
-        raise ExchangeError(f"MEXC: пара {sym} не найдена")
-    step = D(row.get("baseSizePrecision") or 0)
-    if step <= 0:
-        step = step_of(row.get("baseAssetPrecision", 8))
-    info = {
-        "tick": step_of(row.get("quotePrecision", row.get("quoteAssetPrecision", 8))),
-        "step": step,
-        "min_value": D(row.get("quoteAmountPrecision") or 1),
-    }
-    _mexc_sym_cache[sym] = info
-    return info
-
-
-async def mexc_free(asset):
-    data = await mexc_req("GET", "/api/v3/account")
-    for b in data.get("balances", []):
-        if b.get("asset") == asset.upper():
-            return D(b.get("free") or 0)
-    return D(0)
-
-
-async def mexc_total(asset):
-    """Свободно + в ордерах."""
-    data = await mexc_req("GET", "/api/v3/account")
-    for b in data.get("balances", []):
-        if b.get("asset") == asset.upper():
-            return D(b.get("free") or 0) + D(b.get("locked") or 0)
-    return D(0)
-
-
-async def mexc_sold_since(sym, since):
-    """Продажи по паре на MEXC с момента since (сек.): (кол-во, выручка $ за вычетом
-    комиссии в USDT) — по истории сделок, кто бы ни продавал: бот или ты вручную."""
-    qty, quote = D(0), D(0)
-    start = int(since * 1000)
-    while True:
-        data = await mexc_req("GET", "/api/v3/myTrades", {"symbol": sym, "startTime": start, "limit": 1000})
-        for t in data:
-            if t.get("isBuyer"):
-                continue
-            qty += D(t["qty"])
-            quote += D(t["quoteQty"])
-            if str(t.get("commissionAsset", "")).upper() == "USDT":
-                quote -= D(t.get("commission") or 0)
-        if len(data) < 1000:
-            return qty, quote
-        start = int(data[-1]["time"]) + 1
-
-
-async def mexc_place(sym, side, order_type, qty, price):
-    data = await mexc_req("POST", "/api/v3/order", {
-        "symbol": sym, "side": side, "type": order_type,
-        "quantity": dstr(qty), "price": dstr(price),
-    })
-    return str(data["orderId"])
-
-
-async def mexc_order(sym, order_id):
-    o = await mexc_req("GET", "/api/v3/order", {"symbol": sym, "orderId": order_id})
-    return {
-        "status": o.get("status"),
-        "filled": D(o.get("executedQty") or 0),
-        "quote": D(o.get("cummulativeQuoteQty") or 0),
-    }
-
-
-async def mexc_cancel(sym, order_id):
-    try:
-        await mexc_req("DELETE", "/api/v3/order", {"symbol": sym, "orderId": order_id})
-    except ExchangeError:
-        pass
-
-
-async def mexc_wait_final(sym, order_id, timeout=15):
-    deadline = time.time() + timeout
-    while True:
-        o = await mexc_order(sym, order_id)
-        if o["status"] in ("FILLED", "CANCELED", "PARTIALLY_CANCELED") or time.time() > deadline:
-            return o
-        await asyncio.sleep(1)
-
-
-_mexc_config_cache = {"ts": 0.0, "data": []}
-
-
-async def mexc_networks(coin):
-    """Сети монеты на MEXC. getall — тяжёлый ответ по всем монетам, кэш 2 мин."""
-    if time.time() - _mexc_config_cache["ts"] > 120:
-        data = await mexc_req("GET", "/api/v3/capital/config/getall")
-        _mexc_config_cache.update(ts=time.time(), data=data if isinstance(data, list) else [])
-    for item in _mexc_config_cache["data"]:
-        if str(item.get("coin", "")).upper() == coin.upper():
-            return item.get("networkList", [])
-    return []
-
-
-async def mexc_deposit_address(coin, net_entry):
-    names = {net_entry.get("netWork"), net_entry.get("network")} - {None}
-
-    def pick(rows):
-        for row in rows if isinstance(rows, list) else []:
-            if row.get("network") in names or row.get("netWork") in names:
-                return row
-        return None
-
-    row = pick(await mexc_req("GET", "/api/v3/capital/deposit/address", {"coin": coin.upper()}))
-    if not row:
-        # Адреса ещё нет — просим MEXC его сгенерировать.
-        net_param = net_entry.get("netWork") or net_entry.get("network")
-        await mexc_req("POST", "/api/v3/capital/deposit/address",
-                       {"coin": coin.upper(), "network": net_param})
-        row = pick(await mexc_req("GET", "/api/v3/capital/deposit/address", {"coin": coin.upper()}))
-    if not row or not row.get("address"):
-        raise ExchangeError(f"MEXC: не удалось получить адрес депозита {coin} ({'/'.join(names)})")
-    return row["address"], (row.get("memo") or row.get("tag") or None)
 
 
 # ================= КОШЕЛЬКИ =================
@@ -1122,7 +1242,7 @@ async def sui_send_all(coin_type, to):
 COSMOS_PRIVATE_KEY = os.environ.get("COSMOS_PRIVATE_KEY")
 COSMOS_DENOM = "uatom"
 COSMOS_GAS_LIMIT = 150000
-MEMO_NETS = {"atom"}  # сети, где бот умеет передать memo для депозита MEXC
+MEMO_NETS = {"atom"}  # сети, где бот умеет передать memo для депозита Gate
 
 
 def _bech32_encode(hrp, data8):
@@ -1797,8 +1917,8 @@ def hsym(coin, cfg):
 
 
 def hcoin(coin, cfg):
-    """Тикер монеты на HTX. Обычно совпадает с MEXC, но не всегда: Monad на HTX —
-    MONAD, на MEXC — MON (а MON на HTX — вообще другая монета, PixelMon)."""
+    """Тикер монеты на HTX. Обычно совпадает с Gate, но не всегда: Monad на HTX —
+    MONAD, на Gate — MON (а MON на HTX — вообще другая монета, PixelMon)."""
     return (cfg.get("htx_coin") or coin).upper()
 
 
@@ -1822,9 +1942,9 @@ def _net_chains(chains, net, cfg):
 
 
 async def find_htx_ticker(coin, net, token, cfg):
-    """Как эта монета называется на HTX, если тикер отличается от MEXC.
+    """Как эта монета называется на HTX, если тикер отличается от Gate.
     Токен ищем по адресу контракта среди ВСЕХ монет HTX; нативную монету сети
-    (контракта у неё нет) — по названию сети (Monad: MEXC «MON», HTX «MONAD»).
+    (контракта у неё нет) — по названию сети (Monad: Gate «MON», HTX «MONAD»).
     Возвращает (тикер, как_нашли) или (None, None)."""
     if token:
         want = norm_contract(token)
@@ -1845,10 +1965,10 @@ def _is_evm_net(net):
     return net in ("eth", "bsc", "monad") or net in arb.get("networks", {})
 
 
-async def _mexc_net_by_contract(coin, net, nets):
-    """Сеть MEXC, когда по названию не совпала (MEXC: «MAP», у нас «MAPO»):
-      * родная монета сети — единственная её сеть на MEXC без контракта;
-      * токен в EVM-сети — та сеть MEXC, чей контракт реально есть в НАШЕЙ сети
+async def _gate_net_by_contract(coin, net, nets):
+    """Сеть Gate, когда по названию не совпала (Gate: «SCROLLETH», у нас «scroll»):
+      * родная монета сети — единственная её сеть на Gate без контракта;
+      * токен в EVM-сети — та сеть Gate, чей контракт реально есть в НАШЕЙ сети
         (eth_getCode через её ноду).
     Возвращает запись сети или None."""
     if coin.upper() == NATIVE_COIN[net]:
@@ -1872,7 +1992,7 @@ async def _mexc_net_by_contract(coin, net, nets):
 
 async def _htx_chain_by_contract(ticker, chains, token):
     """Сеть HTX, когда по названию не совпала: для токена — та, где контракт на
-    HTX совпадает с контрактом MEXC; для родной монеты — единственная без контракта."""
+    HTX совпадает с контрактом Gate; для родной монеты — единственная без контракта."""
     rows = [r for r in await htx_all_v1_rows() if str(r.get("currency", "")).lower() == ticker.lower()]
     if token:
         want = norm_contract(token)
@@ -1935,33 +2055,34 @@ async def resolve_coin(coin, cfg):
     Возвращает dict или бросает ExchangeError с понятной причиной."""
     net = cfg["net"]
 
-    # ---- MEXC: сеть и контракт — это «эталон», с которым сверяем HTX ----
-    nets = await mexc_networks(coin)
+    # ---- Gate: сеть и контракт — это «эталон», с которым сверяем HTX ----
+    nets = await gate_networks(coin)
     if not nets:
-        raise CoinNotOnMexc(f"монеты {coin} нет на MEXC — проверь тикер (как в паре {coin}/USDT на бирже)")
-    if cfg.get("mexc_net"):
-        mx = [n for n in nets if cfg["mexc_net"] in (n.get("netWork"), n.get("network"))]
+        raise CoinNotOnGate(f"монеты {coin} нет на Gate — проверь тикер (как в паре {coin}/USDT на бирже)")
+    await gate_symbol(gsym(coin))  # пары к USDT нет — CoinNotOnGate
+    if cfg.get("gate_net"):
+        mx = [n for n in nets if cfg["gate_net"] in gate_net_names(n)]
     else:
-        mx = [n for n in nets if matches_net(net, n.get("netWork"), n.get("network"))]
-    found = ", ".join(str(n.get("netWork") or n.get("network")) for n in nets) or "нет ни одной"
-    if not mx and not cfg.get("mexc_net"):
-        hit = await _mexc_net_by_contract(coin, net, nets)
+        mx = [n for n in nets if matches_net(net, *gate_net_names(n))]
+    found = ", ".join(n["chain"] for n in nets) or "нет ни одной"
+    if not mx and not cfg.get("gate_net"):
+        hit = await _gate_net_by_contract(coin, net, nets)
         if hit:
             mx = [hit]
-            cfg["mexc_net"] = hit.get("netWork") or hit.get("network")  # запоминаем сопоставление
+            cfg["gate_net"] = hit["chain"]  # запоминаем сопоставление
     if not mx:
-        raise NetworkMissing(f"на MEXC у {coin} нет сети {NET_TITLES[net]} (есть: {found})")
+        raise NetworkMissing(f"на Gate у {coin} нет сети {NET_TITLES[net]} (есть: {found})")
     if len(mx) > 1:
         raise ExchangeError(
-            f"MEXC: не удалось однозначно найти сеть {NET_TITLES[net]} для {coin} "
-            f"(сети на MEXC: {found}). Укажи вручную: /arb_add {coin} {cfg['pct']} {net} mexc=<имя>")
+            f"Gate: не удалось однозначно найти сеть {NET_TITLES[net]} для {coin} "
+            f"(сети на Gate: {found}). Укажи вручную: /arb_add {coin} {cfg['pct']} {net} gate=<имя>")
     mx = mx[0]
 
     token = None
     if coin.upper() != NATIVE_COIN[net]:
-        token = (mx.get("contract") or "").strip()
+        token = mx["contract"]
         if not token:
-            raise ExchangeError(f"MEXC не отдал контракт {coin} в сети {NET_TITLES[net]}")
+            raise ExchangeError(f"Gate не отдал контракт {coin} в сети {NET_TITLES[net]}")
 
     # ---- HTX: та же монета? ----
     async def check_htx(ticker):
@@ -2013,13 +2134,13 @@ async def resolve_coin(coin, cfg):
             f"(сети на HTX: {found}). Укажи вручную: /arb_add {coin} {cfg['pct']} {net} htx=<код>")
     if problem == "другой контракт":
         raise ContractMismatch(
-            f"контракты разные — это РАЗНЫЕ монеты, а монеты с контрактом MEXC на HTX не нашлось.\n"
-            f"HTX ({hc}): <code>{htx_ca}</code>\nMEXC ({coin}): <code>{token}</code>")
+            f"контракты разные — это РАЗНЫЕ монеты, а монеты с контрактом Gate на HTX не нашлось.\n"
+            f"HTX ({hc}): <code>{htx_ca}</code>\nGate ({coin}): <code>{token}</code>")
 
     if hc in matched_chain:
         cfg["htx_chain"] = matched_chain[hc]  # запоминаем сопоставление по контракту
     # Запоминаем найденную монету и НАСТОЯЩЕЕ имя пары на HTX — дальше стакан и
-    # ордера идут строго по ним, а не по тикеру с MEXC.
+    # ордера идут строго по ним, а не по тикеру с Gate.
     pair = await htx_usdt_pair(hc)
     if cfg.get("htx_symbol") != pair or (hc != coin.upper() and cfg.get("htx_coin") != hc):
         cfg["htx_symbol"] = pair
@@ -2050,8 +2171,8 @@ async def resolve_coin(coin, cfg):
         "htx_fee": htx_chain_fee(htx),
         "htx_min_withdraw": D(htx.get("minWithdrawAmt") or 0),
         "htx_withdraw_step": step_of(htx.get("withdrawPrecision", 8)),
-        "mexc_net": mx,
-        "mexc_deposit_ok": bool(mx.get("depositEnable", True)),
+        "gate_net": mx,
+        "gate_deposit_ok": mx["deposit_ok"],
         "token": token,
         "htx_contract": htx_ca,
         # ok — совпал с HTX; native — нативная монета сети, контракта нет;
@@ -2076,7 +2197,7 @@ def _contract_line(coin, cfg, res):
     st = res["contract_status"]
     if st == "native":
         return "Контракт: нативная монета сети (контракта нет)"
-    line = f"Контракт MEXC: <code>{res['token']}</code>"
+    line = f"Контракт Gate: <code>{res['token']}</code>"
     if st == "ok":
         return line + "\n✅ Совпадает с контрактом на HTX"
     if contract_confirmed(cfg, res):
@@ -2157,7 +2278,7 @@ store = {"loaded": False, "err": None}
 _saved = {}  # ключ Upstash → что в нём сейчас лежит (одно и то же не переписываем)
 # «Когда последний раз смотрели» меняется каждые несколько секунд; ради одного этого
 # в Upstash не пишем — после перезапуска проверка просто случится сразу.
-_VOLATILE = ("last_wallet_check", "last_mexc_check")
+_VOLATILE = ("last_wallet_check", "last_gate_check")
 
 
 async def save():
@@ -2200,6 +2321,12 @@ async def load():
             added = arb["coins"]
             arb.update(json.loads(raw_cfg))
             arb["coins"].update(added)
+            # Переезд с MEXC на Gate: сети MEXC к Gate не подходят — бот подберёт сети Gate заново.
+            if "mexc_depth" in arb:
+                arb["book_depth"] = arb.pop("mexc_depth")
+            for cfg in arb["coins"].values():
+                cfg.pop("mexc_net", None)
+                cfg.setdefault("gate_net", None)
             for name, n in arb.get("networks", {}).items():
                 register_net(name, n["rpc"], n["native"], n.get("aliases", []))
             for name, url in arb.get("rpc_override", {}).items():
@@ -2225,36 +2352,36 @@ async def load():
 # ================= ПОИСК ВОЗМОЖНОСТИ =================
 
 async def check_opportunity(coin, cfg):
-    """Спред HTX→MEXC по лучшим ценам. None, если ниже минимума."""
-    sym = f"{coin}USDT"
+    """Спред HTX→Gate по лучшим ценам. None, если ниже минимума."""
+    sym = gsym(coin)
     hpair = hsym(coin, cfg)
     try:
-        (mbids, _), (hbids, hasks) = await asyncio.gather(mexc_depth(sym), htx_depth(hpair))
+        (gbids, _), (hbids, hasks) = await asyncio.gather(gate_depth(sym), htx_depth(hpair))
     except ExchangeError as e:
         # Чтобы из ошибки было видно, по какой именно паре спрашивали каждую биржу.
-        raise ExchangeError(f"MEXC {sym} / HTX {hpair}: {e}")
-    if not mbids or not hasks:
+        raise ExchangeError(f"Gate {sym} / HTX {hpair}: {e}")
+    if not gbids or not hasks:
         return None
-    mexc_bid = mbids[0][0]
-    max_price = mexc_bid / (1 + D(cfg["pct"]) / 100)
+    gate_bid = gbids[0][0]
+    max_price = gate_bid / (1 + D(cfg["pct"]) / 100)
     if hasks[0][0] <= max_price:
         # Продавец по нужной цене есть — проверяем, не наш ли это ордер.
         hasks = await without_my_asks(hpair, hasks)
         if not hasks:
             return None
-    base = {"mexc_bid": mexc_bid, "max_price": max_price, "asks": hasks, "bids": mbids, "pct": D(cfg["pct"])}
+    base = {"gate_bid": gate_bid, "max_price": max_price, "asks": hasks, "bids": gbids, "pct": D(cfg["pct"])}
     if hasks[0][0] <= max_price:
         # Продавцы в пределах процента — можно выкупать сразу.
-        return dict(base, mode="taker", spread=(mexc_bid - hasks[0][0]) / hasks[0][0] * 100)
+        return dict(base, mode="taker", spread=(gate_bid - hasks[0][0]) / hasks[0][0] * 100)
     # Своих ордеров на покупку в стакане не держим: покупаем только у продавцов.
     return None
 
 
 def plan_buy(asks, max_price, budget, bids=None, pct=None):
     """Сколько монет купить по ордерам на продажу HTX не дороже max_price на
-    сумму не больше budget. Если переданы bids (стакан покупателей MEXC) и pct,
-    каждая порция берётся, только если на MEXC её прямо сейчас покупают с
-    выгодой не ниже pct — чтобы не выкупить на HTX больше, чем MEXC реально
+    сумму не больше budget. Если переданы bids (стакан покупателей Gate) и pct,
+    каждая порция берётся, только если на Gate её прямо сейчас покупают с
+    выгодой не ниже pct — чтобы не выкупить на HTX больше, чем Gate реально
     примет по нужной цене. Возвращает (кол-во, стоимость, последняя цена HTX)."""
     qty, cost, last = D(0), D(0), None
     bi = 0
@@ -2288,7 +2415,7 @@ def plan_buy(asks, max_price, budget, bids=None, pct=None):
 
 
 def ladder_price(breakeven, k, step_pct, floor_pct, best_other_ask, tick):
-    """Цена лимитки на MEXC на шаге k: безубыток минус k шагов, но не выше, чем
+    """Цена лимитки на Gate на шаге k: безубыток минус k шагов, но не выше, чем
     на тик ниже ближайшего чужого ордера на продажу, и не ниже пола."""
     floor = round_up(breakeven * (1 - D(floor_pct) / 100), tick)
     # Своя ступень округляется вверх (чтобы «безубыток» не оказался на тик в
@@ -2335,7 +2462,7 @@ async def note_once(key, text, every=1800):
     kind, _, coin = key.partition(":")
     if coin and kind not in _INFO_KEYS:
         why_not[coin] = (now, _html_to_text(text).split("\n")[0])
-    elif key == "mexc_perm":
+    elif key == "gate_perm":
         why_not["*"] = (now, _html_to_text(text).split("\n")[0])
     daily = every >= DAILY
     slot = f"day:{coin}" if daily and coin and kind not in _INFO_KEYS else key
@@ -2353,10 +2480,11 @@ async def note_once(key, text, every=1800):
 
 engine_state = {"last_pass": 0.0}
 
-# Ошибки ключа API: ключ удалён / истёк (MEXC отключает ключ без привязки к IP через
-# 90 дней) / нет прав / неверная подпись. Повтор не поможет — нужен новый ключ.
-_AUTH_MARKERS = ("10072", "700002", "700007", "api key info invalid", "invalid api-key",
-                 "api-signature-not-valid", "invalid-access-key", "login-required", "api-key-invalid")
+# Ошибки ключа API: ключ удалён / истёк / нет прав / неверная подпись / IP не в белом
+# списке. Повтор не поможет — нужен новый ключ (или права/IP).
+_AUTH_MARKERS = ("api-signature-not-valid", "invalid-access-key", "login-required", "api-key-invalid",
+                 "(invalid_key)", "(invalid_signature)", "(missing_required_header)", "(forbidden)",
+                 "(read_only)", "(ip_forbidden)", "не заданы gate_api_key")
 
 
 def is_auth_error(e):
@@ -2367,18 +2495,18 @@ def is_auth_error(e):
 async def notify_auth_error(e):
     """Один раз в час на биржу — вместо ошибки от каждой сделки каждые 5 минут."""
     t = str(e)
-    ex = "MEXC" if "MEXC" in t else "HTX" if "HTX" in t else "биржи"
+    ex = "Gate" if "Gate" in t else "HTX" if "HTX" in t else "биржи"
     stuck = ", ".join(sorted(deals)) or "новые сделки не начинаются"
     await note_once(f"auth:{ex}", (
         f"⛔ <b>Ключ API {ex} не принимается</b>: <code>{html.escape(t[:200])}</code>\n"
         f"Пока ключ не заменят, сделки стоят (повторяю сами, монеты никуда не деваются): {stuck}.\n"
         f"Что сделать: создай на {ex} новый API-ключ (права: просмотр аккаунта, спот-торговля, просмотр "
         f"депозитов{' и вывод' if ex == 'HTX' else ''}), впиши его в Render в "
-        f"{'MEXC_API_KEY / MEXC_API_SECRET' if ex == 'MEXC' else 'HTX_API_KEY / HTX_API_SECRET'} и перезапусти бота.\n"
-        f"Чтобы ключ не отключался через 90 дней, привяжи его к IP сервера (Render → сервис → Connect → "
-        f"Outbound IP).\nОб этом — не чаще раза в час."), every=3600)
+        f"{'GATE_API_KEY / GATE_API_SECRET' if ex == 'Gate' else 'HTX_API_KEY / HTX_API_SECRET'} и перезапусти бота.\n"
+        f"Если ключ привязан к IP — добавь IP сервера (Render → сервис → Connect → Outbound IP).\n"
+        f"Об этом — не чаще раза в час."), every=3600)
 PAUSE_SEC = 300
-# Продажа по ордерам на покупку MEXC (если цели нет, но покупателей много):
+# Продажа по ордерам на покупку Gate (если цели нет, но покупателей много):
 # лимитка по лучшему покупателю, ждём SELL_HOLD_SEC; потом по следующему
 # покупателю не ниже −step_pct%; ждём; снимаем и ждём SELL_PAUSE_SEC новых.
 SELL_MIN_BIDS = 5      # сколько ордеров на покупку выше пола считать «много»
@@ -2517,8 +2645,8 @@ async def try_start(coin, cfg, opp, check_only=False):
         await note_once(f"wd:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {why} — не покупаю.",
                         every=DAILY)
         return False
-    if not res["mexc_deposit_ok"]:
-        await note_once(f"dep:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но на MEXC закрыт депозит в этой сети — пропускаю.",
+    if not res["gate_deposit_ok"]:
+        await note_once(f"dep:{coin}", f"ℹ️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но на Gate закрыт депозит в этой сети — пропускаю.",
                         every=DAILY)
         return False
     if not arb["dry_run"]:
@@ -2526,7 +2654,7 @@ async def try_start(coin, cfg, opp, check_only=False):
         saved, how = await htx_address_status(res["htx_ticker"], res["htx_chain"], addr)
         if saved is None:
             await note_once(f"addr1:{coin}", f"ℹ️ <b>{coin}</b>: адрес бота для вывода с HTX {how}. "
-                                             f"Если вывод не пройдёт — продам на HTX по цене MEXC и запомню.",
+                                             f"Если вывод не пройдёт — продам на HTX по цене Gate и запомню.",
                             every=DAILY)
         if saved is False:
             why = f"адрес бота для вывода с HTX не принят ({how})"
@@ -2550,25 +2678,25 @@ async def try_start(coin, cfg, opp, check_only=False):
             pass
         if opp["mode"] == "taker":
             _, can_cost, _ = plan_buy(opp["asks"], opp["max_price"], D(10) ** 9,
-                                      opp["bids"] if arb.get("mexc_depth", True) else None, opp["pct"])
+                                      opp["bids"] if arb.get("book_depth", True) else None, opp["pct"])
             how = (f"Выкупил бы продавцов на HTX по цене не выше {fmt(opp['max_price'])} — "
                    f"с соблюдением {cfg['pct']}% сейчас на ~{fmt(can_cost)}$")
         else:
             how = f"Продавцов по цене не выше {fmt(opp['max_price'])} нет — ждал бы их"
         await note_once(f"dry:{coin}", (
             f"🧪 <b>ТЕСТ</b> · <b>{coin}</b>: спред {opp['spread']:.2f}% (мин. {cfg['pct']}%)\n"
-            f"{how}\nMEXC bid {fmt(opp['mexc_bid'])}, USDT на HTX: {usdt}\n"
+            f"{how}\nGate bid {fmt(opp['gate_bid'])}, USDT на HTX: {usdt}\n"
             f"{'Проба ' + str(cfg['probe']) + '$, потом весь баланс' if cfg.get('probe') else 'Сразу на весь баланс'}\n"
             f"Сеть: HTX <code>{res['htx_chain']}</code> → кошелёк "
-            f"<code>{wallet_address(cfg['net'])}</code> → MEXC "
-            f"<code>{res['mexc_net'].get('netWork') or res['mexc_net'].get('network')}</code>\n"
+            f"<code>{wallet_address(cfg['net'])}</code> → Gate "
+            f"<code>{res['gate_net']['chain']}</code>\n"
             f"{contract_line(coin, cfg, res)}\n"
             f"<i>Реальные сделки: /arb_live on</i>"), every=300)
         return False
 
     # Комиссия вывода фиксированная: даже если выкупить на весь баланс, заданный %
     # должен остаться ЧИСТЫМИ, после комиссии вывода. Иначе покупать нет смысла.
-    fee_usd = res["htx_fee"] * opp["mexc_bid"]
+    fee_usd = res["htx_fee"] * opp["gate_bid"]
     try:
         usdt_free = (await htx_balance("usdt"))[0]
     except Exception:
@@ -2581,23 +2709,23 @@ async def try_start(coin, cfg, opp, check_only=False):
                                               f"{fmt(usdt_free)} USDT (деньги в другой сделке или ждут пополнения) — "
                                               f"пропускаю.", every=DAILY)
         return False
-    extra = fee_extra_pct(res["htx_fee"], opp["mexc_bid"], have)
+    extra = fee_extra_pct(res["htx_fee"], opp["gate_bid"], have)
     if D(str(opp["spread"])) < D(cfg["pct"]) + extra:
         if not check_only:
             await note_once(f"fee:{coin}", f"⛔ <b>{coin}</b>: спред {opp['spread']:.2f}%, но комиссия вывода с HTX "
                                            f"~{fmt(fee_usd)}$ даже на весь баланс {fmt(have)}$ съест {extra:.2f}% — "
                                            f"чистыми меньше {cfg['pct']}%. Не покупаю.", every=DAILY)
         return False
-    # Ключ MEXC должен видеть балансы — иначе сделка встанет на первом же шаге.
+    # Ключ Gate должен видеть балансы — иначе сделка встанет на первом же шаге.
     try:
-        await mexc_free(coin)
+        await gate_free(coin)
     except ExchangeError as e:
         if is_auth_error(e):
             await notify_auth_error(e)
             return False
-        await note_once("mexc_perm", f"⛔ Не начинаю сделки: ключ MEXC не видит баланс — <code>{e}</code>\n"
-                                     f"Включи ключу на MEXC право «Аккаунт: просмотр информации об аккаунте» "
-                                     f"(и «Спот: торговля», «Кошелёк: просмотр депозитов»).", every=1800)
+        await note_once("gate_perm", f"⛔ Не начинаю сделки: ключ Gate не видит баланс — <code>{e}</code>\n"
+                                     f"Включи ключу на Gate права «Спот» (чтение и торговля) и «Кошелёк» "
+                                     f"(чтение — для адреса депозита и истории).", every=1800)
         return False
     if check_only:
         return True
@@ -2616,13 +2744,13 @@ async def try_start(coin, cfg, opp, check_only=False):
 # Сделка по монете — это поток, а не одна покупка:
 #   * покупатель на HTX: выкупает продавцов в пределах процента, а если их нет —
 #     держит СВОЙ ордер на покупку первым в стакане (на тик выше лучшего чужого,
-#     но не дороже цены, дающей заданный % к MEXC) и переставляет его, как только
-#     меняется цена на MEXC или его перебивают; остаток ордера не снимается;
+#     но не дороже цены, дающей заданный % к Gate) и переставляет его, как только
+#     меняется цена на Gate или его перебивают; остаток ордера не снимается;
 #   * партии: как только куплено на batch_usd (15$) — сразу вывод на кошелёк, ордер
 #     при этом продолжает стоять и покупать; через check_sec сек. проверяем, ушла ли
 #     партия (свободный баланс монеты на HTX не должен содержать её);
-#   * кошелёк: каждую дошедшую партию пересылаем на депозит MEXC;
-#   * MEXC: всё зачисленное сразу продаём по ордерам на покупку, пока цена даёт
+#   * кошелёк: каждую дошедшую партию пересылаем на депозит Gate;
+#   * Gate: всё зачисленное сразу продаём по ордерам на покупку, пока цена даёт
 #     заданный %; остаток — лесенка от безубытка вниз со спамом.
 # Все шаги крутятся в одном цикле по очереди — без гонок между ними, и после
 # рестарта цикл просто продолжает с сохранённого состояния.
@@ -2637,7 +2765,7 @@ def _add(d, k, v):
 
 def new_deal(coin, cfg, res):
     return {
-        "v": 2, "id": uuid.uuid4().hex[:8], "coin": coin, "cfg": dict(cfg),
+        "v": 3, "id": uuid.uuid4().hex[:8], "coin": coin, "cfg": dict(cfg),
         "started": time.time(), "token": res["token"], "decimals": None,
         "buying": True, "idle_since": None,
         # Проба: сколько ещё $ можно купить, пока первая партия не подтвердилась.
@@ -2649,9 +2777,9 @@ def new_deal(coin, cfg, res):
         "batches": [],                      # партии: вывод подан, ждёт проверки / едет
         "qty": "0", "cost": "0",            # успешно выведено (для безубытка)
         "forwarded": "0", "forwarding": False,
-        "mexc_baseline": None, "sold_qty": "0", "proceeds": "0",
+        "gate_baseline": None, "sold_qty": "0", "proceeds": "0",
         "sell": None, "ladder_since": None, "sell_manual": False,
-        "last_wallet_check": 0.0, "last_mexc_check": 0.0,
+        "last_wallet_check": 0.0, "last_gate_check": 0.0,
     }
 
 
@@ -2670,8 +2798,8 @@ async def run_deal(d):
             await save()
             return
         try:
-            if d["mexc_baseline"] is None:
-                d["mexc_baseline"] = str(await mexc_free(d["coin"]))
+            if d["gate_baseline"] is None:
+                d["gate_baseline"] = str(await gate_free(d["coin"]))
             if d["decimals"] is None:
                 d["decimals"] = await wallet_decimals(d["cfg"]["net"], d["token"])
             if d["buying"]:
@@ -2709,10 +2837,10 @@ def deal_finished(d):
     if any(not b["ok"] for b in d["batches"]):
         return False
     if d["sell_manual"]:
-        return bool(d.get("manual_sold"))  # итог — только когда монеты ушли с MEXC
+        return bool(d.get("manual_sold"))  # итог — только когда монеты ушли с Gate
     if any(not b["fwd"] for b in d["batches"]):
         return False
-    # Всё отправленное на MEXC продано (с допуском на комиссии) — сделка закончена.
+    # Всё отправленное на Gate продано (с допуском на комиссии) — сделка закончена.
     return _dd(d, "sold_qty") >= _dd(d, "forwarded") * D("0.97")
 
 
@@ -2780,8 +2908,8 @@ async def buy_step(d):
 
     await _sync_order(d)
 
-    (mbids, _), (hbids, hasks) = await asyncio.gather(mexc_depth(f"{coin}USDT"), htx_depth(hpair))
-    if not mbids:
+    (gbids, _), (hbids, hasks) = await asyncio.gather(gate_depth(gsym(coin)), htx_depth(hpair))
+    if not gbids:
         return
     free_usdt, _ = await htx_balance("usdt")
     o = d["order"]
@@ -2794,11 +2922,11 @@ async def buy_step(d):
     # всю партию: уже купленное + оставшиеся деньги) чистыми остаётся заданный %.
     pct = D(cfg["pct"])
     if d.get("wd_fee") is not None:
-        pct += fee_extra_pct(D(d["wd_fee"]), mbids[0][0], _dd(d, "unw_cost") + budget)
-    max_price = round_down(mbids[0][0] / (1 + pct / 100), tick)
+        pct += fee_extra_pct(D(d["wd_fee"]), gbids[0][0], _dd(d, "unw_cost") + budget)
+    max_price = round_down(gbids[0][0] / (1 + pct / 100), tick)
 
     # Партия набралась и вывод окупается — выводим, покупка продолжается.
-    if _worth_withdrawing(d, mbids[0][0]):
+    if _worth_withdrawing(d, gbids[0][0]):
         await withdraw_batch(d)
         if not d["buying"]:
             return
@@ -2827,12 +2955,12 @@ async def buy_step(d):
         wd_fee = D(d["wd_fee"]) if d.get("wd_fee") is not None else None
         cap_pct = base_pct
         for _ in range(5):
-            cap = round_down(mbids[0][0] / (1 + cap_pct / 100), tick)
-            if arb.get("mexc_depth", True):
-                qty, cost, last = plan_buy(hasks, cap, budget, mbids, cap_pct)
+            cap = round_down(gbids[0][0] / (1 + cap_pct / 100), tick)
+            if arb.get("book_depth", True):
+                qty, cost, last = plan_buy(hasks, cap, budget, gbids, cap_pct)
             else:
                 qty, cost, last = plan_buy(hasks, cap, budget)
-            need_pct = base_pct + (fee_extra_pct(wd_fee, mbids[0][0], unw_c + cost)
+            need_pct = base_pct + (fee_extra_pct(wd_fee, gbids[0][0], unw_c + cost)
                                    if wd_fee is not None and unw_c + cost > 0 else D(0))
             if need_pct <= cap_pct + D("0.0001"):
                 break
@@ -2847,7 +2975,7 @@ async def buy_step(d):
             # (или меньше минимума вывода HTX) — не покупаем, ждём.
             await _idle(d, "продавцов по цене, выгодной с учётом комиссии вывода, нет")
             return
-        price = min(cap, round_up(last, tick)) if (last is not None and arb.get("mexc_depth", True)) else cap
+        price = min(cap, round_up(last, tick)) if (last is not None and arb.get("book_depth", True)) else cap
         qty = round_down(qty, info["step"])
         if qty > 0 and qty >= info["min_qty"] and qty * price >= info["min_value"]:
             d["ioc"] = "pending"
@@ -2868,7 +2996,7 @@ async def buy_step(d):
                 if d["probe_left"] is not None:
                     d["probe_left"] = str(D(d["probe_left"]) - st["cash"])
                 await notify(f"🟢 <b>{coin}</b>: выкупил на HTX {fmt(st['filled'])} шт. на {fmt(st['cash'])}$ "
-                             f"(ср. {fmt(st['cash'] / st['filled'])}, MEXC bid {fmt(mbids[0][0])})")
+                             f"(ср. {fmt(st['cash'] / st['filled'])}, Gate bid {fmt(gbids[0][0])})")
             d["idle_since"] = None
             return
 
@@ -2891,7 +3019,7 @@ FEE_NEGLIGIBLE_PCT = D("0.1")  # пока покупка идёт: вывод ч
 FEE_SANE_PCT = D("10")          # после покупки: выводим всё, если комиссия не съедает > 10% партии
 
 
-def _worth_withdrawing(d, mexc_bid, final=False):
+def _worth_withdrawing(d, gate_bid, final=False):
     """Процент выгоды проверяется ПРИ ПОКУПКЕ (с учётом комиссии вывода). После покупки
     условия по % нет — монеты выводим, чтобы продать по той выгоде, что есть:
       * пока покупка идёт (final=False) — частями, только если комиссия мизерная (иначе
@@ -2907,7 +3035,7 @@ def _worth_withdrawing(d, mexc_bid, final=False):
         return False
     if d.get("wd_fee") is None:  # сделка из старой версии
         return unw_c >= D(d.get("min_batch") or arb["batch_usd"])
-    bid = D(str(mexc_bid))
+    bid = D(str(gate_bid))
     fee_usd = D(d["wd_fee"]) * (bid if bid > 0 else unw_c / unw_q)
     limit = FEE_SANE_PCT if final else FEE_NEGLIGIBLE_PCT
     return fee_usd <= unw_c * limit / 100
@@ -2931,17 +3059,17 @@ async def flush_carry(coin, cfg):
             await save()
             return
         res = await resolve_coin(coin, cfg)
-        if not res["htx_withdraw_ok"] or not res["mexc_deposit_ok"]:
+        if not res["htx_withdraw_ok"] or not res["gate_deposit_ok"]:
             return
-        mbids, _ = await mexc_depth(f"{coin}USDT")
-        if not mbids:
+        gbids, _ = await gate_depth(gsym(coin))
+        if not gbids:
             return
         d = new_deal(coin, cfg, res)
         d["wd_fee"] = str(res["htx_fee"])
         d["wd_min"] = str(res["htx_min_withdraw"])
         d["buying"] = False
         await _take_carry(d)
-        bid = mbids[0][0]
+        bid = gbids[0][0]
         if not _worth_withdrawing(d, bid, final=True):
             # комиссия всё ещё заметна — кладём обратно и ждём следующей сделки
             if _dd(d, "unw_qty") > 0:
@@ -2994,8 +3122,8 @@ async def _stop_buying(d, why):
     unw_q, unw_c = _dd(d, "unw_qty"), _dd(d, "unw_cost")
     if unw_q > 0:
         try:
-            mbids, _ = await mexc_depth(f"{d['coin']}USDT")
-            mbid = mbids[0][0] if mbids else D(0)
+            gbids, _ = await gate_depth(gsym(d['coin']))
+            mbid = gbids[0][0] if gbids else D(0)
         except Exception:
             mbid = D(0)
         if _worth_withdrawing(d, mbid, final=True):
@@ -3110,7 +3238,7 @@ async def _batch_failed(d, breakeven, reason):
     d["buying"] = False
     d["unw_qty"] = d["unw_cost"] = d["htx_rest"] = "0"
     r = {"id": uuid.uuid4().hex[:8], "coin": hcoin(d["coin"], d["cfg"]), "symbol": hsym(d["coin"], d["cfg"]),
-         "mexc_coin": d["coin"], "breakeven": str(breakeven or 0), "reason": reason,
+         "sell_coin": d["coin"], "breakeven": str(breakeven or 0), "reason": reason,
          "order_id": None, "price": None, "created": time.time()}
     rescues.append(r)
     await save()
@@ -3143,7 +3271,7 @@ async def check_batches(d):
         await notify(f"✅ <b>{coin}</b>: партия {fmt(amount)} шт. ушла с HTX (заморожено {fmt(frozen)}).")
 
 
-# ---------- кошелёк → MEXC ----------
+# ---------- кошелёк → Gate ----------
 
 async def transport_step(d):
     if time.time() - d["last_wallet_check"] < 10:
@@ -3167,7 +3295,7 @@ async def transport_step(d):
             return
         d["forwarding"] = False
 
-    # Кошелёк пересылает на MEXC ВСЁ, что на нём есть: партия, пришедшая раньше, чем
+    # Кошелёк пересылает на Gate ВСЁ, что на нём есть: партия, пришедшая раньше, чем
     # прошла её проверка вывода, могла уехать вместе с предыдущей. Переслано больше,
     # чем числится за отмеченными партиями, — этим излишком закрываем следующие.
     extra = _dd(d, "forwarded") - sum((D(b["amount"]) for b in d["batches"] if b["fwd"]), D(0))
@@ -3188,9 +3316,9 @@ async def transport_step(d):
         return
 
     res = await resolve_coin(coin, d["cfg"])
-    address, memo = await mexc_deposit_address(coin, res["mexc_net"])
+    address, memo = await gate_deposit_address(coin, res["gate_net"])
     if memo and net not in MEMO_NETS:
-        raise ExchangeError(f"MEXC требует memo для {coin} в сети {NET_TITLES[net]} — эта сеть memo не поддерживает")
+        raise ExchangeError(f"Gate требует memo для {coin} в сети {NET_TITLES[net]} — эта сеть memo не поддерживает")
     d["forwarding"] = True
     await save()
     tx, sent_raw = await wallet_send_all(net, d["token"], address, memo)
@@ -3203,52 +3331,52 @@ async def transport_step(d):
             covered += D(b["amount"])
             b["fwd"] = True
     _add(d, "forwarded", sent)
-    await notify(f"🚚 <b>{coin}</b>: отправил {fmt(sent)} шт. на MEXC\ntx: <code>{tx}</code>",
+    await notify(f"🚚 <b>{coin}</b>: отправил {fmt(sent)} шт. на Gate\ntx: <code>{tx}</code>",
                  kb=None if d["sell_manual"] else InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                     text="✋ Не продавать на MEXC — продам сам", callback_data=f"arbmanual:{d['id']}")]]))
+                     text="✋ Не продавать на Gate — продам сам", callback_data=f"arbmanual:{d['id']}")]]))
 
 
-# ---------- продажа на MEXC ----------
+# ---------- продажа на Gate ----------
 
 async def sell_step(d, alarm):
     if d.pop("manual_request", False) and not d["sell_manual"]:
         # Кнопка «продам сам»: снимаем свою лимитку и больше не продаём.
         if d["sell"]:
-            await _sell_cancel(d, f"{d['coin']}USDT")
+            await _sell_cancel(d, gsym(d['coin']))
         d["sell_manual"] = True
         await save()
-        await notify(f"✋ <b>{d['coin']}</b>: продажу на MEXC остановил — продаёшь сам. "
-                     f"Итог сделки пришлю, когда монеты уйдут с MEXC.")
+        await notify(f"✋ <b>{d['coin']}</b>: продажу на Gate остановил — продаёшь сам. "
+                     f"Итог сделки пришлю, когда монеты уйдут с Gate.")
     if d["sell_manual"]:
         if alarm["id"]:
             alarm_end(alarm["id"])
             alarm["id"] = None
-        # Продаёшь сам: ждём, пока монеты сделки уйдут с MEXC, — тогда итог.
-        if time.time() - d["last_mexc_check"] >= 30:
-            d["last_mexc_check"] = time.time()
+        # Продаёшь сам: ждём, пока монеты сделки уйдут с Gate, — тогда итог.
+        if time.time() - d["last_gate_check"] >= 30:
+            d["last_gate_check"] = time.time()
             fwd = _dd(d, "forwarded")
-            left = await mexc_total(d["coin"]) - D(d["mexc_baseline"])
+            left = await gate_total(d["coin"]) - D(d["gate_baseline"])
             if fwd > 0 and left >= fwd * D("0.9"):
-                d["manual_seen"] = True  # монеты дошли до MEXC
+                d["manual_seen"] = True  # монеты дошли до Gate
             elif d.get("manual_seen") and left <= fwd * D("0.03") and not any(
                     not b["fwd"] for b in d["batches"]):
-                d["manual_sold"] = True  # и ушли с MEXC — продал
+                d["manual_sold"] = True  # и ушли с Gate — продал
         return
     if _dd(d, "qty") <= 0:
         return
-    if not d["sell"] and time.time() - d["last_mexc_check"] < 3:
+    if not d["sell"] and time.time() - d["last_gate_check"] < 3:
         return
-    d["last_mexc_check"] = time.time()
+    d["last_gate_check"] = time.time()
     coin, cfg = d["coin"], d["cfg"]
-    sym = f"{coin}USDT"
-    info = await mexc_symbol(sym)
+    sym = gsym(coin)
+    info = await gate_symbol(sym)
     breakeven = deal_breakeven(d)
     target = breakeven * (1 + D(cfg["pct"]) / 100)
 
     # Учёт исполнений стоящей лесенки.
     s = d["sell"]
     if s:
-        o = await mexc_order(sym, s["id"])
+        o = await gate_order(sym, s["id"])
         dq, dc = o["filled"] - D(s["filled"]), o["quote"] - D(s["quote"])
         if dq > 0:
             s["filled"], s["quote"] = str(o["filled"]), str(o["quote"])
@@ -3259,26 +3387,26 @@ async def sell_step(d, alarm):
         elif o["status"] in ("CANCELED", "PARTIALLY_CANCELED") and not s.get("self_cancel"):
             d["sell"] = None
             d["sell_manual"] = True
-            await notify(f"ℹ️ <b>{coin}</b>: ордер на продажу на MEXC отменён вручную — дальше продаёшь сам. "
+            await notify(f"ℹ️ <b>{coin}</b>: ордер на продажу на Gate отменён вручную — дальше продаёшь сам. "
                          f"Итог сделки пришлю, когда монеты будут проданы.")
             return
 
-    free = await mexc_free(coin)
-    new = round_down(free - D(d["mexc_baseline"]), info["step"])
-    enough = lambda q, p: q > 0 and q * p >= info["min_value"]
+    free = await gate_free(coin)
+    new = round_down(free - D(d["gate_baseline"]), info["step"])
+    enough = lambda q, p: q > 0 and q >= info["min_qty"] and q * p >= info["min_value"]
 
     # 1) Новое зачисление — сразу по ордерам на покупку, пока держится процент.
     if enough(new, breakeven):
-        bids, _ = await mexc_depth(sym)
+        bids, _ = await gate_depth(sym)
         if bids and bids[0][0] >= target:
             price = round_up(target, info["tick"])
-            oid = await mexc_place(sym, "SELL", "IMMEDIATE_OR_CANCEL", new, price)
-            o = await mexc_wait_final(sym, oid)
+            oid = await gate_place(sym, "sell", "ioc", new, price)
+            o = await gate_wait_final(sym, oid)
             _add(d, "sold_qty", o["filled"])
             _add(d, "proceeds", o["quote"])
             new -= o["filled"]
             if o["filled"] > 0:
-                await notify(f"💰 <b>{coin}</b>: продано на MEXC {fmt(o['filled'])} шт. на {fmt(o['quote'])}$ "
+                await notify(f"💰 <b>{coin}</b>: продано на Gate {fmt(o['filled'])} шт. на {fmt(o['quote'])}$ "
                              f"(≥ {fmt(price)}, цель +{cfg['pct']}%).")
 
     s = d["sell"]
@@ -3295,7 +3423,7 @@ async def sell_step(d, alarm):
 
     # 2) Цели нет. Стакан не давим: лимитка никогда не ниже лучшего покупателя,
     #    так что за раз исполняется только он, а остаток стоит и ждёт новых.
-    bids, asks = await mexc_depth(sym)
+    bids, asks = await gate_depth(sym)
     floor = round_up(breakeven * (1 - D(str(arb["floor_pct"])) / 100), info["tick"])
     live = [p for p, q in bids if p >= floor]
     many = len(live) >= SELL_MIN_BIDS
@@ -3304,10 +3432,10 @@ async def sell_step(d, alarm):
         qty = new
         if d["sell"]:
             await _sell_cancel(d, sym)
-            qty = round_down(await mexc_free(coin) - D(d["mexc_baseline"]), info["step"])
+            qty = round_down(await gate_free(coin) - D(d["gate_baseline"]), info["step"])
         if not enough(qty, price):
             return False
-        oid = await mexc_place(sym, "SELL", "LIMIT", qty, price)
+        oid = await gate_place(sym, "sell", "gtc", qty, price)
         d["sell"] = dict({"id": oid, "price": str(price), "qty": str(qty), "filled": "0", "quote": "0",
                           "placed": now}, **meta)
         await save()
@@ -3336,7 +3464,7 @@ async def sell_step(d, alarm):
             return
         if s:  # стояла лесенка — переходим на продажу по покупателям
             await _sell_cancel(d, sym)
-            new = round_down(await mexc_free(coin) - D(d["mexc_baseline"]), info["step"])
+            new = round_down(await gate_free(coin) - D(d["gate_baseline"]), info["step"])
         if now < (d.get("sell_pause_until") or 0):
             return
         d["sell_pause_until"] = None
@@ -3352,7 +3480,7 @@ async def sell_step(d, alarm):
     if s and s.get("mode") == "bid":
         await _sell_cancel(d, sym)
         s = None
-        new = round_down(await mexc_free(coin) - D(d["mexc_baseline"]), info["step"])
+        new = round_down(await gate_free(coin) - D(d["gate_baseline"]), info["step"])
         has_more = enough(new, breakeven)
     if d["ladder_since"] is None:
         d["ladder_since"] = now
@@ -3370,14 +3498,14 @@ async def sell_step(d, alarm):
 
 
 async def _sell_cancel(d, sym):
-    """Снимает свою лимитку продажи на MEXC и учитывает, что по ней успело продаться."""
+    """Снимает свою лимитку продажи на Gate и учитывает, что по ней успело продаться."""
     s = d["sell"]
     if not s:
         return
     s["self_cancel"] = True
     await save()  # чтобы после рестарта своя отмена не выглядела ручной
-    await mexc_cancel(sym, s["id"])
-    o = await mexc_wait_final(sym, s["id"], timeout=5)
+    await gate_cancel(sym, s["id"])
+    o = await gate_wait_final(sym, s["id"], timeout=5)
     _add(d, "sold_qty", o["filled"] - D(s["filled"]))
     _add(d, "proceeds", o["quote"] - D(s["quote"]))
     d["sell"] = None
@@ -3388,7 +3516,7 @@ async def _sell_alarm(d, alarm, target, breakeven, floor):
     price = D(s["price"])
     how = ("по ордерам на покупку" + (" (следующий покупатель)" if s.get("stage") else "")
            if s.get("mode") == "bid" else "лесенкой")
-    text = (f"<b>{d['coin']}</b>: не удалось продать на MEXC с плановой выгодой (цель {fmt(target)}). "
+    text = (f"<b>{d['coin']}</b>: не удалось продать на Gate с плановой выгодой (цель {fmt(target)}). "
             f"Продаю {how}: лимитка {fmt(D(s['qty']))} шт. по {fmt(price)} "
             f"({(price / breakeven - 1) * 100:+.2f}% к безубытку {fmt(breakeven)})"
             + (" — это пол, ниже не опускаю." if price <= floor else "."))
@@ -3402,16 +3530,16 @@ async def finish_deal(d):
     cost = _dd(d, "cost")
     if _dd(d, "qty") <= 0:
         return  # ничего не вывели (или вывод не прошёл — тогда итог даст аварийная продажа)
-    # Продано — по истории сделок MEXC (учитывает и ручные продажи).
+    # Продано — по истории сделок Gate (учитывает и ручные продажи).
     try:
-        sold, proceeds = await mexc_sold_since(f"{d['coin']}USDT", d["started"])
+        sold, proceeds = await gate_sold_since(gsym(d['coin']), d["started"])
         fwd = _dd(d, "forwarded")
         if sold > fwd > 0:  # продано больше, чем пришло по сделке: берём долю сделки
             sold, proceeds = fwd, proceeds * fwd / sold
     except Exception:
         sold, proceeds = _dd(d, "sold_qty"), _dd(d, "proceeds")
     if sold <= 0:
-        await notify(f"ℹ️ <b>{d['coin']}</b>: монеты сделки ушли с MEXC, но продаж в истории MEXC не видно — "
+        await notify(f"ℹ️ <b>{d['coin']}</b>: монеты сделки ушли с Gate, но продаж в истории Gate не видно — "
                      f"итог не считаю. Куплено на HTX за {fmt(cost)}$.")
         return
     d["sold_qty"] = str(sold)
@@ -3423,22 +3551,22 @@ async def finish_deal(d):
         f"🏁 <b>{d['coin']}</b>: сделка завершена.\n"
         f"Куплено на HTX: {fmt(sum(D(b.get('bought', b['qty'])) for b in d['batches'] if b['ok']))} шт. "
         f"за {fmt(cost)}$\n"
-        f"Выведено с HTX (после комиссий): {fmt(d['qty'])} шт., дошло до MEXC: {fmt(d['forwarded'])} шт.\n"
-        f"Продано на MEXC: {fmt(d['sold_qty'])} шт. за {fmt(proceeds)}$\n"
+        f"Выведено с HTX (после комиссий): {fmt(d['qty'])} шт., дошло до Gate: {fmt(d['forwarded'])} шт.\n"
+        f"Продано на Gate: {fmt(d['sold_qty'])} шт. за {fmt(proceeds)}$\n"
         f"Итог: <b>{pnl:+.2f}$</b> ({(pnl / cost * 100 if cost else 0):+.2f}%)")
 
 
 # ---------- аварийная продажа на HTX ----------
 
 # Аварийная продажа на HTX, если вывод не прошёл: (сек. от начала, скидка от цены
-# MEXC в %). Со скидкой продаём, только если цена всё ещё ≥ закупки + RESCUE_MIN_PROFIT%;
+# Gate в %). Со скидкой продаём, только если цена всё ещё ≥ закупки + RESCUE_MIN_PROFIT%;
 # после последней ступени — в безубыток.
 RESCUE_STEPS = [(0, 0), (300, 1.5), (480, 2.0), (780, 2.5)]
 RESCUE_BREAKEVEN_AFTER = 1080
 RESCUE_MIN_PROFIT = 1.0
 
 
-def rescue_price(mexc_bid, breakeven, elapsed, tick):
+def rescue_price(gate_bid, breakeven, elapsed, tick):
     """Цена аварийной продажи на HTX: (цена, описание ступени)."""
     if breakeven > 0 and elapsed >= RESCUE_BREAKEVEN_AFTER:
         return round_up(breakeven, tick), "в безубыток"
@@ -3446,28 +3574,28 @@ def rescue_price(mexc_bid, breakeven, elapsed, tick):
     for start, pct in RESCUE_STEPS:
         if elapsed >= start:
             disc = pct
-    price = round_down(mexc_bid * (1 - D(disc) / 100), tick)
+    price = round_down(gate_bid * (1 - D(disc) / 100), tick)
     if disc and breakeven > 0:
         min_price = round_up(breakeven * (1 + D(RESCUE_MIN_PROFIT) / 100), tick)
         if price < min_price:
-            return min_price, f"MEXC −{disc:g}% ниже закупки +{RESCUE_MIN_PROFIT:g}% — держу закупка +{RESCUE_MIN_PROFIT:g}%"
-    return price, ("= цена покупки на MEXC" if not disc else f"= MEXC −{disc:g}%")
+            return min_price, f"Gate −{disc:g}% ниже закупки +{RESCUE_MIN_PROFIT:g}% — держу закупка +{RESCUE_MIN_PROFIT:g}%"
+    return price, ("= цена покупки на Gate" if not disc else f"= Gate −{disc:g}%")
 
 
 async def run_rescue(r):
-    """Вывод не прошёл: продаём монету на HTX вслед за ценой покупки на MEXC —
-    5 мин. по цене MEXC, потом 3 мин. −1,5%, 5 мин. −2%, 5 мин. −2,5% (но не ниже
+    """Вывод не прошёл: продаём монету на HTX вслед за ценой покупки на Gate —
+    5 мин. по цене Gate, потом 3 мин. −1,5%, 5 мин. −2%, 5 мин. −2,5% (но не ниже
     закупки +1%), дальше — в безубыток. Спам — сразу. Если спам
     остановили (/stop или кнопка) — бот «забивает» на монету: ордер не трогает и
     не торгует ею PAUSE_SEC сек. или до /arb_resume."""
     coin, sym = r["coin"], r.get("symbol") or f"{r['coin']}usdt"
-    mcoin = r.get("mexc_coin") or coin
+    mcoin = r.get("sell_coin") or r.get("mexc_coin") or coin
     aid = None
     try:
         info = await htx_symbol(sym)
         free, _ = await htx_balance(coin)
         aid = alarm_start(f"<b>{mcoin}</b>: куплено {fmt(free)} шт. на HTX, но вывод не прошёл: {r['reason']}\n"
-                          f"Продаю на HTX по цене MEXC.", pause_coin=mcoin)
+                          f"Продаю на HTX по цене Gate.", pause_coin=mcoin)
         while True:
             if alarms.get(aid, {}).get("acked"):
                 return  # спам остановлен — «забили» на монету, ордер оставляем как есть
@@ -3481,8 +3609,8 @@ async def run_rescue(r):
                     await notify(f"ℹ️ <b>{mcoin}</b>: ордер на продажу на HTX отменён вручную "
                                  f"(продано {fmt(o['filled'])} шт.). Дальше — вручную.")
                     return
-            # Цена продажи = текущая лучшая цена покупки на MEXC.
-            bids, _ = await mexc_depth(f"{mcoin}USDT")
+            # Цена продажи = текущая лучшая цена покупки на Gate.
+            bids, _ = await gate_depth(gsym(mcoin))
             if not bids:
                 await asyncio.sleep(5)
                 continue
@@ -3504,7 +3632,7 @@ async def run_rescue(r):
                 await save()
                 alarm_update(aid, f"<b>{mcoin}</b>: куплено {fmt(qty)} шт. на HTX, но вывод не прошёл: {r['reason']}\n"
                                   f"Ордер на продажу на HTX: {fmt(qty)} шт. по {fmt(price)} ({stage}), "
-                                  f"закупка {fmt(D(r.get('breakeven') or 0))}. Переставляю вслед за MEXC.")
+                                  f"закупка {fmt(D(r.get('breakeven') or 0))}. Переставляю вслед за Gate.")
             await asyncio.sleep(5)
     except Exception as e:
         print(f"[arb] rescue {coin}: {traceback.format_exc()}", flush=True)
@@ -3548,12 +3676,12 @@ _TESTNET_RE = re.compile(r"test|devnet|rinkeby|goerli|sepolia|holesky|hoodi|kova
 
 
 async def pick_chain_for_coin(cands, coin):
-    """Из нескольких похожих сетей выбирает ту, где живёт монета с MEXC:
-      * токен — его контракт с MEXC реально есть в сети (eth_getCode через её ноду);
-      * иначе — название сети совпадает с названием сети монеты на MEXC
+    """Из нескольких похожих сетей выбирает ту, где живёт монета с Gate:
+      * токен — его контракт с Gate реально есть в сети (eth_getCode через её ноду);
+      * иначе — название сети совпадает с названием сети монеты на Gate
         («Arbitrum One» ↔ «Arbitrum One(ARB)»), а для родной монеты — газ сети.
     Возвращает сеть или None, если однозначно выбрать нельзя."""
-    nets = await mexc_networks(coin)
+    nets = await gate_networks(coin)
     contracts = {(n.get("contract") or "").strip() for n in nets}
     contracts = [c for c in contracts if re.fullmatch(r"0x[0-9a-fA-F]{40}", c)]
 
@@ -3579,9 +3707,8 @@ async def pick_chain_for_coin(cands, coin):
             return hits[0]
         cands = hits or cands
     squash = lambda x: re.sub(r"[^a-z0-9]", "", str(x or "").lower())
-    mexc_names = [squash(n.get("name")) + " " + squash(n.get("netWork")) + " " + squash(n.get("network"))
-                  for n in nets]
-    by_name = [c for c in cands if squash(c.get("name")) and any(squash(c.get("name")) in m for m in mexc_names)]
+    gate_names = [squash(n.get("name")) + " " + squash(n.get("chain")) for n in nets]
+    by_name = [c for c in cands if squash(c.get("name")) and any(squash(c.get("name")) in m for m in gate_names)]
     if len(by_name) == 1:
         return by_name[0]
     native = [c for c in cands if str((c.get("nativeCurrency") or {}).get("symbol", "")).upper() == coin.upper()]
@@ -3640,7 +3767,7 @@ async def discover_network(query, coin=None):
       1) сеть в реестре Chainlist должна найтись однозначно (тестнеты отброшены);
       2) каждая нода сама должна вернуть тот же chain id, что в реестре;
       3) ноды должны сходиться по высоте блока (отстающие/чужие отбрасываются);
-      4) сверка с биржей: для токена его контракт с MEXC должен существовать в
+      4) сверка с биржей: для токена его контракт с Gate должен существовать в
          этой сети (eth_getCode), для родной монеты — совпасть монета газа.
     Возвращает код сети или бросает ExchangeError с понятной причиной."""
     q = re.sub(r"[^a-z0-9_]", "", str(query).lower())
@@ -3680,17 +3807,17 @@ async def discover_network(query, coin=None):
     if coin:
         coin = coin.upper()
         if coin != native:
-            nets = await mexc_networks(coin)
+            nets = await gate_networks(coin)
             register_net(name, good[0]["url"], native, aliases)
-            mx = [n for n in nets if matches_net(name, n.get("netWork"), n.get("network"))]
+            mx = [n for n in nets if matches_net(name, *gate_net_names(n))]
             token = (mx[0].get("contract") or "").strip() if mx else ""
             if not token:
                 unregister_net(name)
-                raise ExchangeError(f"у {coin} на MEXC нет сети {chain.get('name')} с контрактом — не добавляю")
+                raise ExchangeError(f"у {coin} на Gate нет сети {chain.get('name')} с контрактом — не добавляю")
             code = await rpc(name, "eth_getCode", [token, "latest"])
             if not code or code in ("0x", "0x0"):
                 unregister_net(name)
-                raise ExchangeError(f"контракт {coin} с MEXC ({token}) не найден в сети {chain.get('name')} — "
+                raise ExchangeError(f"контракт {coin} с Gate ({token}) не найден в сети {chain.get('name')} — "
                                     f"значит, это не та сеть, не добавляю")
     arb.setdefault("networks", {})[name] = {"rpc": good[0]["url"], "rpcs": [p["url"] for p in good[:5]],
                                             "native": native, "aliases": aliases, "chain_id": cid}
@@ -3744,7 +3871,7 @@ def _keys_text():
     except Exception as e:
         cosmos = f"ошибка ключа: {e}"
     return (f"{mark(HTX_API_KEY and HTX_API_SECRET)} ключ HTX · "
-            f"{mark(MEXC_API_KEY and MEXC_API_SECRET)} ключ MEXC\n"
+            f"{mark(GATE_API_KEY and GATE_API_SECRET)} ключ Gate\n"
             f"👛 EVM (ETH/BNB/Monad): {evm}\n"
             f"👛 Sui: {sui}\n"
             f"👛 Cosmos Hub: {cosmos}\n"
@@ -3759,7 +3886,7 @@ async def cmd_arb(message: types.Message):
     if not await _guard(message):
         return
     lines = [
-        "🤖 <b>Автоарбитраж HTX → кошелёк → MEXC</b>",
+        "🤖 <b>Автоарбитраж HTX → кошелёк → Gate</b>",
         f"{'▶️ ВКЛ' if arb['enabled'] else '⏸ ВЫКЛ'} · "
         f"{'🧪 тест' if arb['dry_run'] else '💸 реальные сделки'} · "
         f"цикл был {_ago(engine_state['last_pass'])} назад (каждые {arb['poll_sec']:g} сек)",
@@ -3772,14 +3899,14 @@ async def cmd_arb(message: types.Message):
         if not cfg.get("htx_symbol"):
             return coin, cfg, None, "пара на HTX ещё не найдена"
         try:
-            (mbids, _), (_, hasks) = await asyncio.gather(mexc_depth(f"{coin}USDT"), htx_depth(hsym(coin, cfg)))
-            if not mbids or not hasks:
+            (gbids, _), (_, hasks) = await asyncio.gather(gate_depth(gsym(coin)), htx_depth(hsym(coin, cfg)))
+            if not gbids or not hasks:
                 return coin, cfg, None, "пустой стакан"
-            return coin, cfg, (mbids[0][0] - hasks[0][0]) / hasks[0][0] * 100, None
+            return coin, cfg, (gbids[0][0] - hasks[0][0]) / hasks[0][0] * 100, None
         except Exception as e:
             return coin, cfg, None, str(e)[:80]
 
-    lines.append("\n<b>Спред HTX→MEXC сейчас:</b>")
+    lines.append("\n<b>Спред HTX→Gate сейчас:</b>")
     if not arb["coins"]:
         lines.append("— список пуст (/arb_add)")
     for coin, cfg, sp, err in await asyncio.gather(*[spread_now(c, cfg) for c, cfg in arb["coins"].items()]):
@@ -3820,9 +3947,9 @@ async def cmd_arb(message: types.Message):
             lines.append(f"партии: на проверке вывода {len(checking)}, идут на кошелёк {len(on_way)}")
         be = deal_breakeven(d)
         if be:
-            lines.append(f"выведено {fmt(d['qty'])} шт. (безубыток {fmt(be)}), на MEXC отправлено {fmt(d['forwarded'])}")
+            lines.append(f"выведено {fmt(d['qty'])} шт. (безубыток {fmt(be)}), на Gate отправлено {fmt(d['forwarded'])}")
         if _dd(d, "sold_qty") > 0 or d.get("sell"):
-            lines.append(f"продано на MEXC: {fmt(d['sold_qty'])} шт. на {fmt(d['proceeds'])}$"
+            lines.append(f"продано на Gate: {fmt(d['sold_qty'])} шт. на {fmt(d['proceeds'])}$"
                          + (f"; лесенка {fmt(d['sell']['qty'])} шт. по {fmt(d['sell']['price'])}" if d.get("sell") else ""))
     for c in [c for c, v in arb.get("carry", {}).items() if D(v["cost"]) < 1]:
         arb["carry"].pop(c)  # пыль — не показываем и не храним
@@ -3846,20 +3973,20 @@ async def cmd_arb(message: types.Message):
     except Exception as e:
         lines.append(f"HTX: ошибка — {str(e)[:80]}")
     try:
-        lines.append(f"MEXC: {fmt(await mexc_free('USDT'))} USDT")
+        lines.append(f"Gate: {fmt(await gate_free('USDT'))} USDT")
     except Exception as e:
-        lines.append(f"MEXC: ошибка — {str(e)[:80]}")
+        lines.append(f"Gate: ошибка — {str(e)[:80]}")
 
     # --- Настройки ---
     lines += [
         "",
         "<b>Настройки:</b>",
-        f"продажа на MEXC без цели: если покупателей ≥{SELL_MIN_BIDS} — по их ценам "
+        f"продажа на Gate без цели: если покупателей ≥{SELL_MIN_BIDS} — по их ценам "
         f"({SELL_HOLD_SEC} сек. на лучшем, потом на следующем не ниже −{arb['step_pct']}%, "
         f"пауза {SELL_PAUSE_SEC} сек.); иначе лесенка −{arb['step_pct']}% каждые {arb['step_sec']} сек.; "
         f"пол −{arb['floor_pct']}% от безубытка, ниже лучшего покупателя не ставит",
-        f"проверка вывода HTX через {arb['check_sec']} сек. · стакан MEXC при покупке: "
-        f"{'учитывается' if arb.get('mexc_depth', True) else 'только лучшая цена'}",
+        f"проверка вывода HTX через {arb['check_sec']} сек. · стакан Gate при покупке: "
+        f"{'учитывается' if arb.get('book_depth', True) else 'только лучшая цена'}",
         f"покупка на HTX только у продавцов по цене с твоим %, своих ордеров в стакане нет · "
         f"твой % проверяется при покупке (с комиссией вывода); после покупки — вывод без условий по %: "
         f"во время покупки частями, если комиссия ≤{FEE_NEGLIGIBLE_PCT}%, после — всё разом (от "
@@ -3881,9 +4008,9 @@ async def cmd_arb(message: types.Message):
 # Считаем по истории САМИХ бирж, а не по памяти бота: так попадают и ручные
 # покупки/продажи, и всё, что бот мог «потерять» при перезапуске.
 #
-# Учёт — единый по монете на ОБЕИХ биржах (купил на HTX, продал на MEXC или наоборот —
+# Учёт — единый по монете на ОБЕИХ биржах (купил на HTX, продал на Gate или наоборот —
 # неважно где): покупка добавляет монеты, продажа и комиссии их списывают, перевод
-# между биржами (HTX → кошелёк → MEXC) — лишь перемещение, только его потери (комиссия
+# между биржами (HTX → кошелёк → Gate) — лишь перемещение, только его потери (комиссия
 # вывода, газ) списываются как расход. Каждая продажа списывает последние купленные
 # до неё монеты (арбитраж продаёт то, что только что купил; старые запасы не трогает).
 # Затем сверка: по каждой монете куплено = продано + комиссии + остаток, а остаток
@@ -3902,7 +4029,7 @@ _HIST_FIELDS = ("id", "created-at", "type", "filled-amount", "price", "filled-fe
 
 def _is_rate_limit(e):
     t = str(e).lower()
-    return "rate" in t or "too many" in t or "429" in t
+    return "rate" in t or "too many" in t or "too_many" in t or "429" in t
 
 
 async def _hist_req(fn, *args):
@@ -4090,6 +4217,39 @@ async def mexc_transfers(since, until):
     return out
 
 
+async def gate_transfers(since, until):
+    """Депозиты и выводы Gate (по всем монетам) за [since, until]: Gate отдаёт окнами ≤30 дней."""
+    out = []
+    t = since
+    while t < until:
+        end = min(t + 29 * 86400, until)
+        for kind, path in (("deposit", "/wallet/deposits"), ("withdraw", "/wallet/withdrawals")):
+            offset = 0
+            while True:
+                rows = await _hist_req(gate_req, "GET", path, {"from": int(t), "to": int(end), "limit": 500,
+                                                               "offset": offset}) or []
+                for r in rows:
+                    st = str(r.get("status", "")).upper()
+                    if kind == "deposit" and st not in ("DONE", "DEP_CREDITED"):
+                        continue
+                    if kind == "withdraw" and st in ("CANCEL", "FAIL", "INVALID"):
+                        continue
+                    x = {"ex": "Gate", "kind": kind, "asset": str(r.get("currency", "")).upper(),
+                         "t": float(r.get("timestamp") or 0), "amount": D(str(r.get("amount") or 0))}
+                    if kind == "withdraw":
+                        x["fee"] = D(str(r.get("fee") or 0))
+                    out.append(x)
+                if len(rows) < 500:
+                    break
+                offset += 500
+        t = end
+    return out
+
+
+async def gate_all_balances():
+    return {c: free + locked for c, (free, locked) in (await _gate_balances()).items() if free + locked > 0}
+
+
 async def htx_all_balances():
     acc = await htx_account_id()
     data = await htx_req("GET", f"/v1/account/accounts/{acc}/balance")
@@ -4146,8 +4306,9 @@ async def track_assets_loop():
 
 # ---------- учёт ----------
 
-def _trade_events(asset, htx_rows, htx_coin, mexc_rows):
-    """Сделки обеих бирж в едином виде: (время, биржа, сторона, монет, $, комиссия монетами)."""
+def _trade_events(asset, htx_rows, htx_coin, gate_rows, mexc_rows=()):
+    """Сделки бирж в едином виде: (время, биржа, сторона, монет, $, комиссия монетами).
+    MEXC — только старая история (до переезда на Gate)."""
     ev = []
     for r in htx_rows:
         q, p = D(str(r["filled-amount"])), D(str(r["price"]))
@@ -4159,6 +4320,18 @@ def _trade_events(asset, htx_rows, htx_coin, mexc_rows):
         elif fc == htx_coin.upper():
             coin_fee = fee
         ev.append((r["created-at"] / 1000, "HTX", side, q, usd, coin_fee))
+    for r in gate_rows:
+        q = D(str(r["amount"]))
+        usd = q * D(str(r["price"]))
+        fee, fc = D(str(r.get("fee") or 0)), str(r.get("fee_currency") or "").upper()
+        side = "buy" if r.get("side") == "buy" else "sell"
+        coin_fee = D(0)
+        if fc == "USDT":
+            usd = usd + fee if side == "buy" else usd - fee
+        elif fc == asset.upper():
+            coin_fee = fee
+        t = float(r.get("create_time_ms") or 0) / 1000 or float(r.get("create_time") or 0)
+        ev.append((t, "Gate", side, q, usd, coin_fee))
     for r in mexc_rows:
         q, usd = D(str(r["qty"])), D(str(r["quoteQty"]))
         fee, fc = D(str(r.get("commission") or 0)), str(r.get("commissionAsset") or "").upper()
@@ -4266,7 +4439,7 @@ async def cmd_stats(message: types.Message):
     """Сделки и прибыль за сутки / неделю / месяц по истории бирж — по всем монетам."""
     if not await _guard(message):
         return
-    wait = await message.answer("⏳ Собираю историю сделок, депозитов и выводов HTX и MEXC по всем монетам… "
+    wait = await message.answer("⏳ Собираю историю сделок, депозитов и выводов HTX и Gate по всем монетам… "
                                 "Первый раз — несколько минут (биржи ограничивают частоту запросов), дальше быстрее.")
     now = time.time()
     since_all = now - STATS_DAYS * 86400
@@ -4275,7 +4448,7 @@ async def cmd_stats(message: types.Message):
     problems = []
 
     # --- какие монеты: всё, что встречается на биржах ---
-    htx2asset = {}  # тикер на HTX → тикер на MEXC (MONAD → MON)
+    htx2asset = {}  # тикер на HTX → тикер на Gate (MONAD → MON)
     for c, cfg in arb["coins"].items():
         if cfg.get("htx_coin"):
             htx2asset[cfg["htx_coin"].upper()] = c.upper()
@@ -4288,26 +4461,36 @@ async def cmd_stats(message: types.Message):
             problems.append(f"{name}: {(str(e) or type(e).__name__)[:100]}")
             return None
 
-    mexc_tr, hb, mb, recent = await asyncio.gather(
-        safe("MEXC депозиты/выводы", mexc_transfers(since_all, now)),
-        safe("HTX балансы", htx_all_balances()), safe("MEXC балансы", mexc_all_balances()),
+    old_mexc = bool(MEXC_API_KEY and MEXC_API_SECRET)  # старая история MEXC — если ключ ещё задан
+
+    async def quiet(coro):
+        """Старая история MEXC: ключ могли уже отключить — тогда просто без неё."""
+        try:
+            return await coro
+        except Exception:
+            return None
+
+    gate_tr, mexc_tr, hb, gb, recent = await asyncio.gather(
+        safe("Gate депозиты/выводы", gate_transfers(since_all, now)),
+        quiet(mexc_transfers(since_all, now)) if old_mexc else asyncio.sleep(0, None),
+        safe("HTX балансы", htx_all_balances()), safe("Gate балансы", gate_all_balances()),
         safe("HTX сделки за 48 ч", htx_recent_assets()))
     norm = lambda a: htx2asset.get(str(a).upper(), str(a).upper())  # PROPY → PRO, MONAD → MON
     balances = {}
     for c, v in (hb or {}).items():
         balances[norm(c)] = balances.get(norm(c), D(0)) + v
-    for c, v in (mb or {}).items():
+    for c, v in (gb or {}).items():
         balances[c] = balances.get(c, D(0)) + v
     known = arb.setdefault("stats_coins", {})
     for k in [k for k in known if norm(k) != k.upper()]:
-        known.pop(k)  # тикер HTX у монеты с другим тикером на MEXC — это та же монета
+        known.pop(k)  # тикер HTX у монеты с другим тикером на Gate — это та же монета
     assets = {norm(c) for c in arb["coins"]} | {norm(c) for c in known}
-    assets |= {norm(x["asset"]) for x in (mexc_tr or [])} | set(balances) | {norm(c) for c in (recent or set())}
+    assets |= {norm(x["asset"]) for x in (gate_tr or [])} | set(balances) | {norm(c) for c in (recent or set())}
     assets = {a for a in assets if a and a not in STABLES}
     htx_tr = await safe("HTX депозиты/выводы",
                         htx_transfers(since_all, sorted(asset2htx.get(a, a) for a in assets)))
     transfers = []
-    for x in (htx_tr or []) + (mexc_tr or []):
+    for x in (htx_tr or []) + (gate_tr or []) + (mexc_tr or []):
         x["asset"] = norm(x["asset"]) if x["ex"] == "HTX" else x["asset"]
         transfers.append(x)
     assets |= {x["asset"] for x in transfers if x["asset"] not in STABLES}
@@ -4327,18 +4510,20 @@ async def cmd_stats(message: types.Message):
             except Exception as e:
                 problems.append(f"{asset}: не узнал пару на HTX ({type(e).__name__} {str(e)[:60]})")
                 return asset, None
-        hrows, mrows = [], []
+        hrows, grows, mrows = [], [], []
         if hsymb:
             hrows = await safe(f"{asset} HTX сделки", htx_trades(hsymb, since_all, now))
             if hrows is None:
                 return asset, None
         try:
-            mrows = await mexc_trades(f"{asset}USDT", since_all, now)
+            grows = await gate_trades(gsym(asset), since_all, now)
         except ExchangeError as e:
-            if "symbol" not in str(e).lower():  # пары нет на MEXC — просто нет сделок
-                problems.append(f"{asset} MEXC сделки: {str(e)[:100]}")
+            if "INVALID_CURRENCY" not in str(e):  # пары нет на Gate — просто нет сделок
+                problems.append(f"{asset} Gate сделки: {str(e)[:100]}")
                 return asset, None
-        return asset, _trade_events(asset, hrows, hc, mrows)
+        if old_mexc:
+            mrows = await quiet(mexc_trades(f"{asset}USDT", since_all, now)) or []
+        return asset, _trade_events(asset, hrows, hc, grows, mrows)
 
     async def progress():
         last = ""
@@ -4372,7 +4557,7 @@ async def cmd_stats(message: types.Message):
         uses, lots, opening = asset_ledger(trades, tops)
         books[asset] = (trades, tops, uses, lots, opening)
 
-    blocks = ["📊 <b>Итоги по всем сделкам HTX и MEXC</b>"]
+    blocks = ["📊 <b>Итоги по всем сделкам HTX и Gate</b>" + (" (и старым на MEXC)" if mexc_tr is not None else "")]
     if problems:
         blocks.append("⚠️ <b>Не удалось получить</b> (итог может быть неполным): " + "; ".join(problems))
     for title, since in periods:
@@ -4469,18 +4654,18 @@ async def cmd_help(message: types.Message):
         "/arb_add PEPE 3 bsc 150 — то же, но сперва проба на 150$, после успешного вывода — весь баланс\n"
         "/arb_add ATOM 2 — сеть можно не писать, если монета родная для сети (ATOM, SUI, MON, BNB, ETH…)\n"
         f"   сети: {nets_list_text()} (свои EVM-сети — /arb_net)\n"
-        "   если бот не нашёл сеть сам: добавь <code>htx=код</code> и/или <code>mexc=имя</code> (см. /arb_chains)\n"
+        "   если бот не нашёл сеть сам: добавь <code>htx=код</code> и/или <code>gate=код</code> (см. /arb_chains)\n"
         "   если тикер на HTX другой: <code>htxcoin=ТИКЕР</code>, напр. /arb_add MON 1.5 monad htxcoin=MONAD\n"
         "/arb_del PEPE — убрать монету\n"
         "/arb_list — список монет в автоарбитраже\n"
-        "/arb_stats — сделки и прибыль за сутки / неделю / месяц (по истории HTX и MEXC)\n"
+        "/arb_stats — сделки и прибыль за сутки / неделю / месяц (по истории HTX и Gate)\n"
         "/arb_confirm PEPE — подтвердить контракт вручную, если HTX его не отдал\n"
         "/arb_htx PEPE — что HTX реально отдаёт: сети, статусы, комиссии, контракты, лимиты, адресная книга\n"
-        "/arb_chains PEPE — сети монеты на HTX и MEXC и что выбрал бот\n"
+        "/arb_chains PEPE — сети монеты на HTX и Gate и что выбрал бот\n"
         "/arb_on · /arb_off — включить/выключить автоторговлю\n"
         "/arb_live on · /arb_live off — реальные сделки / тестовый режим\n"
         "/arb_set step 0.3 · interval 120 · floor 1.2 · check 60 · poll 1 — параметры\n"
-        "/arb_set depth on|off — учитывать стакан MEXC при покупке (по умолчанию on)\n"
+        "/arb_set depth on|off — учитывать стакан Gate при покупке (по умолчанию on)\n"
         "/arb_set batch 15 — с какой суммы купленного сразу выводить партию\n"
         "/arb_set topup 600 — держать на HTX не меньше 600 USDT: недостающее бот сам переводит с кошелька "
         "из сетей BNB / Arbitrum (0 — выкл)\n"
@@ -4493,15 +4678,15 @@ async def cmd_help(message: types.Message):
         "/stop — остановить спам (при аварии вывода — ещё и пауза по монете на 5 мин.)\n"
         "/arb_resume PEPE — снять эту паузу раньше\n\n"
         "<b>Как идёт сделка</b>\n"
-        "1. Покупка на HTX: если есть продавцы по цене, дающей твой % к MEXC, — выкупает их сразу. "
+        "1. Покупка на HTX: если есть продавцы по цене, дающей твой % к Gate, — выкупает их сразу. "
         "Своих ордеров на покупку в стакане не держит: покупает ордером «исполнить сразу» точно по ценам "
-        "продавцов и не больше, чем MEXC сейчас заберёт с твоим %.\n"
+        "продавцов и не больше, чем Gate сейчас заберёт с твоим %.\n"
         "2. Твой % проверяется при покупке (с учётом комиссии вывода). Купленное выводится на кошелёк бота "
         "без условий по %: во время покупки — частями, если комиссия мизерная, после — всё разом. "
         "HTX отклонил вывод или через минуту партия всё ещё на балансе — покупка останавливается, монеты "
-        "продаются на HTX вслед за ценой MEXC, спам до /stop.\n"
-        "3. Каждая дошедшая партия пересылается на депозит MEXC.\n"
-        "4. На MEXC: сразу по ордерам на покупку, пока выгода ≥ твоего %. Иначе — по ценам покупателей, "
+        "продаются на HTX вслед за ценой Gate, спам до /stop.\n"
+        "3. Каждая дошедшая партия пересылается на депозит Gate.\n"
+        "4. На Gate: сразу по ордерам на покупку, пока выгода ≥ твоего %. Иначе — по ценам покупателей, "
         "не давя стакан (или лесенкой от безубытка), не ниже −1,2%; спам до /stop или до продажи.\n"
         "5. Минуту нет продавцов по нужной цене — покупка заканчивается, сделка доводится до продажи.",
         parse_mode="HTML")
@@ -4525,7 +4710,7 @@ async def cmd_add(message: types.Message, command: CommandObject):
             rest = rest[1:]
         elif rest and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,20}", rest[0]) and "=" not in rest[0]:
             # Незнакомая сеть (можно в несколько слов: «Arbitrum One») — ищем её сами
-            # и сверяем с контрактом монеты на MEXC.
+            # и сверяем с контрактом монеты на Gate.
             words = []
             while rest and re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-]*", rest[0]) and "=" not in rest[0]:
                 words.append(rest.pop(0))
@@ -4554,15 +4739,15 @@ async def cmd_add(message: types.Message, command: CommandObject):
                     return
         if not coin or pct <= 0:
             raise ValueError
-        cfg = {"pct": pct, "net": net, "probe": 0, "htx_chain": None, "mexc_net": None}
+        cfg = {"pct": pct, "net": net, "probe": 0, "htx_chain": None, "gate_net": None}
         for a in rest:
             if a.lower().startswith("htxcoin="):
                 cfg["htx_coin"] = re.sub(r"[^A-Z0-9]", "", a[8:].upper()) or None
                 cfg["htx_coin_manual"] = bool(cfg["htx_coin"])
             elif a.lower().startswith("htx="):
                 cfg["htx_chain"] = a[4:]
-            elif a.lower().startswith("mexc="):
-                cfg["mexc_net"] = a[5:]
+            elif a.lower().startswith("gate="):
+                cfg["gate_net"] = a[5:].upper()
             else:
                 cfg["probe"] = abs(float(a.replace(",", ".")))
     except Exception:
@@ -4580,12 +4765,14 @@ async def add_coin(coin, cfg):
     arb.setdefault("stats_coins", {}).setdefault(coin, None)
     text = f"✅ <b>{coin}</b>: от {pct:g}% · {NET_TITLES[net]} · " + \
            (f"проба {cfg['probe']:g}$ → весь баланс" if cfg["probe"] else "сразу весь баланс")
-    # Тикер пишется как на MEXC (там продаём). Нет пары на MEXC — не добавляем.
+    # Тикер пишется как на Gate (там продаём). Нет пары на Gate — не добавляем.
     try:
-        await mexc_symbol(f"{coin}USDT")
-    except ExchangeError:
-        return (f"❌ <b>{coin}</b> не добавлена: пары {coin}/USDT нет на MEXC.\n"
-                f"Пиши тикер как на MEXC — если на HTX он другой, бот найдёт его сам.")
+        await gate_symbol(gsym(coin))
+    except CoinNotOnGate:
+        return (f"❌ <b>{coin}</b> не добавлена: пары {coin}/USDT нет на Gate.\n"
+                f"Пиши тикер как на Gate — если на HTX он другой, бот найдёт его сам.")
+    except Exception as e:
+        return f"❌ <b>{coin}</b> не добавлена: Gate не ответил ({html.escape(_err(e))}). Попробуй ещё раз."
     arb["coins"][coin] = cfg
     # Повторный /arb_add — «попробуй снова»: забываем прошлый отказ HTX по адресу.
     for bad in arb.get("addr_bad", {}).values():
@@ -4599,9 +4786,9 @@ async def add_coin(coin, cfg):
         if res["htx_ticker_auto"]:
             if res["htx_ticker"] != coin:
                 text += f"\n🔎 На HTX эта монета — <b>{res['htx_ticker']}</b> (нашёл сам: {res['htx_ticker_auto']})"
-        text += f"\nПара на HTX: <code>{res['htx_pair']}</code> · на MEXC: <code>{coin}USDT</code>"
+        text += f"\nПара на HTX: <code>{res['htx_pair']}</code> · на Gate: <code>{gsym(coin)}</code>"
         text += (f"\nHTX сеть: <code>{res['htx_chain']}</code> (вывод {'открыт' if res['htx_withdraw_ok'] else 'ЗАКРЫТ'} по API)"
-                 f"\nMEXC сеть: <code>{res['mexc_net'].get('netWork') or res['mexc_net'].get('network')}</code>"
+                 f"\nGate сеть: <code>{res['gate_net']['chain']}</code>"
                  f"\n{contract_line(coin, cfg, res)}")
         try:
             addr = wallet_address(net)
@@ -4635,7 +4822,7 @@ pending_add = {}
 
 @router.callback_query(F.data.startswith("arbmanual:"))
 async def cb_manual_sell(callback: types.CallbackQuery):
-    """Кнопка под «отправил на MEXC»: бот не продаёт эти монеты, продаёшь сам."""
+    """Кнопка под «отправил на Gate»: бот не продаёт эти монеты, продаёшь сам."""
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа")
         return
@@ -4645,7 +4832,7 @@ async def cb_manual_sell(callback: types.CallbackQuery):
         await callback.answer("Сделка уже закончена")
         return
     d["manual_request"] = True  # обработает цикл сделки: снимет лимитку и перестанет продавать
-    await callback.answer("Ок, продажу на MEXC останавливаю")
+    await callback.answer("Ок, продажу на Gate останавливаю")
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -4691,7 +4878,7 @@ async def pending_add_reply(message: types.Message):
         return
     pending_add.pop(message.chat.id, None)
     ctx.chat_set(message.chat.id)
-    cfg = {"pct": pct, "net": p["net"], "probe": probe, "htx_chain": None, "mexc_net": None}
+    cfg = {"pct": pct, "net": p["net"], "probe": probe, "htx_chain": None, "gate_net": None}
     await message.answer(await add_coin(p["coin"], cfg), parse_mode="HTML")
 
 
@@ -4812,7 +4999,7 @@ async def cmd_confirm(message: types.Message, command: CommandObject):
     if res["contract_status"] != "unknown":
         await message.answer(contract_line(coin, cfg, res) + "\nРучное подтверждение не нужно.", parse_mode="HTML")
         return
-    # Запоминаем именно этот адрес: если MEXC когда-нибудь сменит контракт,
+    # Запоминаем именно этот адрес: если Gate когда-нибудь сменит контракт,
     # подтверждение перестанет действовать само.
     cfg["confirmed_contract"] = res["token"]
     await save()
@@ -4854,10 +5041,10 @@ async def cmd_chains(message: types.Message, command: CommandObject):
     except Exception as e:
         lines.append(f"ошибка: {e}")
     try:
-        lines.append("<b>MEXC:</b>")
-        for n in await mexc_networks(coin):
-            lines.append(f"• <code>{n.get('netWork')}</code> / {n.get('network')} "
-                         f"депозит: {'да' if n.get('depositEnable') else 'нет'}, "
+        lines.append("<b>Gate:</b>")
+        for n in await gate_networks(coin):
+            lines.append(f"• <code>{n['chain']}</code> / {n['name']} "
+                         f"депозит: {'да' if n['deposit_ok'] else 'нет'}, "
                          f"контракт: <code>{n.get('contract') or '-'}</code>")
     except Exception as e:
         lines.append(f"ошибка: {e}")
@@ -4865,8 +5052,8 @@ async def cmd_chains(message: types.Message, command: CommandObject):
     if cfg:
         try:
             res = await resolve_coin(coin, cfg)
-            lines.append(f"\n✅ Бот использует: HTX <code>{res['htx_chain']}</code> → MEXC "
-                         f"<code>{res['mexc_net'].get('netWork') or res['mexc_net'].get('network')}</code>")
+            lines.append(f"\n✅ Бот использует: HTX <code>{res['htx_chain']}</code> → Gate "
+                         f"<code>{res['gate_net']['chain']}</code>")
         except Exception as e:
             lines.append(f"\n⚠️ {e}")
     await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
@@ -5006,9 +5193,9 @@ async def cmd_set(message: types.Message, command: CommandObject):
             "batch": ("batch_usd", float), "topup": ("topup_usd", float)}
     args = (command.args or "").split()
     if len(args) == 2 and args[0].lower() == "depth" and args[1].lower() in ("on", "off"):
-        arb["mexc_depth"] = args[1].lower() == "on"
+        arb["book_depth"] = args[1].lower() == "on"
         await save()
-        await message.answer(f"✅ Стакан MEXC при покупке: {'учитывается' if arb['mexc_depth'] else 'только лучшая цена'}")
+        await message.answer(f"✅ Стакан Gate при покупке: {'учитывается' if arb['book_depth'] else 'только лучшая цена'}")
         return
     try:
         key, conv = keys[args[0].lower()]
@@ -5282,9 +5469,16 @@ async def _resume():
     """Продолжает сделки и аварийные продажи, прочитанные из Upstash."""
     tasks = []
     for coin, d in list(deals.items()):
-        if d.get("v") != 2:
+        if d.get("v") == 2:
+            # Сделка начата, когда продавали на MEXC: дальше по ней бот не ведёт.
+            await notify(f"⚠️ Сделка <b>{coin}</b> начата ещё при MEXC — бот её отпускает. Проверь вручную: "
+                         f"монеты на HTX бот заберёт со следующей сделкой по {coin}, а то, что ушло на кошелёк "
+                         f"или MEXC, — разбери сам (с MEXC можно только вывести).")
+            deals.pop(coin)
+            continue
+        if d.get("v") != 3:
             await notify(f"⚠️ Незавершённая сделка <b>{coin}</b> из прошлой версии бота сброшена — "
-                         f"проверь HTX/кошелёк/MEXC вручную.")
+                         f"проверь HTX/кошелёк/Gate вручную.")
             deals.pop(coin)
             continue
         await notify(f"♻️ Бот перезапущен посреди сделки <b>{coin}</b> — продолжаю.")
@@ -5302,7 +5496,7 @@ BOT_COMMANDS = [
     ("arb_stats", "Сделки и прибыль за сутки / неделю / месяц"),
     ("arb_add", "Добавить монету: PEPE 3 bsc [проба$]"),
     ("arb_del", "Убрать монету из автоарбитража"),
-    ("arb_chains", "Сети монеты на HTX и MEXC"),
+    ("arb_chains", "Сети монеты на HTX и Gate"),
     ("arb_confirm", "Подтвердить контракт монеты вручную"),
     ("arb_htx", "Что HTX отдаёт по монете (проверка API)"),
     ("arb_net", "Свои EVM-сети: список / add / del"),
