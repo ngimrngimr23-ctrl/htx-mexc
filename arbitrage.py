@@ -5298,8 +5298,14 @@ async def cmd_key(message: types.Message, command: CommandObject):
                              "пока не задашь новый.")
         return
     if args:
-        await message.answer("Пример: <code>/arb_key gate КЛЮЧ СЕКРЕТ</code> · удалить: <code>/arb_key gate off</code>",
-                             parse_mode="HTML")
+        try:
+            await message.delete()  # похоже на попытку ввести ключ — в переписке ему не место
+            gone = "Сообщение удалил — в нём мог быть ключ.\n"
+        except Exception:
+            gone = "⚠️ Удали своё сообщение — в нём мог быть ключ.\n"
+        await message.answer(gone + "Нужно три части через пробел: <code>/arb_key gate API_KEY SECRET</code> "
+                             "(API Key и Secret — две строки, которые Gate показал при создании ключа) · "
+                             "удалить ключ: <code>/arb_key gate off</code>", parse_mode="HTML")
         return
     wait = await message.answer("⏳ Узнаю IP бота…")
     ips = await outbound_ips()
