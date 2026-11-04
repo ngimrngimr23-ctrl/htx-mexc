@@ -61,6 +61,8 @@ MEXC_API_SECRET = (os.environ.get("MEXC_API_SECRET") or "").strip() or None  # �
 # Кошельки бота: один EVM-ключ на ETH/BNB/Monad (адрес одинаковый) + ключ Sui.
 EVM_PRIVATE_KEY = os.environ.get("EVM_PRIVATE_KEY")
 SUI_PRIVATE_KEY = os.environ.get("SUI_PRIVATE_KEY")
+# Aptos — только для пополнения HTX в USDT (своя пара ключей; без неё — из EVM_PRIVATE_KEY).
+APTOS_PRIVATE_KEY = os.environ.get("APTOS_PRIVATE_KEY")
 # Кто может управлять автоторговлей: Telegram user id через запятую. Без этой
 # переменной команды /arb* не работают вообще — бот торгует реальными деньгами,
 # и любой, кто нашёл бота в поиске, не должен иметь к этому доступа.
@@ -1724,6 +1726,133 @@ async def tron_send_all(token, to):
                 raise ExchangeError(f"Tron: транзакция {txid} упала: {rcpt}")
             return txid, amount
     raise ExchangeError(f"Tron: транзакция {txid} не подтвердилась за 2 минуты")
+
+
+# ================= APTOS (только пополнение HTX в USDT) =================
+# Перевод USDt (fungible asset) — вызов 0x1::primary_fungible_store::transfer; транзакцию
+# собираем в BCS сами и подписываем ed25519, отправляем через REST ноды.
+
+APTOS_NODE = (os.environ.get("APTOS_RPC_URL") or "https://fullnode.mainnet.aptoslabs.com/v1").rstrip("/")
+APTOS_USDT = "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b"  # USDt (Tether), 6 знаков
+APTOS_MAX_GAS = 20000  # лимит газа на перевод (минимум у Aptos — около 10 000; тратится в разы меньше)
+_aptos_keys = None
+
+
+def aptos_keys():
+    """(приватный ключ ed25519, pubkey 32 байта, адрес 0x…)."""
+    global _aptos_keys
+    if _aptos_keys is None:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        raw = (APTOS_PRIVATE_KEY or "").strip()
+        if raw.lower().startswith("ed25519-priv-"):  # формат AIP-80
+            raw = raw[len("ed25519-priv-"):]
+        if not raw:
+            raw = (EVM_PRIVATE_KEY or "").strip()
+            if not raw:
+                raise ExchangeError("не задан APTOS_PRIVATE_KEY (или EVM_PRIVATE_KEY) для Aptos")
+        hx = raw[2:] if raw.lower().startswith("0x") else raw
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", hx):
+            raise ExchangeError("APTOS_PRIVATE_KEY: нужен ключ ed25519 — 64 hex-символа")
+        priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(hx))
+        pub = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        addr = "0x" + hashlib.sha3_256(pub + b"\x00").hexdigest()  # схема ed25519 = 0x00
+        _aptos_keys = (priv, pub, addr)
+    return _aptos_keys
+
+
+async def aptos_req(method, path, body=None, raw=None):
+    url = f"{APTOS_NODE}{path}"
+    kw = {"timeout": TIMEOUT}
+    if raw is not None:
+        kw.update(data=raw, headers={"Content-Type": "application/x.aptos.signed_transaction+bcs"})
+    elif body is not None:
+        kw["json"] = body
+    async with http().request(method, url, **kw) as r:
+        text = await r.text()
+        status = r.status
+    try:
+        data = json.loads(text)
+    except Exception:
+        raise ExchangeError(f"Aptos {path}: HTTP {status} {text[:200]}")
+    if status >= 400:
+        msg = data.get("message") if isinstance(data, dict) else text[:200]
+        raise ExchangeError(f"Aptos {path}: {msg} ({(data or {}).get('error_code') or status})")
+    return data
+
+
+async def aptos_view(function, type_args, args):
+    return await aptos_req("POST", "/view", {"function": function, "type_arguments": type_args, "arguments": args})
+
+
+async def aptos_usdt_balance():
+    """USDt на кошельке бота в Aptos, в минимальных единицах (6 знаков)."""
+    res = await aptos_view("0x1::primary_fungible_store::balance", ["0x1::fungible_asset::Metadata"],
+                           [aptos_keys()[2], APTOS_USDT])
+    return int(res[0])
+
+
+async def aptos_apt_balance():
+    """APT на газ, в октах (8 знаков). Аккаунта ещё нет — 0."""
+    try:
+        res = await aptos_view("0x1::coin::balance", ["0x1::aptos_coin::AptosCoin"], [aptos_keys()[2]])
+        return int(res[0])
+    except ExchangeError:
+        return 0
+
+
+def _apt_addr(a):
+    return bytes.fromhex(a[2:].rjust(64, "0") if a.lower().startswith("0x") else a.rjust(64, "0"))
+
+
+def _bcs_str(x):
+    b = x.encode()
+    return _uleb(len(b)) + b
+
+
+def _aptos_transfer_payload(to, amount):
+    """TransactionPayload::EntryFunction — primary_fungible_store::transfer<fungible_asset::Metadata>(USDt, to, amount)."""
+    args = [_apt_addr(APTOS_USDT), _apt_addr(to), int(amount).to_bytes(8, "little")]
+    type_tag = (b"\x07" + _apt_addr("0x1") + _bcs_str("fungible_asset") + _bcs_str("Metadata") + _uleb(0))
+    return (b"\x02" + _apt_addr("0x1") + _bcs_str("primary_fungible_store") + _bcs_str("transfer")
+            + _uleb(1) + type_tag + _uleb(len(args)) + b"".join(_uleb(len(a)) + a for a in args))
+
+
+def _aptos_signed_tx(seq, payload, gas_price, expires, chain_id):
+    priv, pub, addr = aptos_keys()
+    raw = (_apt_addr(addr) + int(seq).to_bytes(8, "little") + payload
+           + APTOS_MAX_GAS.to_bytes(8, "little") + int(gas_price).to_bytes(8, "little")
+           + int(expires).to_bytes(8, "little") + bytes([chain_id]))
+    sig = priv.sign(hashlib.sha3_256(b"APTOS::RawTransaction").digest() + raw)
+    return raw + b"\x00" + _uleb(32) + pub + _uleb(64) + sig  # аутентификатор Ed25519
+
+
+async def aptos_send_usdt(to, amount):
+    """Переводит amount (единицы USDt) на адрес to. Возвращает хэш, когда транзакция прошла."""
+    _, _, addr = aptos_keys()
+    info, gas = await asyncio.gather(aptos_req("GET", ""), aptos_req("GET", "/estimate_gas_price"))
+    try:
+        seq = int((await aptos_req("GET", f"/accounts/{addr}"))["sequence_number"])
+    except ExchangeError as e:
+        if "account_not_found" not in str(e).lower() and "404" not in str(e):
+            raise
+        seq = 0
+    price = int(gas.get("gas_estimate") or 100)
+    tx = _aptos_signed_tx(seq, _aptos_transfer_payload(to, amount), price, int(time.time()) + 120,
+                          int(info["chain_id"]))
+    txh = (await aptos_req("POST", "/transactions", raw=tx))["hash"]
+    for _ in range(40):
+        await asyncio.sleep(3)
+        try:
+            t = await aptos_req("GET", f"/transactions/by_hash/{txh}")
+        except ExchangeError:
+            continue
+        if t.get("type") == "pending_transaction":
+            continue
+        if t.get("success"):
+            return txh
+        raise ExchangeError(f"Aptos: перевод не прошёл ({t.get('vm_status')}), tx {txh}")
+    raise ExchangeError(f"Aptos: транзакция {txh} не подтвердилась за 2 минуты")
 
 
 def wallet_address(net):
@@ -3872,6 +4001,13 @@ def _safe_addr(net):
         return f"не задан ({e})"
 
 
+def _aptos_addr_text():
+    try:
+        return f"<code>{aptos_keys()[2]}</code>"
+    except Exception as e:
+        return f"не задан ({e})"
+
+
 def _keys_text():
     def mark(ok):
         return "✅" if ok else "❌"
@@ -3894,7 +4030,8 @@ def _keys_text():
             f"👛 Sui: {sui}\n"
             f"👛 Cosmos Hub: {cosmos}\n"
             f"👛 Solana: {_safe_addr('sol')}\n"
-            f"👛 Tron: {_safe_addr('trx')}")
+            f"👛 Tron: {_safe_addr('trx')}\n"
+            f"👛 Aptos (пополнение HTX в USDT): {_aptos_addr_text()}")
 
 
 @router.message(Command("arb"))
@@ -4009,7 +4146,7 @@ async def cmd_arb(message: types.Message):
         f"твой % проверяется при покупке (с комиссией вывода); после покупки — вывод без условий по %: "
         f"во время покупки частями, если комиссия ≤{FEE_NEGLIGIBLE_PCT}%, после — всё разом (от "
         f"{arb.get('batch_usd', 15):g}$, если комиссия ≤{FEE_SANE_PCT}%)",
-        (f"пополнение HTX: держу ≥{arb.get('topup_usd'):g} USDT (BNB / Arbitrum), проверка раз в минуту; "
+        (f"пополнение HTX: держу ≥{arb.get('topup_usd'):g} USDT (BNB / Arbitrum / Aptos), проверка раз в минуту; "
          + (f"последняя {_ago(topup_status['t'])} назад: " if topup_status["t"] else "")
          + html.escape(topup_status["text"])
          if arb.get("topup_usd") else "пополнение HTX с кошелька: выкл"),
@@ -4686,7 +4823,7 @@ async def cmd_help(message: types.Message):
         "/arb_set depth on|off — учитывать стакан Gate при покупке (по умолчанию on)\n"
         "/arb_set batch 15 — с какой суммы купленного сразу выводить партию\n"
         "/arb_set topup 600 — держать на HTX не меньше 600 USDT: недостающее бот сам переводит с кошелька "
-        "из сетей BNB / Arbitrum (0 — выкл)\n"
+        "из сетей BNB / Arbitrum / Aptos (0 — выкл)\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
         "/arb_key — IP бота и ключ Gate; задать: /arb_key gate КЛЮЧ СЕКРЕТ (сообщение удалится)\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
@@ -5335,6 +5472,11 @@ async def cmd_wallet(message: types.Message):
             lines.append(f"{NET_TITLES[net]}: {fmt(D(bal) / (D(10) ** dec))} {NATIVE_COIN[net]} (на газ)")
         except Exception as e:
             lines.append(f"{NET_TITLES[net]}: {e}")
+    try:
+        usdt, apt = await asyncio.gather(aptos_usdt_balance(), aptos_apt_balance())
+        lines.append(f"Aptos: {fmt(D(usdt) / D(10) ** 6)} USDT, {fmt(D(apt) / D(10) ** 8)} APT (на газ)")
+    except Exception as e:
+        lines.append(f"Aptos: {e}")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -5447,11 +5589,11 @@ async def htx_usdt_deposit_address(net, contract):
     """Адрес депозита USDT на HTX в нашей сети: сеть HTX ищем по контракту USDT."""
     chains = await htx_chains("usdt")
     hit = await _htx_chain_by_contract("usdt", chains, contract)
-    if not hit:
+    if not hit and net in NET_ALIASES:
         cand = _net_chains(chains, net, {})
         hit = cand[0] if len(cand) == 1 else None
     if not hit:
-        raise ExchangeError(f"на HTX нет депозита USDT в сети {NET_TITLES[net]}")
+        raise ExchangeError(f"на HTX нет депозита USDT в сети {NET_TITLES.get(net, net)}")
     if hit.get("depositStatus") not in (None, "allowed"):
         raise ExchangeError(f"депозит USDT в сети {hit.get('chain')} на HTX закрыт")
     rows = await htx_req("GET", "/v2/account/deposit/address", {"currency": "usdt"})
@@ -5460,7 +5602,7 @@ async def htx_usdt_deposit_address(net, contract):
         raise ExchangeError(f"HTX не дал адрес депозита USDT в сети {hit.get('chain')} — "
                             f"открой один раз страницу депозита USDT в этой сети на HTX")
     if row.get("addressTag"):
-        raise ExchangeError("HTX требует memo для депозита USDT — на EVM так не бывает, не перевожу")
+        raise ExchangeError("HTX требует memo для депозита USDT — бот так не переводит")
     return row["address"], hit.get("chain")
 
 
@@ -5472,7 +5614,7 @@ def _topup_say(text):
 
 
 async def topup_step():
-    """USDT на HTX меньше порога — переводим недостающее с кошелька бота (BNB / Arbitrum)."""
+    """USDT на HTX меньше порога — переводим недостающее с кошелька бота (BNB / Arbitrum / Aptos)."""
     if not store["loaded"]:
         _topup_say("Upstash не отвечает — не пополняю, пока не прочитаю, когда был прошлый перевод")
         return
@@ -5515,11 +5657,27 @@ async def topup_step():
                                                    f"{NET_TITLES[net]}, но нет {NATIVE_COIN[net]} на газ.", every=6 * 3600)
                 continue
             options.append((bal, net, token, dec))
+    try:
+        if APTOS_PRIVATE_KEY or EVM_PRIVATE_KEY:
+            bal = D(await aptos_usdt_balance()) / D(10) ** 6
+            if bal >= TOPUP_MIN:
+                apt = await aptos_apt_balance()
+                if apt < APTOS_MAX_GAS * 150:
+                    _topup_say(f"на кошельке {fmt(bal)} USDT в сети Aptos, но мало APT на газ")
+                    await note_once("topupgas:apt", f"⚠️ Пополнение HTX: на кошельке {fmt(bal)} USDT в сети Aptos, "
+                                                    f"но APT на газ меньше {fmt(D(APTOS_MAX_GAS * 150) / D(10) ** 8)}.",
+                                    every=6 * 3600)
+                else:
+                    options.append((bal, "apt", APTOS_USDT, 6))
+    except Exception as e:
+        _topup_say(f"сеть Aptos недоступна: {str(e)[:100]}")
+        await note_once("topupnet:apt", f"⚠️ Пополнение HTX: сеть Aptos недоступна: <code>{e}</code>",
+                        every=6 * 3600)
     if not options:
         _topup_say(f"на HTX {fmt(have)} USDT (< {fmt(need_level)}), но на кошельке нет USDT "
-                   f"(от {fmt(TOPUP_MIN)}) с газом в сетях BNB / Arbitrum")
+                   f"(от {fmt(TOPUP_MIN)}) с газом в сетях BNB / Arbitrum / Aptos")
         await note_once("topup_empty", f"ℹ️ На HTX {fmt(have)} USDT (меньше {fmt(need_level)}), "
-                                       f"а на кошельке бота нет USDT в сетях BNB / Arbitrum для пополнения.",
+                                       f"а на кошельке бота нет USDT в сетях BNB / Arbitrum / Aptos для пополнения.",
                         every=6 * 3600)
         return
     bal, net, token, dec = max(options, key=lambda o: o[0])
@@ -5527,13 +5685,21 @@ async def topup_step():
     amount = amount.quantize(D("0.01"), rounding=ROUND_DOWN)
     address, chain = await htx_usdt_deposit_address(net, token)
     t_send = time.time()
-    tx, sent_raw = await evm_send_all(net, token, address, int(amount * D(10) ** dec))
-    sent = D(sent_raw) / D(10) ** dec
+    if net == "apt":
+        title = "Aptos"
+        arb["topup_last"] = t_send  # до отправки: при сбое посреди перевода не отправим второй раз сразу
+        await save()
+        tx = await aptos_send_usdt(address, int(amount * D(10) ** dec))
+        sent = amount
+    else:
+        title = NET_TITLES[net]
+        tx, sent_raw = await evm_send_all(net, token, address, int(amount * D(10) ** dec))
+        sent = D(sent_raw) / D(10) ** dec
     arb["topup_last"] = t_send
     await save()
-    _topup_say(f"перевёл {fmt(sent)} USDT ({NET_TITLES[net]})")
+    _topup_say(f"перевёл {fmt(sent)} USDT ({title})")
     await notify(f"💵 На HTX {fmt(have)} USDT — меньше {fmt(need_level)}. Перевёл {fmt(sent)} USDT "
-                 f"с кошелька бота в сети {NET_TITLES[net]} на депозит HTX ({chain}).\ntx: <code>{tx}</code>")
+                 f"с кошелька бота в сети {title} на депозит HTX ({chain}).\ntx: <code>{tx}</code>")
 
 
 async def topup_loop():
