@@ -1734,6 +1734,17 @@ async def tron_send_all(token, to):
 
 APTOS_NODE = (os.environ.get("APTOS_RPC_URL") or "https://fullnode.mainnet.aptoslabs.com/v1").rstrip("/")
 APTOS_USDT = "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b"  # USDt (Tether), 6 знаков
+APTOS_KEY_SOURCE = {"from": "env" if APTOS_PRIVATE_KEY else None}
+
+
+def set_aptos_key(raw, source):
+    """Ключ Aptos из /arb_key (хранится в Upstash) — важнее переменной окружения."""
+    global APTOS_PRIVATE_KEY, _aptos_keys
+    APTOS_PRIVATE_KEY = raw or None
+    APTOS_KEY_SOURCE["from"] = source if raw else None
+    _aptos_keys = None
+
+
 APTOS_MAX_GAS = 20000  # лимит газа на перевод (минимум у Aptos — около 10 000; тратится в разы меньше)
 _aptos_keys = None
 
@@ -2449,13 +2460,16 @@ async def load():
         return True
     raw = await asyncio.gather(
         ctx.redis("GET", "arb:config"), ctx.redis("GET", "arb:deals"),
-        ctx.redis("GET", "arb:rescues"), ctx.redis("GET", "arb:gate_key"), return_exceptions=True)
+        ctx.redis("GET", "arb:rescues"), ctx.redis("GET", "arb:gate_key"), ctx.redis("GET", "arb:aptos_key"),
+        return_exceptions=True)
     err = next((r for r in raw if isinstance(r, Exception)), None)
     if err is not None:
         store["err"] = str(err)[:200] or type(err).__name__
         print(f"[arb] Upstash не ответил, состояние не прочитано: {store['err']}", flush=True)
         return False
-    raw_cfg, raw_deal, raw_resc, raw_key = raw
+    raw_cfg, raw_deal, raw_resc, raw_key, raw_apt = raw
+    if isinstance(raw_apt, str) and raw_apt.strip():
+        set_aptos_key(raw_apt.strip(), "upstash")
     try:
         k = json.loads(raw_key) if isinstance(raw_key, str) else None
         if k and k.get("key") and k.get("secret"):
@@ -4825,7 +4839,7 @@ async def cmd_help(message: types.Message):
         "/arb_set topup 600 — держать на HTX не меньше 600 USDT: недостающее бот сам переводит с кошелька "
         "из сетей BNB / Arbitrum / Aptos (0 — выкл)\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
-        "/arb_key — IP бота и ключ Gate; задать: /arb_key gate КЛЮЧ СЕКРЕТ (сообщение удалится)\n"
+        "/arb_key — IP бота и ключи; Gate: /arb_key gate КЛЮЧ СЕКРЕТ, Aptos: /arb_key aptos КЛЮЧ (сообщение удалится)\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
         "/arb_net — список сетей · /arb_net del mapo — удалить свою сеть\n"
@@ -5424,6 +5438,46 @@ async def cmd_key(message: types.Message, command: CommandObject):
         await message.answer(f"✅ Ключ Gate <code>{_mask(args[1])}</code> работает: на Gate {fmt(usdt)} USDT. "
                              f"Ключ {saved}; {gone}.", parse_mode="HTML")
         return
+    if len(args) == 2 and args[0].lower() == "aptos" and args[1].lower() != "off":
+        try:
+            await message.delete()
+            gone = "сообщение с ключом удалил"
+        except Exception:
+            gone = "⚠️ сообщение с ключом удалить не смог — удали его сам"
+        old = (APTOS_PRIVATE_KEY, APTOS_KEY_SOURCE["from"])
+        set_aptos_key(args[1], "upstash")
+        try:
+            addr = aptos_keys()[2]
+            usdt, apt = await asyncio.gather(aptos_usdt_balance(), aptos_apt_balance())
+        except Exception as e:
+            set_aptos_key(*old)
+            await message.answer(f"❌ Ключ Aptos не подошёл: <code>{html.escape(_err(e)[:200])}</code>\n"
+                                 f"Не сохранил ({gone}). Нужен приватный ключ ed25519: 0x + 64 символа "
+                                 f"или ed25519-priv-0x…", parse_mode="HTML")
+            return
+        saved = "сохранён в Upstash"
+        if ctx.redis:
+            try:
+                await ctx.redis("SET", "arb:aptos_key", args[1])
+            except Exception as e:
+                saved = f"⚠️ в Upstash не сохранился ({html.escape(_err(e)[:80])}) — после перезапуска задай снова"
+        else:
+            saved = "⚠️ Upstash не настроен — после перезапуска задай снова"
+        await message.answer(f"✅ Ключ Aptos принят. Кошелёк бота в Aptos: <code>{addr}</code>\n"
+                             f"На нём {fmt(D(usdt) / D(10) ** 6)} USDT и {fmt(D(apt) / D(10) ** 8)} APT (на газ). "
+                             f"Ключ {saved}; {gone}.", parse_mode="HTML")
+        return
+    if len(args) == 2 and args[0].lower() == "aptos" and args[1].lower() == "off":
+        env_key = (os.environ.get("APTOS_PRIVATE_KEY") or "").strip() or None
+        set_aptos_key(env_key, "env")
+        if ctx.redis:
+            try:
+                await ctx.redis("DEL", "arb:aptos_key")
+            except Exception:
+                pass
+        await message.answer("🗑 Ключ Aptos, заданный командой, удалён. Кошелёк Aptos снова — из EVM_PRIVATE_KEY "
+                             "(или APTOS_PRIVATE_KEY в Render).")
+        return
     if len(args) == 2 and args[0].lower() == "gate" and args[1].lower() == "off":
         set_gate_key(None, None, None)
         if ctx.redis:
@@ -5440,9 +5494,11 @@ async def cmd_key(message: types.Message, command: CommandObject):
             gone = "Сообщение удалил — в нём мог быть ключ.\n"
         except Exception:
             gone = "⚠️ Удали своё сообщение — в нём мог быть ключ.\n"
-        await message.answer(gone + "Нужно три части через пробел: <code>/arb_key gate API_KEY SECRET</code> "
-                             "(API Key и Secret — две строки, которые Gate показал при создании ключа) · "
-                             "удалить ключ: <code>/arb_key gate off</code>", parse_mode="HTML")
+        await message.answer(gone + "Gate — три части через пробел: <code>/arb_key gate API_KEY SECRET</code> "
+                             "(API Key и Secret — две строки, которые Gate показал при создании ключа).\n"
+                             "Aptos — <code>/arb_key aptos ПРИВАТНЫЙ_КЛЮЧ</code>.\n"
+                             "Удалить: <code>/arb_key gate off</code> · <code>/arb_key aptos off</code>",
+                             parse_mode="HTML")
         return
     wait = await message.answer("⏳ Узнаю IP бота…")
     ips = await outbound_ips()
@@ -5453,7 +5509,11 @@ async def cmd_key(message: types.Message, command: CommandObject):
             "\n<i>Хостинг может ходить в сеть с нескольких IP — впиши все. Если ключ вдруг перестанет "
             "приниматься с ошибкой FORBIDDEN — проверь /arb_key ещё раз: мог появиться новый IP.</i>\n"
             "Задать ключ: <code>/arb_key gate КЛЮЧ СЕКРЕТ</code> (права: Спот — чтение и торговля, "
-            "Кошелёк — чтение; вывод НЕ включать).")
+            "Кошелёк — чтение; вывод НЕ включать).\n\n"
+            "🔑 Aptos: " + _aptos_addr_text() + " — " +
+            {"env": "ключ из Render (APTOS_PRIVATE_KEY)", "upstash": "ключ задан командой"}.get(
+                APTOS_KEY_SOURCE["from"], "из EVM_PRIVATE_KEY") +
+            "\nСвой кошелёк Aptos: <code>/arb_key aptos ПРИВАТНЫЙ_КЛЮЧ</code> (сообщение удалится).")
     try:
         await wait.edit_text(text, parse_mode="HTML")
     except Exception:
@@ -5784,7 +5844,7 @@ BOT_COMMANDS = [
     ("arb_live", "Реальные сделки on / тест off"),
     ("arb_set", "Параметры лесенки и проверок"),
     ("arb_wallet", "Кошельки бота"),
-    ("arb_key", "Ключ Gate без Render и IP бота"),
+    ("arb_key", "Ключи Gate и Aptos без Render, IP бота"),
     ("arb_resume", "Снять паузу с монеты после /stop"),
     ("stop", "Остановить спам"),
 ]
