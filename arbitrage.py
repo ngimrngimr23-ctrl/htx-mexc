@@ -965,10 +965,19 @@ def _pad32(hex_no0x):
 
 
 _evm_account = None
+# Свой ключ для отдельной EVM-сети (/arb_key avax …): сеть → приватный ключ. Хранится в Upstash.
+EVM_NET_KEYS = {}
+_evm_net_accounts = {}
 
 
-def evm_account():
+def evm_account(net=None):
+    """Кошелёк бота в EVM-сети: свой ключ сети, если задан, иначе общий EVM_PRIVATE_KEY."""
     global _evm_account
+    if net and net in EVM_NET_KEYS:
+        if net not in _evm_net_accounts:
+            from eth_account import Account
+            _evm_net_accounts[net] = Account.from_key(EVM_NET_KEYS[net].strip())
+        return _evm_net_accounts[net]
     if _evm_account is None:
         if not EVM_PRIVATE_KEY:
             raise ExchangeError("не задан EVM_PRIVATE_KEY")
@@ -977,8 +986,16 @@ def evm_account():
     return _evm_account
 
 
+def set_evm_net_key(net, key):
+    if key:
+        EVM_NET_KEYS[net] = key
+    else:
+        EVM_NET_KEYS.pop(net, None)
+    _evm_net_accounts.pop(net, None)
+
+
 async def evm_balance(net, token):
-    addr = evm_account().address
+    addr = evm_account(net).address
     if not token:
         return int(await rpc(net, "eth_getBalance", [addr, "latest"]), 16)
     data = "0x70a08231" + _pad32(addr[2:].lower())
@@ -1007,7 +1024,7 @@ async def evm_send_all(net, token, to, amount=None):
 
 async def _evm_send(net, token, to, want=None):
     from eth_utils import to_checksum_address
-    acct = evm_account()
+    acct = evm_account(net)
     to = to_checksum_address(to)
     chain_id = int(await rpc(net, "eth_chainId", []), 16)
     nonce = int(await rpc(net, "eth_getTransactionCount", [acct.address, "pending"]), 16)
@@ -1893,7 +1910,7 @@ def wallet_address(net):
         return sui_keys()[2]
     if net == "atom":
         return cosmos_keys()[2]
-    return evm_account().address
+    return evm_account(net).address
 
 
 async def wallet_balance(net, token):
@@ -2479,13 +2496,18 @@ async def load():
     raw = await asyncio.gather(
         ctx.redis("GET", "arb:config"), ctx.redis("GET", "arb:deals"),
         ctx.redis("GET", "arb:rescues"), ctx.redis("GET", "arb:gate_key"), ctx.redis("GET", "arb:aptos_key"),
-        return_exceptions=True)
+        ctx.redis("GET", "arb:evm_keys"), return_exceptions=True)
     err = next((r for r in raw if isinstance(r, Exception)), None)
     if err is not None:
         store["err"] = str(err)[:200] or type(err).__name__
         print(f"[arb] Upstash не ответил, состояние не прочитано: {store['err']}", flush=True)
         return False
-    raw_cfg, raw_deal, raw_resc, raw_key, raw_apt = raw
+    raw_cfg, raw_deal, raw_resc, raw_key, raw_apt, raw_evm = raw
+    try:
+        for n, k in (json.loads(raw_evm) if isinstance(raw_evm, str) else {}).items():
+            set_evm_net_key(n, k)
+    except Exception as e:
+        print(f"[arb] ключи EVM-сетей из Upstash не разобраны: {type(e).__name__}", flush=True)
     if isinstance(raw_apt, str) and raw_apt.strip():
         set_aptos_key(raw_apt.strip(), "upstash")
     try:
@@ -4099,7 +4121,8 @@ def _keys_text():
             f"👛 Cosmos Hub: {cosmos}\n"
             f"👛 Solana: {_safe_addr('sol')}\n"
             f"👛 Tron: {_safe_addr('trx')}\n"
-            f"👛 Aptos (пополнение HTX в USDT): {_aptos_addr_text()}")
+            f"👛 Aptos (пополнение HTX в USDT): {_aptos_addr_text()}"
+            + "".join(f"\n👛 {NET_TITLES.get(n, n)} (свой ключ): {_safe_addr(n)}" for n in EVM_NET_KEYS))
 
 
 @router.message(Command("arb"))
@@ -4214,7 +4237,7 @@ async def cmd_arb(message: types.Message):
         f"твой % проверяется при покупке (с комиссией вывода); после покупки — вывод без условий по %: "
         f"во время покупки частями, если комиссия ≤{FEE_NEGLIGIBLE_PCT}%, после — всё разом (от "
         f"{arb.get('batch_usd', 15):g}$, если комиссия ≤{FEE_SANE_PCT}%)",
-        (f"пополнение HTX: держу ≥{arb.get('topup_usd'):g} USDT (BNB / Arbitrum / Aptos), проверка раз в минуту; "
+        (f"пополнение HTX: держу ≥{arb.get('topup_usd'):g} USDT (BNB / Arbitrum / Avalanche / Aptos), проверка раз в минуту; "
          + (f"последняя {_ago(topup_status['t'])} назад: " if topup_status["t"] else "")
          + html.escape(topup_status["text"])
          if arb.get("topup_usd") else "пополнение HTX с кошелька: выкл"),
@@ -4891,9 +4914,10 @@ async def cmd_help(message: types.Message):
         "/arb_set depth on|off — учитывать стакан Gate при покупке (по умолчанию on)\n"
         "/arb_set batch 15 — с какой суммы купленного сразу выводить партию\n"
         "/arb_set topup 600 — держать на HTX не меньше 600 USDT: недостающее бот сам переводит с кошелька "
-        "из сетей BNB / Arbitrum / Aptos (0 — выкл)\n"
+        "из сетей BNB / Arbitrum / Avalanche / Aptos (0 — выкл)\n"
         "/arb_wallet — адреса и балансы кошельков бота\n"
-        "/arb_key — IP бота и ключи; Gate: /arb_key gate КЛЮЧ СЕКРЕТ, Aptos: /arb_key aptos КЛЮЧ (сообщение удалится)\n"
+        "/arb_key — IP бота и ключи; Gate: /arb_key gate КЛЮЧ СЕКРЕТ, Aptos: /arb_key aptos КЛЮЧ, "
+        "Avalanche: /arb_key avax КЛЮЧ (сообщение удалится)\n"
         "/arb_net add mapo https://rpc.maplabs.io MAPO — добавить любую EVM-сеть "
         "(имя, адрес ноды, монета на газ; можно ещё названия сети на биржах через запятую: MAPO,MAP)\n"
         "/arb_net — список сетей · /arb_net del mapo — удалить свою сеть\n"
@@ -5492,6 +5516,47 @@ async def cmd_key(message: types.Message, command: CommandObject):
         await message.answer(f"✅ Ключ Gate <code>{_mask(args[1])}</code> работает: на Gate {fmt(usdt)} USDT. "
                              f"Ключ {saved}; {gone}.", parse_mode="HTML")
         return
+    if len(args) == 2 and args[0].lower() in EVM_KEY_NETS:
+        name = args[0].lower()
+        cid, query = EVM_KEY_NETS[name]
+        off = args[1].lower() == "off"
+        gone = ""
+        if not off:
+            try:
+                await message.delete()
+                gone = "; сообщение с ключом удалил"
+            except Exception:
+                gone = "; ⚠️ сообщение с ключом удалить не смог — удали его сам"
+        try:
+            net = await _evm_net_by_chain_id(cid, query)
+        except Exception as e:
+            await message.answer(f"❌ Не нашёл сеть {name}: <code>{html.escape(_err(e)[:200])}</code>{gone}",
+                                 parse_mode="HTML")
+            return
+        old = EVM_NET_KEYS.get(net)
+        set_evm_net_key(net, None if off else args[1])
+        try:
+            addr = evm_account(net).address
+            token = next(t for c, _, t in TOPUP_NETS if c == cid)
+            dec = await evm_decimals(net, token)
+            usdt, gas = await asyncio.gather(evm_balance(net, token), evm_balance(net, None))
+        except Exception as e:
+            set_evm_net_key(net, old)
+            await message.answer(f"❌ Ключ не подошёл: <code>{html.escape(_err(e)[:200])}</code>. Не сохранил{gone}.\n"
+                                 f"Нужен приватный ключ EVM-кошелька: 0x + 64 символа.", parse_mode="HTML")
+            return
+        saved = "сохранено в Upstash"
+        if ctx.redis:
+            try:
+                await ctx.redis("SET", "arb:evm_keys", json.dumps(EVM_NET_KEYS))
+            except Exception as e:
+                saved = f"⚠️ в Upstash не сохранилось ({html.escape(_err(e)[:80])}) — после перезапуска задай снова"
+        await message.answer(
+            (f"🗑 Свой ключ для {NET_TITLES[net]} удалён — там снова общий кошелёк " if off else
+             f"✅ Кошелёк бота в {NET_TITLES[net]}: ") +
+            f"<code>{addr}</code>\nНа нём {fmt(D(usdt) / D(10) ** dec)} USDT и {fmt(D(gas) / D(10) ** 18)} "
+            f"{NATIVE_COIN[net]} (на газ). Пополнение HTX берёт USDT и отсюда; {saved}{gone}.", parse_mode="HTML")
+        return
     if len(args) == 2 and args[0].lower() == "aptos" and args[1].lower() != "off":
         try:
             await message.delete()
@@ -5550,7 +5615,8 @@ async def cmd_key(message: types.Message, command: CommandObject):
             gone = "⚠️ Удали своё сообщение — в нём мог быть ключ.\n"
         await message.answer(gone + "Gate — три части через пробел: <code>/arb_key gate API_KEY SECRET</code> "
                              "(API Key и Secret — две строки, которые Gate показал при создании ключа).\n"
-                             "Aptos — <code>/arb_key aptos ПРИВАТНЫЙ_КЛЮЧ</code>.\n"
+                             "Aptos — <code>/arb_key aptos ПРИВАТНЫЙ_КЛЮЧ</code>, Avalanche — "
+                             "<code>/arb_key avax ПРИВАТНЫЙ_КЛЮЧ</code>.\n"
                              "Удалить: <code>/arb_key gate off</code> · <code>/arb_key aptos off</code>",
                              parse_mode="HTML")
         return
@@ -5567,7 +5633,8 @@ async def cmd_key(message: types.Message, command: CommandObject):
             "🔑 Aptos: " + _aptos_addr_text() + " — " +
             {"env": "ключ из Render (APTOS_PRIVATE_KEY)", "upstash": "ключ задан командой"}.get(
                 APTOS_KEY_SOURCE["from"], "из EVM_PRIVATE_KEY") +
-            "\nСвой кошелёк Aptos: <code>/arb_key aptos ПРИВАТНЫЙ_КЛЮЧ</code> (сообщение удалится).")
+            "\nСвой кошелёк Aptos: <code>/arb_key aptos ПРИВАТНЫЙ_КЛЮЧ</code>, Avalanche: "
+            "<code>/arb_key avax ПРИВАТНЫЙ_КЛЮЧ</code> (сообщение удалится).")
     try:
         await wait.edit_text(text, parse_mode="HTML")
     except Exception:
@@ -5680,7 +5747,10 @@ async def cb_stop(callback: types.CallbackQuery):
 TOPUP_NETS = [
     (56, "bsc", "0x55d398326f99059fF775485246999027B3197955"),
     (42161, "Arbitrum One", "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),
+    (43114, "avax", "0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7"),  # Avalanche C-Chain
 ]
+# Сети, где можно задать свой кошелёк командой /arb_key <имя> КЛЮЧ: имя → (chain id, как искать сеть).
+EVM_KEY_NETS = {"avax": (43114, "avax")}
 TOPUP_MIN = D(10)            # меньше не переводим
 TOPUP_COOLDOWN = 2 * 60      # после перевода столько не переводим снова (деньги в пути)
 
@@ -5728,7 +5798,7 @@ def _topup_say(text):
 
 
 async def topup_step():
-    """USDT на HTX меньше порога — переводим недостающее с кошелька бота (BNB / Arbitrum / Aptos)."""
+    """USDT на HTX меньше порога — переводим недостающее с кошелька бота (BNB / Arbitrum / Avalanche / Aptos)."""
     if not store["loaded"]:
         _topup_say("Upstash не отвечает — не пополняю, пока не прочитаю, когда был прошлый перевод")
         return
@@ -5789,9 +5859,9 @@ async def topup_step():
                         every=6 * 3600)
     if not options:
         _topup_say(f"на HTX {fmt(have)} USDT (< {fmt(need_level)}), но на кошельке нет USDT "
-                   f"(от {fmt(TOPUP_MIN)}) с газом в сетях BNB / Arbitrum / Aptos")
+                   f"(от {fmt(TOPUP_MIN)}) с газом в сетях BNB / Arbitrum / Avalanche / Aptos")
         await note_once("topup_empty", f"ℹ️ На HTX {fmt(have)} USDT (меньше {fmt(need_level)}), "
-                                       f"а на кошельке бота нет USDT в сетях BNB / Arbitrum / Aptos для пополнения.",
+                                       f"а на кошельке бота нет USDT в сетях BNB / Arbitrum / Avalanche / Aptos для пополнения.",
                         every=6 * 3600)
         return
     bal, net, token, dec = max(options, key=lambda o: o[0])
