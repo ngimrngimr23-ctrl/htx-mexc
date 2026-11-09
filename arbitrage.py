@@ -847,14 +847,32 @@ def gate_net_names(n):
     return tuple(x for x in (n.get("chain"), n.get("name"), short) if x)
 
 
+def _gate_addr_ok(a):
+    a = str(a or "").strip()
+    return len(a) >= 20 and not re.search(r"\s", a)  # не «New address is being generated…»
+
+
 async def gate_deposit_address(coin, net_entry):
-    data = await gate_req("GET", "/wallet/deposit_address", {"currency": coin.upper()})
-    for row in (data or {}).get("multichain_addresses") or []:
-        if row.get("chain") == net_entry["chain"]:
-            if int(row.get("obtain_failed") or 0) or not row.get("address"):
-                break
-            return row["address"], (row.get("payment_id") or None)
-    raise ExchangeError(f"Gate: не удалось получить адрес депозита {coin} в сети {net_entry['chain']}")
+    data = await gate_req("GET", "/wallet/deposit_address", {"currency": coin.upper()}) or {}
+    rows = data.get("multichain_addresses") or []
+    want = str(net_entry["chain"]).upper()
+    for row in rows:
+        if str(row.get("chain") or "").upper() == want and not int(row.get("obtain_failed") or 0) \
+                and _gate_addr_ok(row.get("address")):
+            return row["address"].strip(), (row.get("payment_id") or None)
+    # У монеты с одной сетью Gate может отдать адрес только в общем поле address
+    # (или одной строкой списка под другим названием сети).
+    if len(await gate_networks(coin)) == 1:
+        good = [r for r in rows if not int(r.get("obtain_failed") or 0) and _gate_addr_ok(r.get("address"))]
+        if len(good) == 1:
+            return good[0]["address"].strip(), (good[0].get("payment_id") or None)
+        if not rows and _gate_addr_ok(data.get("address")):
+            return data["address"].strip(), None
+    got = "; ".join(f"{r.get('chain')}: {'ошибка выдачи' if int(r.get('obtain_failed') or 0) else (r.get('address') or 'пусто')}"
+                    for r in rows) or f"сетей нет, общий адрес: {data.get('address') or 'пусто'}"
+    raise ExchangeError(f"Gate: не удалось получить адрес депозита {coin} в сети {net_entry['chain']} "
+                        f"(Gate отдал: {got[:200]}). Если адреса нет — открой один раз депозит {coin} "
+                        f"на сайте Gate в этой сети, Gate его создаст")
 
 
 # ================= MEXC (только старая история для /arb_stats) =================
