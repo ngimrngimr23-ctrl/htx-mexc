@@ -2395,21 +2395,40 @@ def _contract_line(coin, cfg, res):
 
 # ================= TELEGRAM: уведомления и спам =================
 
+# Сообщения уходят через очередь отдельной задачей: если Telegram включил флуд-лимит
+# («retry after 283»), ждёт только отправка, а покупка/вывод/продажа идут дальше.
+_notify_q = None
+_tg_flood = {"until": 0.0}  # до какого времени Telegram просил не слать (общий и для спама)
+
+
 async def notify(text, kb=None):
-    # Чат не известен (настройки сканера не прочитались) — пишем админу напрямую.
-    chat = ctx.chat_get() or next(iter(ADMIN_IDS), None)
-    if not chat:
-        print(f"[arb] нет chat_id, сообщение: {text}", flush=True)
-        return
-    for _ in range(3):
-        try:
-            await ctx.bot.send_message(chat, text, parse_mode="HTML", reply_markup=kb)
-            return
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-        except Exception as e:
-            print(f"[arb] ошибка отправки: {e}", flush=True)
-            return
+    global _notify_q
+    if _notify_q is None:
+        _notify_q = asyncio.Queue()
+        spawn(_notify_worker())
+    _notify_q.put_nowait((text, kb))
+
+
+async def _notify_worker():
+    while True:
+        text, kb = await _notify_q.get()
+        # Чат не известен (настройки сканера не прочитались) — пишем админу напрямую.
+        chat = ctx.chat_get() or next(iter(ADMIN_IDS), None)
+        if not chat:
+            print(f"[arb] нет chat_id, сообщение: {text}", flush=True)
+            continue
+        for _ in range(5):
+            wait = _tg_flood["until"] - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                await ctx.bot.send_message(chat, text, parse_mode="HTML", reply_markup=kb)
+                break
+            except TelegramRetryAfter as e:
+                _tg_flood["until"] = time.time() + e.retry_after
+            except Exception as e:
+                print(f"[arb] ошибка отправки: {e}", flush=True)
+                break
 
 
 STOP_KB = InlineKeyboardMarkup(inline_keyboard=[[
@@ -2437,12 +2456,15 @@ async def spam_loop():
         active = [a["text"] for a in alarms.values() if not a["acked"]]
         chat = ctx.chat_get()
         if active and chat:
+            if time.time() < _tg_flood["until"]:  # Telegram попросил подождать — не долбим
+                await asyncio.sleep(1)
+                continue
             text = "🚨🚨🚨 <b>ТРЕБУЕТСЯ ВНИМАНИЕ</b>\n\n" + "\n\n".join(active) + \
                    "\n\n<i>Остановить: кнопка ниже или /stop</i>"
             try:
                 await ctx.bot.send_message(chat, text, parse_mode="HTML", reply_markup=STOP_KB)
             except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
+                _tg_flood["until"] = time.time() + e.retry_after
             except Exception as e:
                 print(f"[arb] спам: {e}", flush=True)
             await asyncio.sleep(arb["spam_sec"])
@@ -3077,8 +3099,9 @@ def deal_finished(d):
         return bool(d.get("manual_sold"))  # итог — только когда монеты ушли с Gate
     if any(not b["fwd"] for b in d["batches"]):
         return False
-    # Всё отправленное на Gate продано (с допуском на комиссии) — сделка закончена.
-    return _dd(d, "sold_qty") >= _dd(d, "forwarded") * D("0.97")
+    # Всё отправленное на Gate продано (с допуском на комиссии) или остался хвост
+    # меньше минимального ордера Gate — сделка закончена.
+    return _dd(d, "sold_qty") >= _dd(d, "forwarded") * D("0.97") or bool(d.get("sell_dust"))
 
 
 # ---------- покупка на HTX ----------
@@ -3469,13 +3492,16 @@ async def withdraw_batch(d):
                  + (" Ордер на покупку продолжает стоять." if d["order"] else ""))
 
 
-async def _batch_failed(d, breakeven, reason):
-    """Вывод не прошёл: покупку прекращаем, монеты на HTX продаём в ноль."""
+async def _batch_failed(d, breakeven, reason, qty=None):
+    """Вывод не прошёл: покупку прекращаем, монеты сделки на HTX продаём в ноль.
+    qty — сколько монет сделки застряло на HTX (продаём не больше, чужое не трогаем)."""
     await _cancel_order(d)
     d["buying"] = False
+    stuck = D(qty) if qty is not None else _dd(d, "unw_qty")
     d["unw_qty"] = d["unw_cost"] = d["htx_rest"] = "0"
     r = {"id": uuid.uuid4().hex[:8], "coin": hcoin(d["coin"], d["cfg"]), "symbol": hsym(d["coin"], d["cfg"]),
          "sell_coin": d["coin"], "breakeven": str(breakeven or 0), "reason": reason,
+         "qty": str(stuck) if stuck > 0 else None,
          "order_id": None, "price": None, "created": time.time()}
     rescues.append(r)
     await save()
@@ -3498,7 +3524,7 @@ async def check_batches(d):
         if stuck >= amount * D("0.05") and stuck * be >= 1:
             d["batches"].remove(b)
             await _batch_failed(d, be, f"через {arb['check_sec']} сек. партия {fmt(amount)} шт. всё ещё "
-                                       f"свободна на HTX — вывод не прошёл")
+                                       f"свободна на HTX — вывод не прошёл", qty=stuck + _dd(d, "unw_qty"))
             return
         b["ok"] = True
         remember_address(wallet_address(d["cfg"]["net"]), hcoin(coin, d["cfg"]), True)
@@ -3649,6 +3675,12 @@ async def sell_step(d, alarm):
     s = d["sell"]
     has_more = enough(new, breakeven)
     now = time.time()
+    if not s and not has_more and not d["buying"] and not d["forwarding"] \
+            and d["batches"] and all(b["ok"] and b["fwd"] for b in d["batches"]):
+        left = _dd(d, "forwarded") - _dd(d, "sold_qty")
+        if left * breakeven < info["min_value"] * 2 and _dd(d, "sold_qty") > 0:
+            # Непроданный хвост меньше минимального ордера Gate — продать его нельзя, сделка закончена.
+            d["sell_dust"] = True
     if not s and not has_more:
         if d["ladder_since"] is not None or d.get("sell_pause_until"):
             d["ladder_since"] = None
@@ -3857,9 +3889,13 @@ async def run_rescue(r):
                 if r["order_id"]:
                     r["self_cancel"] = True
                     await htx_cancel(r["order_id"])
-                    await htx_wait_final(r["order_id"], timeout=5)
+                    o = await htx_wait_final(r["order_id"], timeout=5)
+                    r["sold"] = str(D(r.get("sold") or 0) + o["filled"])
                     r["self_cancel"] = False
                 free, _ = await htx_balance(coin)
+                if r.get("qty"):  # продаём монеты сделки (и что уже продано — не повторяем)
+                    sold = D(r.get("sold") or 0)
+                    free = min(free, D(r["qty"]) - sold)
                 qty = round_down(free, info["step"])
                 if qty <= 0 or qty * price < info["min_value"]:
                     await notify(f"✅ <b>{mcoin}</b>: на HTX больше нечего продавать.")
@@ -5869,10 +5905,12 @@ async def topup_step():
     amount = amount.quantize(D("0.01"), rounding=ROUND_DOWN)
     address, chain = await htx_usdt_deposit_address(net, token)
     t_send = time.time()
+    # Отметка — до отправки: если перевод ушёл, а ответ потерялся (сбой, таймаут ожидания
+    # подтверждения), пауза не даст отправить ту же сумму второй раз.
+    arb["topup_last"] = t_send
+    await save()
     if net == "apt":
         title = "Aptos"
-        arb["topup_last"] = t_send  # до отправки: при сбое посреди перевода не отправим второй раз сразу
-        await save()
         tx = await aptos_send_usdt(address, int(amount * D(10) ** dec))
         sent = amount
     else:
