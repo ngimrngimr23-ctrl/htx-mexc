@@ -849,7 +849,7 @@ def gate_net_names(n):
 
 def _gate_addr_ok(a):
     a = str(a or "").strip()
-    return len(a) >= 20 and not re.search(r"\s", a)  # не «New address is being generated…»
+    return len(a) >= 3 and not re.search(r"\s", a)  # не «New address is being generated…»
 
 
 async def gate_deposit_address(coin, net_entry):
