@@ -2788,6 +2788,37 @@ def should_preempt(buyer, opp):
     return not buyer.get("ioc") and opp["mode"] == "taker"
 
 
+_mexc_xcheck = {}  # монета → (время, лучший bid, лучший ask) с MEXC; кэш на несколько секунд
+
+
+async def mexc_cross_check(coin, gate_bid, pct):
+    """Сверка с MEXC (публичный стакан, ключ не нужен): если на MEXC монета стоит около цены HTX,
+    а задрана только Gate, — не покупаем: пока монеты дойдут до Gate, цена там обычно вернётся.
+    (True, None) — покупать можно (или сверить не с чем); (False, пояснение) — не покупать."""
+    hit = _mexc_xcheck.get(coin)
+    if hit and time.time() - hit[0] < 5:
+        mb, ma = hit[1], hit[2]
+    else:
+        try:
+            data = await mexc_req("GET", "/api/v3/depth", {"symbol": f"{coin.upper()}USDT", "limit": 5}, signed=False)
+            mb = D(data["bids"][0][0]) if data.get("bids") else None
+            ma = D(data["asks"][0][0]) if data.get("asks") else None
+        except Exception:
+            return True, None  # пары на MEXC нет / MEXC не ответил — сверить не с чем
+        _mexc_xcheck[coin] = (time.time(), mb, ma)
+    if not mb or not ma:
+        return True, None
+    mid = (mb + ma) / 2
+    gate_bid = D(str(gate_bid))
+    if (ma - mb) / mid > D("0.05") or not (D("0.67") < gate_bid / mid < D("1.5")):
+        return True, None  # на MEXC пустой стакан или под тем же тикером другая монета — не показатель
+    prem = (gate_bid / mid - 1) * 100
+    if prem > D(str(pct)) / 2:
+        return False, (f"на Gate покупают по {fmt(gate_bid)}, а на MEXC цена {fmt(mb)}–{fmt(ma)}: Gate дороже "
+                       f"MEXC на {prem:.2f}% — задрана только Gate, не покупаю")
+    return True, None
+
+
 async def try_start(coin, cfg, opp, check_only=False):
     try:
         res = await resolve_coin(coin, cfg)
@@ -2845,6 +2876,11 @@ async def try_start(coin, cfg, opp, check_only=False):
     if not arb["dry_run"] and not contract_confirmed(cfg, res):
         await note_once(f"unconf:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но контракт не сверен.\n"
                                           f"{contract_line(coin, cfg, res)}", every=DAILY)
+        return False
+
+    ok, why = await mexc_cross_check(coin, opp["gate_bid"], cfg["pct"])
+    if not ok:
+        await note_once(f"gatehi:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {why}.", every=DAILY)
         return False
 
     if arb["dry_run"] and check_only:
