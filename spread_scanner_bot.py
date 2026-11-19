@@ -535,6 +535,29 @@ async def add_blacklist(message: types.Message, command: CommandObject):
         await message.answer("❌ Ошибка. Пример: /b BTC (повторный вызов уберёт монету из ЧС). Список ЧС — /bl")
 
 
+@dp.callback_query(lambda c: (c.data or "").startswith("bl:"))
+async def blacklist_button(callback: types.CallbackQuery):
+    """Кнопка «В ЧС» под сигналом: монета больше не приходит в сигналах (убрать — /b МОНЕТА)."""
+    pair = normalize_pair(callback.data[3:])
+    already = pair in blacklist
+    blacklist.add(pair)
+    schedule_save()
+    await callback.answer(f"{pair[:-4]} уже в ЧС" if already else f"🚫 {pair[:-4]} в ЧС — сигналов по ней больше не будет")
+    try:  # кнопку ЧС под этим сигналом заменяем пометкой, остальные кнопки оставляем
+        kb = callback.message.reply_markup.inline_keyboard if callback.message and callback.message.reply_markup else []
+        rows = [[b for b in row if not (b.callback_data or "").startswith("bl:")] for row in kb]
+        rows = [r for r in rows if r] + [[InlineKeyboardButton(text=f"🚫 в ЧС (убрать: /b {pair[:-4]})",
+                                                                 callback_data="noop")]]
+        await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except Exception:
+        pass
+
+
+@dp.callback_query(lambda c: c.data == "noop")
+async def noop_button(callback: types.CallbackQuery):
+    await callback.answer()
+
+
 @dp.message(Command("bl"))
 async def list_blacklist(message: types.Message):
     if not blacklist:
@@ -1546,16 +1569,18 @@ async def scanner_task():
 
                 # Кнопка «В автоарбитраж» — только для направления HTX→Gate и сети,
                 # которую автоарбитраж умеет (EVM/Sui/Cosmos и свои EVM-сети).
-                markup = None
+                rows = []
                 if buy_ex == "HTX":
                     names = []
                     if route.get("best"):
                         names = list(route["best"]["htx"].get("names", [])) + list(route["best"]["gate"].get("names", []))
                     net = arbitrage.net_from_names(*names) if names else None
                     if net:
-                        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                        rows.append([InlineKeyboardButton(
                             text=f"➕ {base_coin} в автоарбитраж ({arbitrage.NET_TITLES[net]})",
-                            callback_data=f"arbadd:{base_coin}:{net}")]])
+                            callback_data=f"arbadd:{base_coin}:{net}")])
+                rows.append([InlineKeyboardButton(text=f"🚫 {base_coin} в ЧС", callback_data=f"bl:{pair}")])
+                markup = InlineKeyboardMarkup(inline_keyboard=rows)
                 if settings["chat_id"]:
                     messages.append((settings["chat_id"], alert_text, markup))
                 if settings["channel_id"]:
