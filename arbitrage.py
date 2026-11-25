@@ -2576,47 +2576,79 @@ async def load():
 
 # ---- Шпилька на Gate: цена подскочила резко, «одной свечой» ----
 # Бот смотрит стакан Gate каждые пару секунд и запоминает лучшую цену покупателей. Если за
-# любые SPIKE_WINDOW сек. из последних SPIKE_HOLD сек. она выросла на SPIKE_PCT% и больше —
-# это шпилька: не покупаем. Продержалась минуту — рынок цену «принял», покупаем; постепенный
-# рост (по чуть-чуть каждые 10 сек.) шпилькой не считается.
+# SPIKE_WINDOW сек. она выросла на SPIKE_PCT% и больше — это шпилька: монету не покупаем
+# SPIKE_BLOCK сек. (25 мин.) с последнего такого скачка, даже если цена держится. Постепенный
+# рост (по чуть-чуть каждые 10 сек.) шпилькой не считается. После перезапуска бот сам не видел,
+# что было раньше, поэтому один раз смотрит 10-секундные свечи Gate за последние 25 минут.
 SPIKE_PCT = D(5)
 SPIKE_WINDOW = 10
-SPIKE_HOLD = 60
-_gate_bid_hist = {}  # монета → [(время, лучший bid Gate)], последние ~2 мин.
+SPIKE_BLOCK = 25 * 60
+_gate_bid_hist = {}  # монета → [(время, лучший bid Gate)] за последние ~15 сек.
+_last_spike = {}  # монета → (время, цена до, цена после, рост %) — последний резкий скачок
+_spike_boot = {}  # монета → (время проверки свечей, удалась ли)
 
 
-def note_gate_bid(coin, bid):
-    now = time.time()
+def _note_spike(coin, t, low, high):
+    rise = (high / low - 1) * 100 if low > 0 else D(0)
+    if rise >= SPIKE_PCT:
+        prev = _last_spike.get(coin)
+        # Тот же скачок виден ещё несколько опросов подряд — время блокировки не сдвигаем.
+        if prev and t - prev[0] <= SPIKE_WINDOW and high <= prev[2]:
+            return
+        if not prev or t >= prev[0]:
+            _last_spike[coin] = (t, low, high, rise)
+
+
+def note_gate_bid(coin, bid, now=None):
+    now = time.time() if now is None else now
+    bid = D(str(bid))
     h = _gate_bid_hist.setdefault(coin, [])
+    before = [b for t, b in h if now - t <= SPIKE_WINDOW]
+    if before:
+        _note_spike(coin, now, min(before), bid)
     if not h or now - h[-1][0] >= 1:
-        h.append((now, D(str(bid))))
-    while h and now - h[0][0] > SPIKE_HOLD + SPIKE_WINDOW + 30:
+        h.append((now, bid))
+    while h and now - h[0][0] > SPIKE_WINDOW + 5:
         h.pop(0)
 
 
-def gate_spike(coin):
-    """None — резких скачков нет; иначе текст: на сколько и как быстро подскочила цена на Gate.
-    Пока бот смотрит монету меньше минуты (только запустился) — тоже ждём: скачок не увидеть."""
-    h = _gate_bid_hist.get(coin) or []
-    now = time.time()
-    if not h or now - h[0][0] < SPIKE_HOLD:
-        return "бот следит за ценой на Gate меньше минуты — жду, чтобы не купить на шпильке"
-    worst = None
-    for i, (t, bid) in enumerate(h):
-        if now - t > SPIKE_HOLD:
-            continue
-        before = [b for tt, b in h[:i] if t - tt <= SPIKE_WINDOW]
-        if not before:
-            continue
-        low = min(before)
-        rise = (bid / low - 1) * 100 if low > 0 else D(0)
-        if rise >= SPIKE_PCT and (worst is None or rise > worst[0]):
-            worst = (rise, low, bid, int(now - t))
-    if worst:
-        rise, low, bid, ago = worst
-        return (f"цена на Gate подскочила на {rise:.1f}% за несколько секунд ({fmt(low)} → {fmt(bid)}, "
-                f"{ago} сек. назад) — шпилька, жду, пока цена продержится минуту")
-    return None
+async def _spike_bootstrap(coin, now=None):
+    """Скачки за последние 25 мин. по 10-секундным свечам Gate: верх свечи против цены перед ней."""
+    now = time.time() if now is None else now
+    data = await gate_req("GET", "/spot/candlesticks",
+                          {"currency_pair": gsym(coin), "interval": "10s", "limit": SPIKE_BLOCK // 10 + 5},
+                          signed=False)
+    prev_close = None
+    for c in sorted(data or [], key=lambda c: int(c[0])):
+        t, close, high, opn = int(c[0]) + 10, D(c[2]), D(c[3]), D(c[5])
+        ref = min(opn, prev_close) if prev_close else opn
+        if now - t < SPIKE_BLOCK:
+            _note_spike(coin, min(t, now), ref, high)
+        prev_close = close
+
+
+async def gate_spike(coin, now=None):
+    """None — резких скачков за 25 мин. не было; иначе текст: на сколько подскочила цена на Gate
+    и через сколько снова можно покупать."""
+    now = time.time() if now is None else now
+    boot = _spike_boot.get(coin)
+    if not boot or (not boot[1] and now - boot[0] > 30):
+        try:
+            await _spike_bootstrap(coin, now)
+            _spike_boot[coin] = (now, True)
+        except Exception as e:
+            _spike_boot[coin] = (now, False)
+            print(f"[arb] {coin}: свечи Gate не получены: {e}", flush=True)
+        boot = _spike_boot[coin]
+    if not boot[1]:
+        return "не получилось проверить свечи Gate за последние 25 мин. — жду, чтобы не купить на шпильке"
+    s = _last_spike.get(coin)
+    if not s or now - s[0] >= SPIKE_BLOCK:
+        return None
+    t, low, high, rise = s
+    ago, left = int((now - t) // 60), int((SPIKE_BLOCK - (now - t) + 59) // 60)
+    return (f"цена на Gate подскочила на {rise:.1f}% за несколько секунд ({fmt(low)} → {fmt(high)}, "
+            f"{ago} мин. назад) — шпилька, покупка снова через {left} мин.")
 
 
 async def check_opportunity(coin, cfg):
@@ -2972,7 +3004,7 @@ async def try_start(coin, cfg, opp, check_only=False):
     if not ok:
         await note_once(f"gatehi:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {why}.", every=DAILY)
         return False
-    spike = gate_spike(coin)
+    spike = await gate_spike(coin)
     if spike:
         await note_once(f"spike:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {spike}.", every=DAILY)
         return False
@@ -3253,7 +3285,7 @@ async def buy_step(d):
     #    на продажу из стакана вычитаем).
     if hasks and hasks[0][0] <= max_price:
         hasks = await without_my_asks(hpair, hasks)
-    spike = gate_spike(coin) if hasks and hasks[0][0] <= max_price else None
+    spike = await gate_spike(coin) if hasks and hasks[0][0] <= max_price else None
     if spike:
         why_not[coin] = (time.time(), spike)  # посреди покупки: не докупаем на шпильке
         await _idle(d, spike)
