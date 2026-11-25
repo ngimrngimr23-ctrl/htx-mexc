@@ -2574,6 +2574,51 @@ async def load():
 
 # ================= ПОИСК ВОЗМОЖНОСТИ =================
 
+# ---- Шпилька на Gate: цена подскочила резко, «одной свечой» ----
+# Бот смотрит стакан Gate каждые пару секунд и запоминает лучшую цену покупателей. Если за
+# любые SPIKE_WINDOW сек. из последних SPIKE_HOLD сек. она выросла на SPIKE_PCT% и больше —
+# это шпилька: не покупаем. Продержалась минуту — рынок цену «принял», покупаем; постепенный
+# рост (по чуть-чуть каждые 10 сек.) шпилькой не считается.
+SPIKE_PCT = D(5)
+SPIKE_WINDOW = 10
+SPIKE_HOLD = 60
+_gate_bid_hist = {}  # монета → [(время, лучший bid Gate)], последние ~2 мин.
+
+
+def note_gate_bid(coin, bid):
+    now = time.time()
+    h = _gate_bid_hist.setdefault(coin, [])
+    if not h or now - h[-1][0] >= 1:
+        h.append((now, D(str(bid))))
+    while h and now - h[0][0] > SPIKE_HOLD + SPIKE_WINDOW + 30:
+        h.pop(0)
+
+
+def gate_spike(coin):
+    """None — резких скачков нет; иначе текст: на сколько и как быстро подскочила цена на Gate.
+    Пока бот смотрит монету меньше минуты (только запустился) — тоже ждём: скачок не увидеть."""
+    h = _gate_bid_hist.get(coin) or []
+    now = time.time()
+    if not h or now - h[0][0] < SPIKE_HOLD:
+        return "бот следит за ценой на Gate меньше минуты — жду, чтобы не купить на шпильке"
+    worst = None
+    for i, (t, bid) in enumerate(h):
+        if now - t > SPIKE_HOLD:
+            continue
+        before = [b for tt, b in h[:i] if t - tt <= SPIKE_WINDOW]
+        if not before:
+            continue
+        low = min(before)
+        rise = (bid / low - 1) * 100 if low > 0 else D(0)
+        if rise >= SPIKE_PCT and (worst is None or rise > worst[0]):
+            worst = (rise, low, bid, int(now - t))
+    if worst:
+        rise, low, bid, ago = worst
+        return (f"цена на Gate подскочила на {rise:.1f}% за несколько секунд ({fmt(low)} → {fmt(bid)}, "
+                f"{ago} сек. назад) — шпилька, жду, пока цена продержится минуту")
+    return None
+
+
 async def check_opportunity(coin, cfg):
     """Спред HTX→Gate по лучшим ценам. None, если ниже минимума."""
     sym = gsym(coin)
@@ -2586,6 +2631,7 @@ async def check_opportunity(coin, cfg):
     if not gbids or not hasks:
         return None
     gate_bid = gbids[0][0]
+    note_gate_bid(coin, gate_bid)
     max_price = gate_bid / (1 + D(cfg["pct"]) / 100)
     if hasks[0][0] <= max_price:
         # Продавец по нужной цене есть — проверяем, не наш ли это ордер.
@@ -2926,6 +2972,10 @@ async def try_start(coin, cfg, opp, check_only=False):
     if not ok:
         await note_once(f"gatehi:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {why}.", every=DAILY)
         return False
+    spike = gate_spike(coin)
+    if spike:
+        await note_once(f"spike:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {spike}.", every=DAILY)
+        return False
 
     if arb["dry_run"] and check_only:
         return False
@@ -3171,6 +3221,7 @@ async def buy_step(d):
     (gbids, _), (hbids, hasks) = await asyncio.gather(gate_depth(gsym(coin)), htx_depth(hpair))
     if not gbids:
         return
+    note_gate_bid(coin, gbids[0][0])
     free_usdt, _ = await htx_balance("usdt")
     o = d["order"]
     locked = (D(o["amount"]) - D(o["filled"])) * D(o["price"]) if o else D(0)
@@ -3202,6 +3253,11 @@ async def buy_step(d):
     #    на продажу из стакана вычитаем).
     if hasks and hasks[0][0] <= max_price:
         hasks = await without_my_asks(hpair, hasks)
+    spike = gate_spike(coin) if hasks and hasks[0][0] <= max_price else None
+    if spike:
+        why_not[coin] = (time.time(), spike)  # посреди покупки: не докупаем на шпильке
+        await _idle(d, spike)
+        return
     if hasks and hasks[0][0] <= max_price:
         await _cancel_order(d)
         free_usdt, _ = await htx_balance("usdt")
