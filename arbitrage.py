@@ -4466,8 +4466,11 @@ async def htx_trades(symbol, since, until):
         end = t + step  # окна встык (без зазора), повторы отсеиваем по id
         key = f"htx|{symbol}|{int(t)}|{int(end)}"
         _hist_progress["done"] += 1
-        if key in _hist_cache:
-            rows_all = _hist_cache[key]
+        cached = _hist_cache.get(key)
+        if cached is not None and len(cached) >= 500 and t > time.time() - 119 * 86400:
+            cached = None  # сохранено старым способом, мог обрезаться на 500 — перекачиваем
+        if cached is not None:
+            rows_all = cached
         else:
             rows_all = await _htx_window(symbol, t, end)
             if end < time.time() - 600:  # окно закончилось — больше не изменится
@@ -4481,20 +4484,19 @@ async def htx_trades(symbol, since, until):
 
 
 async def _htx_window(symbol, t, end):
-    """Одно окно истории HTX (до 48 ч) со всеми страницами по 500."""
+    """Одно окно истории HTX (до 48 ч) целиком. HTX отдаёт не больше 500 сделок за запрос и не
+    описывает, в какую сторону листать (from/direct), — поэтому полное окно (500) делим пополам
+    и качаем половины, пока каждая не влезет в один запрос."""
+    rows = await _hist_req(htx_req, "GET", "/v1/order/matchresults", {
+        "symbol": symbol, "start-time": int(t * 1000), "end-time": int(end * 1000) - 1, "size": 500}) or []
+    if len(rows) < 500 or end - t < 1:
+        return rows
+    mid = t + (end - t) / 2
     out, seen = [], set()
-    # Окно [t, end) в мс: следующее начинается ровно там, где кончилось это, — без пропусков.
-    params = {"symbol": symbol, "start-time": int(t * 1000), "end-time": int(end * 1000) - 1, "size": 500}
-    while True:
-        rows = await _hist_req(htx_req, "GET", "/v1/order/matchresults", params) or []
-        new = [r for r in rows if r.get("id") not in seen]
-        for r in new:
+    for r in await _htx_window(symbol, t, mid) + await _htx_window(symbol, mid, end):
+        if r.get("id") not in seen:
             seen.add(r.get("id"))
-        out += new
-        if len(rows) < 500 or not new:
-            break
-        params["from"] = min(r["id"] for r in rows)
-        params["direct"] = "prev"
+            out.append(r)
     return out
 
 
@@ -4532,7 +4534,7 @@ async def htx_transfers(since, currencies=()):
     async def query(kind, currency):
         frm = None
         while True:
-            params = {"type": kind, "size": 500, "direct": "prev"}
+            params = {"type": kind, "size": 500, "direct": "next"}  # next — от новых к старым
             if currency:
                 params["currency"] = currency.lower()
             if frm:
@@ -4845,23 +4847,26 @@ async def cmd_stats(message: types.Message):
         quiet(mexc_transfers(since_all, now)) if old_mexc else asyncio.sleep(0, None),
         safe("HTX балансы", htx_all_balances()), safe("Gate балансы", gate_all_balances()),
         safe("HTX сделки за 48 ч", htx_recent_assets()))
-    norm = lambda a: htx2asset.get(str(a).upper(), str(a).upper())  # PROPY → PRO, MONAD → MON
+    def norm(a):  # PROPY → PRO, MONAD → MON; MAGIC-ARB, ZIL-ZILEVM, USDT-BSC — та же монета в другой сети
+        a = str(a).upper().split("-")[0]
+        return htx2asset.get(a, a)
     balances = {}
     for c, v in (hb or {}).items():
         balances[norm(c)] = balances.get(norm(c), D(0)) + v
     for c, v in (gb or {}).items():
+        c = str(c).upper().split("-")[0]
         balances[c] = balances.get(c, D(0)) + v
     known = arb.setdefault("stats_coins", {})
     for k in [k for k in known if norm(k) != k.upper()]:
         known.pop(k)  # тикер HTX у монеты с другим тикером на Gate — это та же монета
     assets = {norm(c) for c in arb["coins"]} | {norm(c) for c in known}
-    assets |= {norm(x["asset"]) for x in (gate_tr or [])} | set(balances) | {norm(c) for c in (recent or set())}
+    assets |= {str(x["asset"]).upper().split("-")[0] for x in (gate_tr or [])} | set(balances) | {norm(c) for c in (recent or set())}
     assets = {a for a in assets if a and a not in STABLES}
     htx_tr = await safe("HTX депозиты/выводы",
                         htx_transfers(since_all, sorted(asset2htx.get(a, a) for a in assets)))
     transfers = []
     for x in (htx_tr or []) + (gate_tr or []) + (mexc_tr or []):
-        x["asset"] = norm(x["asset"]) if x["ex"] == "HTX" else x["asset"]
+        x["asset"] = norm(x["asset"]) if x["ex"] == "HTX" else str(x["asset"]).upper().split("-")[0]
         transfers.append(x)
     assets |= {x["asset"] for x in transfers if x["asset"] not in STABLES}
     assets = sorted(a for a in assets if a)
@@ -4888,7 +4893,7 @@ async def cmd_stats(message: types.Message):
         try:
             grows = await gate_trades(gsym(asset), since_all, now)
         except ExchangeError as e:
-            if "INVALID_CURRENCY" not in str(e):  # пары нет на Gate — просто нет сделок
+            if not re.search(r"INVALID_CURRENCY|INVALID_PARAM", str(e)):  # пары нет на Gate — просто нет сделок
                 problems.append(f"{asset} Gate сделки: {str(e)[:100]}")
                 return asset, None
         if old_mexc:
