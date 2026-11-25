@@ -2075,25 +2075,51 @@ def address_book_hint(coin_htx, chain, address):
 _htx_pairs = {"ts": 0.0, "by_base": {}}
 
 
+_htx_pairs_lock = asyncio.Lock()
+
+
+async def _htx_load_pairs():
+    by_base = {}
+    try:
+        rows = await htx_req("GET", "/v1/settings/common/market-symbols", signed=False)
+        for r in rows or []:
+            if str(r.get("qc", "")).lower() == "usdt" and r.get("state", "online") == "online":
+                by_base[str(r.get("bc", "")).lower()] = r.get("symbol")
+    except (ExchangeError, asyncio.TimeoutError, aiohttp.ClientError):
+        pass
+    if not by_base:
+        rows = await htx_req("GET", "/v1/common/symbols", signed=False)
+        for r in rows or []:
+            if str(r.get("quote-currency", "")).lower() == "usdt" and r.get("state", "online") == "online":
+                by_base[str(r.get("base-currency", "")).lower()] = r.get("symbol")
+    return by_base
+
+
 async def htx_usdt_pair(currency):
     """Настоящее имя спотовой пары монеты к USDT на HTX (например «monadusdt»)
     по коду монеты — из общего списка пар HTX, а не склейкой строк. None, если
-    такой пары нет. Список кэшируется на час."""
-    if time.time() - _htx_pairs["ts"] > 3600 or not _htx_pairs["by_base"]:
-        by_base = {}
-        try:
-            rows = await htx_req("GET", "/v1/settings/common/market-symbols", signed=False)
-            for r in rows or []:
-                if str(r.get("qc", "")).lower() == "usdt" and r.get("state", "online") == "online":
-                    by_base[str(r.get("bc", "")).lower()] = r.get("symbol")
-        except ExchangeError:
-            pass
-        if not by_base:
-            rows = await htx_req("GET", "/v1/common/symbols", signed=False)
-            for r in rows or []:
-                if str(r.get("quote-currency", "")).lower() == "usdt" and r.get("state", "online") == "online":
-                    by_base[str(r.get("base-currency", "")).lower()] = r.get("symbol")
-        _htx_pairs.update(ts=time.time(), by_base=by_base)
+    такой пары нет. Список кэшируется на час и качается одним запросом, даже если
+    спрашивают сразу много монет (иначе десятки одинаковых больших запросов разом
+    падают по таймауту); не скачался — до 3 попыток."""
+    fresh = lambda: _htx_pairs["by_base"] and time.time() - _htx_pairs["ts"] <= 3600
+    if not fresh():
+        async with _htx_pairs_lock:
+            if not fresh():
+                by_base = {}
+                for attempt in range(3):
+                    try:
+                        by_base = await _htx_load_pairs()
+                        if not by_base:
+                            raise ExchangeError("HTX отдал пустой список пар")
+                        break
+                    except (ExchangeError, asyncio.TimeoutError, aiohttp.ClientError):
+                        if attempt == 2:
+                            if _htx_pairs["by_base"]:
+                                break  # старый список лучше, чем никакого
+                            raise
+                        await asyncio.sleep(3 * (attempt + 1))
+                if by_base:
+                    _htx_pairs.update(ts=time.time(), by_base=by_base)
     return _htx_pairs["by_base"].get(currency.lower())
 
 
