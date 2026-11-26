@@ -931,10 +931,21 @@ async def _mexc_req(method, path, params=None, signed=True):
 
 # ================= КОШЕЛЬКИ =================
 
+class RpcUnavailable(Exception):
+    """Нода сети ответила не JSON (пусто, страница ошибки, лимит запросов) — временный сбой."""
+
+
 async def _rpc_once(url, net, method, params):
     body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     async with http().post(url, json=body, timeout=TIMEOUT) as r:
-        data = await r.json(content_type=None)
+        text, status = await r.text(), r.status
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise RpcUnavailable(f"нода сети {net} не ответила ({method}): HTTP {status} "
+                             f"{(text.strip()[:80] or 'пустой ответ')}")
+    if not isinstance(data, dict):
+        raise RpcUnavailable(f"нода сети {net} ответила непонятно ({method}): {text.strip()[:80]}")
     if data.get("error"):
         raise ExchangeError(f"RPC {net} {method}: {data['error']}")
     return data.get("result")
@@ -2699,8 +2710,8 @@ def _err(e):
 
 def _is_net_error(e):
     """Обрыв связи / таймаут / 5xx биржи — пройдёт само, на следующем проходе."""
-    return (isinstance(e, (asyncio.TimeoutError, aiohttp.ClientError))
-            or bool(re.search(r"HTTP 5\d\d", str(e))))
+    return (isinstance(e, (asyncio.TimeoutError, aiohttp.ClientError, RpcUnavailable, json.JSONDecodeError))
+            or bool(re.search(r"HTTP (5\d\d|429)", str(e))))
 
 
 async def note_once(key, text, every=1800):
@@ -3093,12 +3104,15 @@ async def run_deal(d):
             await transport_step(d)
             await sell_step(d, alarm)
             await save()
+            d.pop("_net_err_since", None)
             if deal_finished(d):
                 break
         except Exception as e:
             print(f"[arb] сделка {d['coin']}: {traceback.format_exc()}", flush=True)
             if is_auth_error(e):
                 await notify_auth_error(e)
+            elif _is_net_error(e) and time.time() - d.setdefault("_net_err_since", time.time()) < CHK_FAIL_SEC:
+                pass  # сбой связи с биржей/нодой — обычно проходит сам; сообщаем, только если держится 10 мин.
             else:
                 # Одна и та же ошибка у разных сделок — одно сообщение раз в 30 мин., а не по
                 # сообщению от каждой сделки каждые 5 мин.
