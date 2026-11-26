@@ -2770,6 +2770,16 @@ async def notify_auth_error(e):
     t = str(e)
     ex = "Gate" if "Gate" in t else "HTX" if "HTX" in t else "биржи"
     stuck = ", ".join(sorted(deals)) or "новые сделки не начинаются"
+    ip = re.search(r"whitelist[^0-9]*(\d{1,3}(?:\.\d{1,3}){3})", t, re.I)
+    if ip:
+        # Ключ рабочий, просто сервер бота сменил IP (новый сервис / Render сменил адрес).
+        await note_once(f"auth:{ex}", (
+            f"⛔ <b>{ex} не пускает сервер бота</b>: IP <code>{ip.group(1)}</code> нет в белом списке ключа.\n"
+            f"Сделки стоят, пока IP не добавят (повторяю сами, монеты никуда не деваются): {stuck}.\n"
+            f"Что сделать: на {ex} → API-ключи → этот ключ → IP-адреса — добавь <code>{ip.group(1)}</code> "
+            f"(все IP сервера показывает /arb_key). Новый ключ не нужен, перезапуск тоже.\n"
+            f"Об этом — не чаще раза в час."), every=3600)
+        return
     await note_once(f"auth:{ex}", (
         f"⛔ <b>Ключ API {ex} не принимается</b>: <code>{html.escape(t[:200])}</code>\n"
         f"Пока ключ не заменят, сделки стоят (повторяю сами, монеты никуда не деваются): {stuck}.\n"
