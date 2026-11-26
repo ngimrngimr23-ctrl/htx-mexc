@@ -80,6 +80,13 @@ RPC_URLS = {
     "sol": os.environ.get("SOLANA_RPC_URL") or "https://api.mainnet-beta.solana.com",
     "trx": (os.environ.get("TRON_API_URL") or "https://api.trongrid.io").rstrip("/"),
 }
+# Запасные публичные ноды встроенных EVM-сетей: основная может закрыть доступ серверу бота
+# (Cloudflare «Just a moment…», HTTP 403) или упереться в лимит — тогда пробуем их.
+RPC_SPARES = {
+    "eth": ["https://eth.drpc.org", "https://eth-mainnet.public.blastapi.io", "https://ethereum-rpc.publicnode.com"],
+    "bsc": ["https://bsc-dataseed1.defibit.io", "https://bsc.drpc.org", "https://bsc-rpc.publicnode.com",
+            "https://bsc-dataseed.bnbchain.org"],
+}
 NET_TITLES = {"eth": "Ethereum", "bsc": "BNB Chain", "monad": "Monad", "sui": "Sui", "atom": "Cosmos Hub",
               "sol": "Solana", "trx": "Tron"}
 NATIVE_COIN = {"eth": "ETH", "bsc": "BNB", "monad": "MON", "sui": "SUI", "atom": "ATOM", "sol": "SOL", "trx": "TRX"}
@@ -956,19 +963,25 @@ async def rpc(net, method, params):
     запасные (сети, найденные автоматически), — пробуем их и переходим на рабочую."""
     try:
         return await _rpc_once(RPC_URLS[net], net, method, params)
-    except ExchangeError:
-        raise  # нода ответила ошибкой по существу — запасная не поможет
-    except Exception:
-        spares = [u for u in arb.get("networks", {}).get(net, {}).get("rpcs", []) if u != RPC_URLS[net]]
-        for url in spares:
-            try:
-                res = await _rpc_once(url, net, method, params)
-            except Exception:
-                continue
-            RPC_URLS[net] = url
+    except ExchangeError as e:
+        # Нода ответила ошибкой по существу — запасная не поможет; но «лимит запросов» — поможет.
+        if not re.search(r"limit|rate|too many|-32005|-32001|-32029", str(e), re.I):
+            raise
+        first = e
+    except Exception as e:
+        first = e
+    spares = arb.get("networks", {}).get(net, {}).get("rpcs", []) + RPC_SPARES.get(net, [])
+    for url in dict.fromkeys(u for u in spares if u != RPC_URLS[net]):
+        try:
+            res = await _rpc_once(url, net, method, params)
+        except Exception:
+            continue
+        print(f"[arb] сеть {net}: нода {RPC_URLS[net]} не отвечает ({str(first)[:80]}), перешёл на {url}", flush=True)
+        RPC_URLS[net] = url
+        if net in arb.get("networks", {}):
             arb["networks"][net]["rpc"] = url
-            return res
-        raise
+        return res
+    raise first
 
 
 def _pad32(hex_no0x):
