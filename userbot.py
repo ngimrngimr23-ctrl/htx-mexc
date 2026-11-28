@@ -94,7 +94,7 @@ class UserBot:
             log("юзербот не подключился: %s" % self.last_error, "ERR")
             return False
 
-    async def ask(self, bot, text, is_final, reply_timeout=None, tag="TG", skip_if=None):
+    async def ask(self, bot, text, is_final, reply_timeout=None, tag="TG", skip_if=None, press=None):
         """Отправляет text боту и ждёт ответ. Никогда не бросает исключений.
 
         is_final(text) -> True, когда ответ окончательный (вердикт, таблица и т.п.).
@@ -102,6 +102,8 @@ class UserBot:
         ответа не было, отдаёт последний увиденный текст: пусть разбор решит, что это.
         skip_if() проверяется уже внутри очереди: True — не спрашивать (ответ уже в кэше,
         пока ждали очереди, эту монету спросили), вернётся (None, SKIPPED).
+        press(msg) -> кнопка, которую надо нажать под ответом (или None): у @SpreaderApp на тикер
+        сначала приходит карточка монеты с меню, а таблица цен — только по кнопке «Спот».
         """
         if not self.ready:
             return None, "юзербот не подключён"
@@ -120,7 +122,7 @@ class UserBot:
             log("спрашиваю @%s: %s" % (bot, text), tag)
             try:
                 reply, note = await asyncio.wait_for(
-                    self._ask(bot, text, is_final, reply_timeout), HARD_TIMEOUT)
+                    self._ask(bot, text, is_final, reply_timeout, press), HARD_TIMEOUT)
             except asyncio.TimeoutError:
                 reply, note = None, "запрос завис дольше %d с" % HARD_TIMEOUT
                 self.last_error = "@%s %s: %s" % (bot, text, note)
@@ -143,13 +145,13 @@ class UserBot:
                                          time.time() - started), tag)
             return reply, note
 
-    async def _ask(self, bot, text, is_final, reply_timeout):
+    async def _ask(self, bot, text, is_final, reply_timeout, press=None):
         """Не client.conversation: бот может сначала прислать «ищу…», а потом
         ОТРЕДАКТИРОВАТЬ это же сообщение в ответ — события новых сообщений правку
         не видят. get_messages всегда отдаёт текущий текст: видны и новые, и правки."""
         sent = await self.client.send_message(bot, text)
         deadline = time.time() + reply_timeout
-        last = None
+        last, pressed = None, set()
         while time.time() < deadline:
             await asyncio.sleep(POLL_INTERVAL)
             msgs = await self.client.get_messages(bot, limit=5, min_id=sent.id)
@@ -162,6 +164,12 @@ class UserBot:
                 if is_final(t):
                     return t, ""
                 last = t
+                if press is not None and msg.id not in pressed:
+                    btn = press(msg)
+                    if btn is not None:
+                        pressed.add(msg.id)
+                        await btn.click()  # ответ придёт правкой этого сообщения или новым — перечитаем
+                        deadline = time.time() + reply_timeout
         if last is not None:
             return last, "окончательного ответа за %d с не было" % reply_timeout
         return None, "бот не ответил за %d с" % reply_timeout

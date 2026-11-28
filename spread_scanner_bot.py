@@ -342,7 +342,7 @@ async def start_cmd(message: types.Message):
         f"/debug — воронка последнего прохода сканера (диагностика, если алертов нет)\n"
         f"/halal — халяль-проверка монет перед сигналом (on/off/only/all, /halal MBL)\n"
         f"   └ сейчас: <b>{halal_mode()}</b>\n"
-        f"/ask SpreaderApp DGB — спросить бота через юзербот, увидеть сырой ответ\n"
+        f"/ask SpreaderApp DGB | Спот — спросить бота через юзербот (и нажать кнопку), увидеть сырой ответ\n"
         f"/arb — автоарбитраж HTX → кошелёк → Gate (помощь: /arb_help), весь рынок — /arb_auto\n\n"
 
         f"💾 <b>Upstash</b>: {'подключён — настройки/ЧС/муты переживут перезапуск' if UPSTASH_REDIS_REST_URL else 'не настроен — состояние в памяти, слетит при перезапуске'}\n\n"
@@ -668,7 +668,7 @@ async def halal_cmd(message: types.Message, command: CommandObject):
         "/halal only — только халяль (неизвестные тоже отсеивать)\n"
         "/halal all — обычный режим (блок только харам)\n"
         "/halal MBL — проверить монету прямо сейчас\n"
-        "/ask SpreaderApp DGB — спросить любого бота через юзербот и увидеть сырой ответ",
+        "/ask SpreaderApp DGB | Спот — спросить бота через юзербот (и нажать кнопку), увидеть сырой ответ",
         parse_mode="HTML")
 
 
@@ -677,9 +677,22 @@ async def ask_cmd(message: types.Message, command: CommandObject):
     """/ask SpreaderApp DGB — отправить текст боту от имени юзербота и показать сырой ответ."""
     parts = (command.args or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Пример: /ask SpreaderApp DGB  ·  /ask CryptoGulfHalal_Bot MBL")
+        await message.answer("Пример: /ask SpreaderApp DGB | Спот  ·  /ask CryptoGulfHalal_Bot MBL\n"
+                             "После «|» — кнопка, которую нажать под ответом.")
         return
     bot_name, text = parts[0].lstrip("@"), parts[1]
+    button = None
+    if "|" in text:  # /ask SpreaderApp ETC | Спот — нажать кнопку под ответом
+        text, button = [x.strip() for x in text.split("|", 1)]
+
+    def press(msg):
+        if not button:
+            return None
+        for row in getattr(msg, "buttons", None) or []:
+            for btn in row:
+                if button.lower() in (getattr(btn, "text", "") or "").lower():
+                    return btn
+        return None
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", bot_name):
         await message.answer("❌ Имя бота: латиница, цифры, _ (например SpreaderApp)")
         return
@@ -688,7 +701,7 @@ async def ask_cmd(message: types.Message, command: CommandObject):
         return
     queue = " (жду очереди)" if ub.busy else ""
     await message.answer(f"⏳ Спрашиваю @{bot_name}: {html.escape(text)}…{queue}", parse_mode="HTML")
-    reply, note = await ub.ask(bot_name, text, lambda t: False, reply_timeout=12, tag="ASK")
+    reply, note = await ub.ask(bot_name, text, lambda t: False, reply_timeout=12, tag="ASK", press=press)
     if reply is None:
         await message.answer(f"❔ Ответа нет: {html.escape(note)}")
         return

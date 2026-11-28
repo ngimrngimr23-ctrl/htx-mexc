@@ -106,6 +106,20 @@ def is_final(text, ticker):
     return not p["mismatch"] and len(p["rows"]) >= 2
 
 
+def spot_button(msg, ticker):
+    """Кнопка «Спот» под карточкой монеты (на тикер @SpreaderApp сначала присылает карточку:
+    «Ethereum Classic (ETC) · Цена … · Спот 12 · перп 16» и меню, таблица — по кнопке «Спот»).
+    Нажимаем, только если карточка про нашу монету."""
+    head = re.search(r"\(([A-Za-z0-9]{1,15})\)", (getattr(msg, "raw_text", "") or "").split("\n")[0])
+    if head and head.group(1).upper() != ticker.upper():
+        return None
+    for row in getattr(msg, "buttons", None) or []:
+        for b in row:
+            if re.sub(r"[^\w]", "", getattr(b, "text", "") or "").lower() in ("спот", "spot"):
+                return b
+    return None
+
+
 def market_check(rows, gate_ref, spread_pct, markets=None):
     """(ok, пояснение). markets — ключи бирж (okx, binance…); пусто — весь рынок, кроме HTX и Gate.
     ok=False, если хоть одна выбранная биржа дешевле Gate больше чем на spread_pct/2,
@@ -165,7 +179,8 @@ class SpreaderChecker:
                 return hit
         try:
             text, note = await self.ub.ask(BOT, ticker, lambda t: is_final(t, ticker), tag="SPREADER",
-                                           skip_if=None if fresh else (lambda: self.cached(ticker) is not None))
+                                           skip_if=None if fresh else (lambda: self.cached(ticker) is not None),
+                                           press=lambda m: spot_button(m, ticker))
             if text is None and note == userbot.SKIPPED:
                 return self.cached(ticker) or _unknown("проверка в очереди")
             if text is None:
