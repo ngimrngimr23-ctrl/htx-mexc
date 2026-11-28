@@ -38,6 +38,8 @@ import uuid
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 import aiohttp
+
+import spreader
 from aiogram import F, Router, types
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
@@ -174,6 +176,13 @@ arb = {
     # Пополнение HTX с кошелька бота: если USDT на HTX меньше topup_usd — перевести
     # недостающее из сетей TOPUP_NETS (0 — выключено). /arb_set topup 600
     "topup_usd": 600.0,
+    # Автоарбитраж всего рынка (/arb_auto): монету из сигнала сканера HTX→Gate бот берёт сам,
+    # если она халяль, контракт на HTX и Gate совпал, сеть поддерживается и рынок (@SpreaderApp)
+    # подтверждает цену. auto_net_pct — мин. ЧИСТЫЙ спред (после торговых комиссий и вывода).
+    "auto_on": False,
+    "auto_net_pct": 3.0,
+    # Биржи для сверки цены (/arb_markets): ключи вроде binance, okx; пусто — весь рынок.
+    "auto_markets": [],
     # Куплено на HTX, но не выведено (вывод не окупался): {монета: {"qty", "cost"}}.
     # Следующая сделка по монете начинает с этого остатка и выводит всё разом.
     "carry": {},
@@ -206,6 +215,8 @@ alarms = {}       # id -> {"text": str, "acked": bool}
 
 
 class _Ctx:
+    halal = None     # халяль-проверка (ставит сканер), см. halal.py
+    spreader = None  # цены по биржам через @SpreaderApp, см. spreader.py
     bot = None
     session_getter = None
     redis = None
@@ -2819,6 +2830,8 @@ async def engine_loop():
                 for c in arb["coins"]:
                     why_not[c] = (time.time(), "Upstash не отвечает — сделки не начинаю, пока не прочитаю состояние")
             elif arb["enabled"] and arb["coins"]:
+                if auto_cleanup():
+                    await save()
                 # Все монеты списка проверяются ПАРАЛЛЕЛЬНО: время прохода = одному
                 # запросу, а не сумме по монетам. Первой пробуем монету с большим спредом.
                 # Сначала — монеты, для которых ещё не найдена настоящая пара на HTX:
@@ -2986,6 +2999,11 @@ async def try_start(coin, cfg, opp, check_only=False):
     if not ok:
         await note_once(f"gatehi:{coin}", f"⚠️ <b>{coin}</b>: спред {opp['spread']:.2f}%, но {why}.", every=DAILY)
         return False
+    if cfg.get("auto"):
+        ok, why = await auto_recheck(coin, cfg, opp)
+        if not ok:
+            why_not[coin] = (time.time(), f"автоарбитраж: {why}")
+            return False
 
     if arb["dry_run"] and check_only:
         return False
@@ -5159,6 +5177,84 @@ async def add_coin(coin, cfg):
     return text
 
 
+AUTO_TTL = 30 * 60  # монета из автоарбитража убирается, если сигналов по ней нет столько времени
+
+
+async def auto_offer(coin, net, route_contract, halal_v, spread, net_spread, gate_bid, htx_ask, trade_fees):
+    """Сигнал сканера HTX→Gate → брать ли монету в автоарбитраж всего рынка.
+    Возвращает строку для сигнала («🤖 …») или "" — если монета уже в списке вручную."""
+    head = "🤖 Автоарбитраж: "
+    cfg0 = arb["coins"].get(coin)
+    if cfg0 is not None:
+        if not cfg0.get("auto"):
+            return ""  # добавлена вручную — её настройки не трогаем
+        cfg0["auto_until"] = time.time() + AUTO_TTL
+        return head + "монета уже в работе"
+    if not arb["enabled"]:
+        return head + "не беру — автоарбитраж выключен (/arb_on)"
+    if not net:
+        return head + "не беру — сеть монеты бот не поддерживает"
+    if route_contract == "mismatch":
+        return head + "не беру — контракты на HTX и Gate разные"
+    if not halal_v or halal_v.get("status") != "halal":
+        why = (halal_v or {}).get("note") or ("харам" if (halal_v or {}).get("status") == "haram"
+                                             else "халяль-проверка выключена или не настроена (/halal)")
+        return head + "не беру — не подтверждено халяль (%s)" % html.escape(why)
+    need = D(str(arb.get("auto_net_pct", 3)))
+    if net_spread is None or D(str(net_spread)) < need:
+        return head + "не беру — чистый спред %s ниже порога %s%% (/arb_auto)" % (
+            "неизвестен" if net_spread is None else "%.2f%%" % net_spread, fmt(need))
+    sp = await ctx.spreader.check(coin) if getattr(ctx, "spreader", None) else {"status": "unknown",
+                                                                               "note": "юзербот не настроен"}
+    if sp["status"] != "ok":
+        return head + "не беру — цены по рынку не получил (%s)" % html.escape(sp.get("note") or "")
+    ok, why = spreader.market_check(sp["rows"], float(gate_bid), float(spread), arb.get("auto_markets") or None)
+    if not ok:
+        return head + "не беру — рынок: %s" % html.escape(why)
+    cfg = {"pct": float(need) + float(trade_fees), "net": net, "probe": 0, "htx_chain": None, "gate_net": None,
+           "auto": True, "auto_until": time.time() + AUTO_TTL}
+    try:
+        await gate_symbol(gsym(coin))
+        res = await resolve_coin(coin, cfg)
+    except Exception as e:
+        return head + "не беру — %s" % html.escape(_err(e)[:150])
+    if res["contract_status"] not in ("ok", "native"):
+        return head + "не беру — контракт на HTX и Gate не совпал автоматически"
+    if not res["htx_withdraw_ok"] or not res["gate_deposit_ok"]:
+        return head + "не беру — вывод HTX или депозит Gate в сети %s закрыт" % NET_TITLES[net]
+    arb["coins"][coin] = cfg
+    arb.setdefault("stats_coins", {}).setdefault(coin, None)
+    await save()
+    return (head + "<b>взял в работу</b> — %s, покупаю при чистом спреде ≥ %s%%%s.\nРынок: %s" % (
+        NET_TITLES[net], fmt(need), "" if not arb["dry_run"] else " (🧪 тестовый режим)", html.escape(why)))
+
+
+def auto_cleanup():
+    """Убирает монеты автоарбитража, по которым давно не было сигналов и нет сделки/остатка."""
+    now, gone = time.time(), []
+    for coin, cfg in list(arb["coins"].items()):
+        if cfg.get("auto") and now > cfg.get("auto_until", 0) and coin not in deals \
+                and coin not in arb.get("carry", {}):
+            arb["coins"].pop(coin, None)
+            gone.append(coin)
+    return gone
+
+
+async def auto_recheck(coin, cfg, opp):
+    """Перед покупкой монеты из автоарбитража: всё ещё халяль и рынок подтверждает цену. (ok, почему нет)."""
+    hv = ctx.halal.cached(coin) if getattr(ctx, "halal", None) else None
+    if not hv or hv.get("status") != "halal":
+        return False, "нет свежего вердикта «халяль»"
+    if not getattr(ctx, "spreader", None):
+        return False, "юзербот не настроен — цены по рынку не проверить"
+    sp = await ctx.spreader.check(coin)
+    if sp["status"] != "ok":
+        return False, "цены по рынку не получил (%s)" % sp.get("note")
+    ok, why = spreader.market_check(sp["rows"], float(opp["gate_bid"]), float(opp["spread"]),
+                                    arb.get("auto_markets") or None)
+    return ok, ("" if ok else "рынок: " + why)
+
+
 def net_from_names(*names):
     """Код сети бота по названиям сети на биржах ('ERC20', 'BEP20(BSC)', 'SUI'…) или None."""
     for net in NET_TITLES:
@@ -5356,6 +5452,72 @@ async def cmd_confirm(message: types.Message, command: CommandObject):
     cfg["confirmed_contract"] = res["token"]
     await save()
     await message.answer(f"✅ <b>{coin}</b>: контракт <code>{res['token']}</code> подтверждён.", parse_mode="HTML")
+
+
+@router.message(Command("arb_auto"))
+async def cmd_auto(message: types.Message, command: CommandObject):
+    """/arb_auto — статус; on | off; /arb_auto 3 — мин. чистый спред, %."""
+    if not await _guard(message):
+        return
+    a = (command.args or "").strip().lower().replace(",", ".").rstrip("%")
+    if a in ("on", "вкл"):
+        arb["auto_on"] = True
+    elif a in ("off", "выкл"):
+        arb["auto_on"] = False
+    elif a:
+        try:
+            v = float(a)
+            if v <= 0 or v > 100:
+                raise ValueError
+            arb["auto_net_pct"] = v
+        except ValueError:
+            await message.answer("Пример: /arb_auto on · /arb_auto off · /arb_auto 3 (мин. чистый спред, %)")
+            return
+    if a:
+        await save()
+    autos = sorted(c for c, cfg in arb["coins"].items() if cfg.get("auto"))
+    mk = ", ".join(arb.get("auto_markets") or []) or "весь рынок (кроме HTX и Gate, объём от 1000$)"
+    halal_ready = bool(getattr(ctx, "halal", None) and ctx.halal.ready)
+    await message.answer(
+        f"🤖 <b>Автоарбитраж всего рынка</b>: {'✅ ВКЛ' if arb.get('auto_on') else '⏸ ВЫКЛ'}\n"
+        f"Мин. чистый спред (после торговых комиссий и вывода): <b>{fmt(D(str(arb.get('auto_net_pct', 3))))}%</b>\n"
+        f"Сверка цены по биржам: {html.escape(mk)} — /arb_markets\n"
+        f"Беру монету, только если: сигнал HTX→Gate, халяль подтверждён, контракт на HTX и Gate совпал, "
+        f"сеть поддерживается, и на выбранных биржах цена не ниже Gate больше чем на половину спреда.\n"
+        f"Юзербот (халяль + @SpreaderApp): {'✅ подключён' if halal_ready else '⚠️ не подключён — монеты брать не будет'}\n"
+        f"Общий автоарбитраж: {'▶️ ВКЛ' if arb['enabled'] else '⏸ ВЫКЛ (/arb_on)'} · "
+        f"{'🧪 тест' if arb['dry_run'] else '💸 реальные сделки'}\n"
+        f"Сигналы приходят от сканера, поэтому порог /sp тоже должен пропускать такой спред.\n"
+        f"Сейчас в работе: {', '.join(autos) or 'нет'} (без сигналов {AUTO_TTL // 60} мин. — убираются сами)\n\n"
+        f"/arb_auto on | off · /arb_auto 3 — порог чистого спреда",
+        parse_mode="HTML")
+
+
+@router.message(Command("arb_markets"))
+async def cmd_markets(message: types.Message, command: CommandObject):
+    """/arb_markets binance okx bybit — биржи для сверки цены; /arb_markets all — весь рынок."""
+    if not await _guard(message):
+        return
+    a = (command.args or "").strip()
+    if a.lower() in ("all", "все", "всё"):
+        arb["auto_markets"] = []
+        await save()
+    elif a:
+        keys = [spreader.ex_key(x) for x in re.split(r"[\s,]+", a) if x.strip()]
+        keys = [k for k in dict.fromkeys(keys) if k and k not in ("htx", "gate")]
+        if not keys:
+            await message.answer("Пример: /arb_markets binance okx bybit · /arb_markets all")
+            return
+        arb["auto_markets"] = keys
+        await save()
+    mk = arb.get("auto_markets") or []
+    await message.answer(
+        "📊 <b>Сверка цены перед автопокупкой</b>: "
+        + (html.escape(", ".join(mk)) if mk else "весь рынок (все биржи из @SpreaderApp, кроме HTX и Gate, объём от 1000$)")
+        + "\nПравило: на каждой из них цена не ниже Gate больше чем на половину спреда HTX→Gate. "
+          "Биржи, где монеты нет, пропускаются; если нет ни одной — не покупаю.\n"
+          "/arb_markets binance okx bybit · /arb_markets all",
+        parse_mode="HTML")
 
 
 @router.message(Command("arb_del"))
@@ -6065,6 +6227,8 @@ BOT_COMMANDS = [
     ("arb_stats", "Сделки и прибыль за сутки / неделю / месяц"),
     ("arb_add", "Добавить монету: PEPE 3 bsc [проба$]"),
     ("arb_del", "Убрать монету из автоарбитража"),
+    ("arb_auto", "Автоарбитраж всего рынка: on/off, порог"),
+    ("arb_markets", "Биржи для сверки цены перед покупкой"),
     ("arb_chains", "Сети монеты на HTX и Gate"),
     ("arb_confirm", "Подтвердить контракт монеты вручную"),
     ("arb_htx", "Что HTX отдаёт по монете (проверка API)"),

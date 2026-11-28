@@ -11,7 +11,10 @@ import time
 import os
 
 import arbitrage
+import halal
 import scanner_quality as sq
+import spreader
+import userbot
 
 # ================= НАСТРОЙКИ =================
 # ВАЖНО: токен ТОЛЬКО из переменной окружения. Никогда не хардкодь его в файле,
@@ -112,6 +115,12 @@ settings = {
     # разные монеты с одним тикером (/ca). Где контракт не отдан — не режем.
     "check_contracts": True,
 
+    # Проверять монету в @CryptoGulfHalal_Bot перед сигналом (если юзербот настроен, /halal).
+    # Харам → монета в ЧС, сигнал не шлём; иначе сигнал с пометкой вердикта.
+    "halal_check": True,
+    # Строгий режим: сигнал только по подтверждённым халяль; «не проверено» пропускаем (не в ЧС).
+    "halal_only": False,
+
     "chat_id": None,
     "channel_id": None,
 }
@@ -144,6 +153,18 @@ def apply_env_overrides():
 
 
 blacklist = set()
+
+# Юзербот (обычный аккаунт Telegram): спрашивает халяль-бота и @SpreaderApp — ботам писать
+# ботам Telegram не даёт. Без TG_API_ID / TG_API_HASH / TG_SESSION просто выключен.
+ub = userbot.UserBot()
+halal_checker = halal.HalalChecker(ub)
+spreader_checker = spreader.SpreaderChecker(ub)
+arbitrage.ctx.halal = halal_checker
+arbitrage.ctx.spreader = spreader_checker
+# Монеты, которые ты сам вернул из ЧС после харам-вердикта: их больше не проверяем и не блокируем.
+halal_ignore = set()
+halal_stats = {"skipped": 0, "blocked": 0, "last_log": 0.0}
+RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME") or "этом сервисе"
 
 # symbol -> timestamp (unix), до которого монета замьючена. Отличается от
 # blacklist тем, что снимается автоматически по истечении времени, не навсегда.
@@ -319,7 +340,10 @@ async def start_cmd(message: types.Message):
         f"   └ сейчас: <b>{settings['channel_id'] or 'Не задан'}</b>\n"
         f"/s — текущий статус настроек\n"
         f"/debug — воронка последнего прохода сканера (диагностика, если алертов нет)\n"
-        f"/arb — автоарбитраж HTX → кошелёк → Gate (помощь: /arb_help)\n\n"
+        f"/halal — халяль-проверка монет перед сигналом (on/off/only/all, /halal MBL)\n"
+        f"   └ сейчас: <b>{halal_mode()}</b>\n"
+        f"/ask SpreaderApp DGB — спросить бота через юзербот, увидеть сырой ответ\n"
+        f"/arb — автоарбитраж HTX → кошелёк → Gate (помощь: /arb_help), весь рынок — /arb_auto\n\n"
 
         f"💾 <b>Upstash</b>: {'подключён — настройки/ЧС/муты переживут перезапуск' if UPSTASH_REDIS_REST_URL else 'не настроен — состояние в памяти, слетит при перезапуске'}\n\n"
 
@@ -524,11 +548,19 @@ async def add_blacklist(message: types.Message, command: CommandObject):
     settings["chat_id"] = message.chat.id
     if command.args:
         pair = normalize_pair(command.args)
+        base = pair[:-4]
         if pair in blacklist:
             blacklist.discard(pair)
-            await message.answer(f"✅ <b>{pair}</b> убран из ЧС (сейчас в ЧС: {len(blacklist)})", parse_mode="HTML")
+            extra = ""
+            hv = halal_checker.cached(base)
+            if hv and hv.get("status") == halal.HARAM:
+                # Ручное решение главнее автоматики: больше не проверяем и не блокируем.
+                halal_ignore.add(base)
+                extra = "\n🕌 Её туда отправил харам-вердикт — больше не проверяю и не блокирую (вернуть в ЧС: /b " + base + ")"
+            await message.answer(f"✅ <b>{pair}</b> убран из ЧС (сейчас в ЧС: {len(blacklist)}){extra}", parse_mode="HTML")
         else:
             blacklist.add(pair)
+            halal_ignore.discard(base)
             await message.answer(f"🚫 <b>{pair}</b> в ЧС (сейчас в ЧС: {len(blacklist)})", parse_mode="HTML")
         schedule_save()
     else:
@@ -541,6 +573,7 @@ async def blacklist_button(callback: types.CallbackQuery):
     pair = normalize_pair(callback.data[3:])
     already = pair in blacklist
     blacklist.add(pair)
+    halal_ignore.discard(pair[:-4])
     schedule_save()
     await callback.answer(f"{pair[:-4]} уже в ЧС" if already else f"🚫 {pair[:-4]} в ЧС — сигналов по ней больше не будет")
     try:  # кнопку ЧС под этим сигналом заменяем пометкой, остальные кнопки оставляем
@@ -565,6 +598,102 @@ async def list_blacklist(message: types.Message):
         return
     coins = "\n".join(f"• {p}" for p in sorted(blacklist))
     await message.answer(f"🚫 <b>Чёрный список ({len(blacklist)}):</b>\n{coins}", parse_mode="HTML")
+
+
+@dp.message(Command("halal"))
+async def halal_cmd(message: types.Message, command: CommandObject):
+    """/halal — статус; on|off; only|all; /halal MBL — проверить сейчас в обход кэша."""
+    arg = (command.args or "").strip()
+    low = arg.lower()
+    if low in ("on", "вкл"):
+        settings["halal_check"] = True
+        schedule_save()
+        await message.answer(f"🕌 Халяль-проверка: <b>{halal_mode()}</b>", parse_mode="HTML")
+        return
+    if low in ("off", "выкл"):
+        settings["halal_check"] = False
+        settings["halal_only"] = False
+        schedule_save()
+        await message.answer("🕌 Халяль-проверка выключена (и строгий режим тоже). "
+                             "Автоарбитраж всего рынка без неё не покупает — он берёт только подтверждённые халяль.")
+        return
+    if low == "only":
+        settings["halal_check"] = True
+        settings["halal_only"] = True
+        schedule_save()
+        warn = "" if halal_checker.ready else (
+            "\n⚠️ Юзербот не подключён — в строгом режиме сигналов не будет совсем: "
+            + html.escape(ub.describe()))
+        await message.answer("🕌 Строгий режим: сигналы только по подтверждённым халяль. "
+                             "Харам — в ЧС, «не проверено» — пропускаю (в ЧС не кладу).\n"
+                             "Обычный режим: /halal all" + warn, parse_mode="HTML")
+        return
+    if low == "all":
+        settings["halal_only"] = False
+        schedule_save()
+        await message.answer(f"🕌 Обычный режим: <b>{halal_mode()}</b>", parse_mode="HTML")
+        return
+    if arg:
+        base = re.sub(r"[^A-Z0-9]", "", arg.upper())
+        if base.endswith("USDT") and len(base) > 4:
+            base = base[:-4]
+        if not base:
+            await message.answer("❌ Пример: /halal MBL")
+            return
+        if not halal_checker.ready:
+            await message.answer(f"⚠️ Юзербот: {html.escape(ub.describe())}")
+            return
+        queue = " (сначала дождусь текущей проверки)" if ub.busy else ""
+        await message.answer(f"⏳ Спрашиваю @{halal.BOT} про <b>{base}</b>…{queue}", parse_mode="HTML")
+        v = await halal_checker.check(base, fresh=True)
+        schedule_save()
+        verdict = {halal.HARAM: "❌ харам (غير مباح) — сигналы по ней будут блокироваться",
+                   halal.HALAL: "✅ халяль (مباح)"}.get(v["status"], f"❔ не проверено: {v.get('note')}")
+        extra = ""
+        if v.get("link"):
+            extra += f"\n🔗 {v['link']}"
+        if v.get("source"):
+            extra += f"\nИсточник: {v['source']}"
+        if base in halal_ignore:
+            extra += "\nℹ️ Ты возвращал её из ЧС вручную — автоматически не блокирую"
+        await message.answer(html.escape(f"🕌 {base}: {verdict}{extra}"), disable_web_page_preview=True)
+        return
+    await message.answer(
+        f"🕌 <b>Халяль-проверка</b>: {halal_mode()}\n"
+        f"Юзербот: {html.escape(ub.describe())}\n"
+        f"В кэше вердиктов: {len(halal_checker.cache)} · харам → ЧС: {halal_stats['blocked']} · "
+        f"пропущено строгим режимом: {halal_stats['skipped']}\n"
+        f"Возвращены вручную: {html.escape(', '.join(sorted(halal_ignore)) or 'нет')}\n\n"
+        "/halal on | off — вкл/выкл проверку\n"
+        "/halal only — только халяль (неизвестные тоже отсеивать)\n"
+        "/halal all — обычный режим (блок только харам)\n"
+        "/halal MBL — проверить монету прямо сейчас\n"
+        "/ask SpreaderApp DGB — спросить любого бота через юзербот и увидеть сырой ответ",
+        parse_mode="HTML")
+
+
+@dp.message(Command("ask"))
+async def ask_cmd(message: types.Message, command: CommandObject):
+    """/ask SpreaderApp DGB — отправить текст боту от имени юзербота и показать сырой ответ."""
+    parts = (command.args or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Пример: /ask SpreaderApp DGB  ·  /ask CryptoGulfHalal_Bot MBL")
+        return
+    bot_name, text = parts[0].lstrip("@"), parts[1]
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", bot_name):
+        await message.answer("❌ Имя бота: латиница, цифры, _ (например SpreaderApp)")
+        return
+    if not ub.ready:
+        await message.answer(f"⚠️ Юзербот: {html.escape(ub.describe())}")
+        return
+    queue = " (жду очереди)" if ub.busy else ""
+    await message.answer(f"⏳ Спрашиваю @{bot_name}: {html.escape(text)}…{queue}", parse_mode="HTML")
+    reply, note = await ub.ask(bot_name, text, lambda t: False, reply_timeout=12, tag="ASK")
+    if reply is None:
+        await message.answer(f"❔ Ответа нет: {html.escape(note)}")
+        return
+    await message.answer(f"📨 @{bot_name} ответил (сырой текст):\n<pre>{html.escape(reply[:3500])}</pre>",
+                         parse_mode="HTML")
 
 
 @dp.message(Command("mute"))
@@ -626,6 +755,7 @@ async def status_cmd(message: types.Message):
         f"⏳ Стабильность спреда перед алертом: <b>{stable_display}</b>\n"
         f"🚚 Фильтр перевода (только HTX-плечо): <b>{'Вкл' if settings['require_transferable'] else 'Выкл'}</b>\n"
         f"🚫 В чёрном списке: <b>{len(blacklist)} шт.</b>\n"
+        f"🕌 Халяль: <b>{halal_mode()}</b> · юзербот {html.escape(ub.describe())}\n"
         f"🔇 В муте сейчас: <b>{len(muted_until)} шт.</b>\n"
         f"💾 Upstash: {upstash_line}\n"
         f"📢 Канал: {settings['channel_id'] or 'Не задан'}\n"
@@ -674,6 +804,8 @@ async def debug_cmd(message: types.Message):
         f"стакан не загрузился: {debug_stats['depth_fallback']})",
         f"9️⃣ Чистая прибыль ≥ /mp {settings['min_profit_usd']:g}$: отсеяно {debug_stats['blocked_by_profit']}",
         f"📨 Алертов отправлено за этот проход: {debug_stats['alerts_sent']}",
+        f"🕌 Халяль: {halal_mode()} · харам → ЧС: {halal_stats['blocked']} · пропущено строгим режимом: "
+        f"{halal_stats['skipped']} · юзербот {html.escape(ub.describe())}",
     ]
 
     hd = debug_stats.get("htx_data") or {}
@@ -1126,6 +1258,8 @@ async def save_state():
         redis_cmd("SET", "spread_bot:settings", json.dumps(settings)),
         redis_cmd("SET", "spread_bot:blacklist", json.dumps(list(blacklist))),
         redis_cmd("SET", "spread_bot:muted", json.dumps(muted_until)),
+        redis_cmd("SET", "spread_bot:halal", json.dumps({"ignore": sorted(halal_ignore),
+                                                          "cache": halal_checker.export_cache()})),
         return_exceptions=True,
     )
 
@@ -1136,13 +1270,14 @@ async def load_state():
     стартует с дефолтами, как раньше."""
     if not UPSTASH_REDIS_REST_URL:
         return
-    raw_settings, raw_blacklist, raw_muted = await asyncio.gather(
+    raw_settings, raw_blacklist, raw_muted, raw_halal = await asyncio.gather(
         redis_cmd("GET", "spread_bot:settings"),
         redis_cmd("GET", "spread_bot:blacklist"),
         redis_cmd("GET", "spread_bot:muted"),
+        redis_cmd("GET", "spread_bot:halal"),
         return_exceptions=True,
     )
-    failed = [r for r in (raw_settings, raw_blacklist, raw_muted) if isinstance(r, Exception)]
+    failed = [r for r in (raw_settings, raw_blacklist, raw_muted, raw_halal) if isinstance(r, Exception)]
     if failed:
         print(f"--- Upstash не ответил, состояние не прочитано: {failed[0]} — "
               f"не сохраняю, пока не прочитаю ---", flush=True)
@@ -1172,6 +1307,14 @@ async def load_state():
             muted_until.update(json.loads(raw_muted))
     except Exception as e:
         print(f"Upstash: не удалось разобрать muted: {e}", flush=True)
+    try:
+        if isinstance(raw_halal, str):
+            data = json.loads(raw_halal)
+            halal_ignore.clear()
+            halal_ignore.update(str(x).upper() for x in data.get("ignore", []))
+            halal_checker.import_cache(data.get("cache"))
+    except Exception as e:
+        print(f"Upstash: не удалось разобрать halal: {e}", flush=True)
     state_loaded["ok"] = True
     print("--- Состояние восстановлено из Upstash ---", flush=True)
 
@@ -1241,6 +1384,41 @@ def build_pair_map(gate_data, huobi_data, htx_transfer, gate_contracts):
     return pair_map
 
 
+async def halal_gate(base_coin, pair):
+    """Халяль-проверка прямо перед отправкой сигнала: (слать ли, строка для сигнала, вердикт).
+    Вердикт — dict халяль-бота или None, если проверка не делалась."""
+    if not settings["halal_check"]:
+        return True, "", None
+    if base_coin in halal_ignore:
+        return True, "🕌 Халяль: не проверяется — возвращена из ЧС вручную", None
+    if not halal_checker.configured():
+        if settings["halal_only"]:
+            halal_stats["skipped"] += 1
+            print(f"[HALAL] WARN {base_coin}: строгий режим, а юзербот не настроен — сигнал пропущен", flush=True)
+            return False, "", None
+        return True, f"🕌 Халяль: проверка не настроена на сервисе {html.escape(RENDER_SERVICE)}", None
+    v = await halal_checker.check(base_coin)
+    if v["status"] == halal.HARAM:
+        blacklist.add(pair)
+        schedule_save()
+        halal_stats["blocked"] += 1
+        print(f"[HALAL] ХАРАМ {base_coin}: сигнал не отправлен, монета в ЧС ({v.get('link') or 'без ссылки'})", flush=True)
+        return False, "", v
+    if v["status"] == halal.HALAL:
+        return True, "🕌 Халяль: <b>مباح ✅</b>", v
+    if settings["halal_only"]:
+        halal_stats["skipped"] += 1
+        print(f"[HALAL] строгий режим: {base_coin} пропущен — не проверено ({v.get('note')})", flush=True)
+        return False, "", v
+    return True, f"🕌 Халяль: не проверено ({html.escape(v.get('note') or 'нет ответа')})", v
+
+
+def halal_mode():
+    if not settings["halal_check"]:
+        return "выкл"
+    return "ТОЛЬКО ХАЛЯЛЬ" if settings["halal_only"] else "вкл (харам → ЧС)"
+
+
 async def scanner_task():
     while True:
         try:
@@ -1258,6 +1436,12 @@ async def scanner_task():
                       "depth_fallback", "blocked_by_contract", "route_unmatched", "blocked_by_net",
                       "blocked_by_profit"):
                 debug_stats[k] = 0
+
+            if time.time() - halal_stats["last_log"] >= 900 and settings["halal_check"]:
+                halal_stats["last_log"] = time.time()
+                print(f"[HALAL] режим {halal_mode()}; юзербот {ub.describe()}; в кэше {len(halal_checker.cache)}; "
+                      f"харам → ЧС: {halal_stats['blocked']}; пропущено строгим режимом: {halal_stats['skipped']}",
+                      flush=True)
 
             if not gate_data or not huobi_data:
                 await asyncio.sleep(settings["check_interval"])
@@ -1479,6 +1663,11 @@ async def scanner_task():
                         debug_stats["blocked_by_profit"] += 1
                         continue
 
+                # ============ ХАЛЯЛЬ (после всех дешёвых фильтров, прямо перед отправкой) ============
+                send, halal_line, halal_verdict = await halal_gate(base_coin, pair)
+                if not send:
+                    continue
+
                 if avg_spread is None:
                     depth_line = (f"📦 Прокрутить с чистым спредом ≥ {c['threshold']:g}%: ~{fmt_money(tradable_usd)}$ "
                                   f"(только лучшая цена — стакан не загрузился)")
@@ -1565,6 +1754,19 @@ async def scanner_task():
                     contract_line,
                     "<i>Статусы перевода — со слов бирж (HTX часто неточен), сверяй перед крупным переводом.</i>",
                 ]
+                if halal_line:
+                    lines.append(halal_line)
+                # Автоарбитраж всего рынка (/arb_auto): только HTX→Gate и только подтверждённые халяль.
+                if buy_ex == "HTX" and arbitrage.arb.get("auto_on"):
+                    names = []
+                    if route.get("best"):
+                        names = list(route["best"]["htx"].get("names", [])) + list(route["best"]["gate"].get("names", []))
+                    auto_line = await arbitrage.auto_offer(
+                        base_coin, arbitrage.net_from_names(*names) if names else None, route["contract"],
+                        halal_verdict, best_spread, c["net"], sell_price, buy_price,
+                        settings["fee_htx_pct"] + settings["fee_gate_pct"])
+                    if auto_line:
+                        lines.append(auto_line)
                 alert_text = "\n".join(lines)
 
                 # Кнопка «В автоарбитраж» — только для направления HTX→Gate и сети,
@@ -1627,6 +1829,8 @@ BOT_COMMANDS = [
     BotCommand(command="mute", description="Временно замьютить монету"),
     BotCommand(command="unmute", description="Снять мут с монеты"),
     BotCommand(command="channel", description="Куда дублировать сигналы"),
+    BotCommand(command="halal", description="Халяль-проверка: статус, on/off, only/all, тикер"),
+    BotCommand(command="ask", description="Спросить бота через юзербот (сырой ответ)"),
 ] + [BotCommand(command=c, description=d) for c, d in arbitrage.BOT_COMMANDS]
 
 
@@ -1681,6 +1885,9 @@ async def main():
         await bot.set_my_commands(BOT_COMMANDS)
 
         await bot.delete_webhook(drop_pending_updates=True)
+        ub_task = asyncio.create_task(ub.start())  # подключение юзербота не задерживает старт бота
+        _background_tasks.add(ub_task)
+        ub_task.add_done_callback(_background_tasks.discard)
         scanner = asyncio.create_task(scanner_task())
         arb_tasks = await arbitrage.start()
         await dp.start_polling(bot)
