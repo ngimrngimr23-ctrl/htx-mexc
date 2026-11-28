@@ -186,8 +186,9 @@ arb = {
     # Мин. число спот-рынков монеты (по карточке @SpreaderApp «median of N spot», HTX и Gate
     # входят в N): меньше — медиана не показатель, не покупаем. /arb_markets 5
     "auto_min_markets": 3,
-    # Насколько медиана по рынку может быть ниже Gate, % (/arb_markets pct 2). None — половина спреда.
-    "auto_median_pct": None,
+    # Насколько медиана по рынку может быть ниже Gate — в % ОТ СПРЕДА HTX→Gate (/arb_markets pct 50).
+    # 50 — половина спреда: при спреде 6% медиана может быть дешевле Gate не больше чем на 3%.
+    "auto_median_share": 50.0,
     # Куплено на HTX, но не выведено (вывод не окупался): {монета: {"qty", "cost"}}.
     # Следующая сделка по монете начинает с этого остатка и выводит всё разом.
     "carry": {},
@@ -5214,7 +5215,7 @@ async def auto_offer(coin, net, route_contract, halal_v, spread, net_spread, gat
     if sp["status"] != "ok":
         return head + "не беру — цены по рынку не получил (%s)" % html.escape(sp.get("note") or "")
     ok, why = spreader.verdict(sp, float(gate_bid), float(spread), arb.get("auto_markets") or None,
-                               int(arb.get("auto_min_markets", spreader.MIN_MEDIAN_N)), arb.get("auto_median_pct"))
+                               int(arb.get("auto_min_markets", spreader.MIN_MEDIAN_N)), float(arb.get("auto_median_share", 50)))
     if not ok:
         return head + "не беру — рынок: %s" % html.escape(why)
     cfg = {"pct": float(need) + float(trade_fees), "net": net, "probe": 0, "htx_chain": None, "gate_net": None,
@@ -5257,7 +5258,7 @@ async def auto_recheck(coin, cfg, opp):
     if sp["status"] != "ok":
         return False, "цены по рынку не получил (%s)" % sp.get("note")
     ok, why = spreader.verdict(sp, float(opp["gate_bid"]), float(opp["spread"]), arb.get("auto_markets") or None,
-                               int(arb.get("auto_min_markets", spreader.MIN_MEDIAN_N)), arb.get("auto_median_pct"))
+                               int(arb.get("auto_min_markets", spreader.MIN_MEDIAN_N)), float(arb.get("auto_median_share", 50)))
     return ok, ("" if ok else "рынок: " + why)
 
 
@@ -5490,9 +5491,7 @@ async def cmd_auto(message: types.Message, command: CommandObject):
         f"Сверка цены по биржам: {html.escape(mk)} — /arb_markets\n"
         f"Беру монету, только если: сигнал HTX→Gate, халяль подтверждён, контракт на HTX и Gate совпал, "
         f"сеть поддерживается, и медиана цены по рынку (от {arb.get('auto_min_markets', 3)} спот-рынков) ниже Gate "
-        f"не больше чем на "
-        + (f"{arb['auto_median_pct']:g}%" if arb.get("auto_median_pct") is not None else "половину спреда")
-        + " (/arb_markets).\n"
+        f"не больше чем на {float(arb.get('auto_median_share', 50)):g}% от спреда (/arb_markets).\n"
         f"Юзербот (халяль + @SpreaderApp): {'✅ подключён' if halal_ready else '⚠️ не подключён — монеты брать не будет'}\n"
         f"Общий автоарбитраж: {'▶️ ВКЛ' if arb['enabled'] else '⏸ ВЫКЛ (/arb_on)'} · "
         f"{'🧪 тест' if arb['dry_run'] else '💸 реальные сделки'}\n"
@@ -5509,17 +5508,13 @@ async def cmd_markets(message: types.Message, command: CommandObject):
         return
     a = (command.args or "").strip()
     num = re.fullmatch(r"(?:min\s+|мин\s+)?(\d{1,3})", a.lower())
-    pct = re.fullmatch(r"(?:pct|%|процент)\s+(half|пол|\d+(?:[.,]\d+)?)%?", a.lower())
+    pct = re.fullmatch(r"(?:pct|%|процент)\s+(\d+(?:[.,]\d+)?)%?", a.lower())
     if pct:
-        v = pct.group(1)
-        if v in ("half", "пол"):
-            arb["auto_median_pct"] = None
-        else:
-            f = float(v.replace(",", "."))
-            if f < 0 or f > 100:
-                await message.answer("Пример: /arb_markets pct 2 (или pct half — половина спреда)")
-                return
-            arb["auto_median_pct"] = f
+        f = float(pct.group(1).replace(",", "."))
+        if f < 0 or f > 100:
+            await message.answer("Пример: /arb_markets pct 50 — медиана дешевле Gate не больше чем на 50% спреда")
+            return
+        arb["auto_median_share"] = f
         await save()
     elif num:
         n = int(num.group(1))
@@ -5544,13 +5539,13 @@ async def cmd_markets(message: types.Message, command: CommandObject):
         "📊 <b>Сверка цены перед автопокупкой</b>: сейчас по медиане цены по всем спот-рынкам из @SpreaderApp "
         "(таблицу по отдельным биржам он присылает в формате, который юзербот не видит).\n"
         "Правило: медиана цены по рынку ниже Gate не больше чем на <b>"
-        + (f"{arb['auto_median_pct']:g}%" if arb.get("auto_median_pct") is not None else "половину спреда HTX→Gate")
-        + "</b> (задать: /arb_markets pct 2 · вернуть половину спреда: /arb_markets pct half)\n"
+        f"{float(arb.get('auto_median_share', 50)):g}% от спреда HTX→Gate</b> "
+        "(при 50% и спреде 6% — не дешевле Gate больше чем на 3%). Задать: /arb_markets pct 50\n"
         f"Мин. спот-рынков у монеты: <b>{arb.get('auto_min_markets', 3)}</b> (HTX и Gate входят в счёт) — "
         f"меньше не покупаю. Задать: /arb_markets 5\n"
         "Список бирж сохранён, но пока не применяется: "
         + (html.escape(", ".join(mk)) if mk else "не задан")
-        + "\n/arb_markets 5 — мин. спот-рынков · /arb_markets binance okx bybit · /arb_markets all",
+        + "\n/arb_markets 5 — мин. спот-рынков · /arb_markets pct 50 — допуск в % от спреда",
         parse_mode="HTML")
 
 
