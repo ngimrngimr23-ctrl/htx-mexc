@@ -9,9 +9,11 @@
 спреда HTX→Gate. Например, при спреде 6% любая из бирж может быть дешевле Gate
 не больше чем на 3%.
 
-Ответ бота: шапка «DigiByte (DGB) · Цены спота», затем таблица «биржа | цена | Δ% |
-объём». Разбор терпимый к оформлению: ячейки через «|», через пробелы или каждая
-на своей строке. Ничего не разобрали — «не проверено», и монету не покупаем.
+На тикер бот присылает карточку: «DigiByte (DGB) / Price 0.002483 USDT · median of 8 spot».
+Таблицу по биржам он показывает по кнопке «Spot», но в новом формате Telegram, который
+юзербот видит пустым, — поэтому сверяем с медианой по всем спот-рынкам из карточки.
+Разбор таблицы оставлен на случай, если она когда-нибудь придёт текстом.
+Ничего не разобрали — «не проверено», и монету не покупаем.
 """
 
 import os
@@ -101,9 +103,31 @@ def parse_prices(text, ticker):
     return {"rows": rows, "coin": coin, "mismatch": bool(coin) and coin != ticker.upper()}
 
 
+_CARD = re.compile(r"(?:Price|Цена)\s+([\d.,]+(?:[eE]-?\d+)?)\s*USD[TC]?\s*·\s*(?:median of|медиана по)\s+(\d+)", re.I)
+
+
+def parse_card(text, ticker):
+    """Карточка монеты (ответ на тикер): «DigiByte (DGB) / Price 0.002483 USDT · median of 8 spot».
+    {"coin", "median", "n", "mismatch"}; median None — карточку не разобрали."""
+    text = (text or "").replace("\u200e", "").replace("\u200f", "")
+    head = re.search(r"\(([A-Za-z0-9]{1,15})\)", text.split("\n")[0])
+    coin = head.group(1).upper() if head else ""
+    m = _CARD.search(text)
+    median = n = None
+    if m:
+        try:
+            median, n = float(m.group(1).replace(",", "")), int(m.group(2))
+        except ValueError:
+            median = n = None
+    return {"coin": coin, "median": median, "n": n, "mismatch": bool(coin) and coin != ticker.upper()}
+
+
 def is_final(text, ticker):
     p = parse_prices(text, ticker)
-    return not p["mismatch"] and len(p["rows"]) >= 2
+    if not p["mismatch"] and len(p["rows"]) >= 2:
+        return True
+    c = parse_card(text, ticker)
+    return not c["mismatch"] and c["median"] is not None
 
 
 def spot_button(msg, ticker):
@@ -157,6 +181,29 @@ def market_check(rows, gate_ref, spread_pct, markets=None):
     return True, ", ".join(parts) + tail
 
 
+MIN_MEDIAN_N = 3  # медиана по 1–2 биржам (а это почти одни HTX и Gate) — не показатель
+
+
+def verdict(sp, gate_ref, spread_pct, markets=None):
+    """(ok, пояснение) по результату check(): по таблице бирж, если она есть, иначе по медиане.
+    Медиана — цена монеты по всем спот-рынкам из Spreader; правило то же: не ниже Gate больше
+    чем на половину спреда HTX→Gate."""
+    if sp.get("rows"):
+        return market_check(sp["rows"], gate_ref, spread_pct, markets)
+    median, n = sp.get("median"), sp.get("n") or 0
+    if not median or not gate_ref:
+        return False, "нет медианы цены по рынку"
+    if n < MIN_MEDIAN_N:
+        return False, "монета есть всего на %d спот-рынках — сверять не с чем" % n
+    below = (float(gate_ref) - median) / float(gate_ref) * 100
+    allowed = float(spread_pct) / 2
+    note = "медиана по %d спот-рынкам %s (%+.2f%% к Gate; допуск −%.2f%% = половина спреда)" % (
+        n, ("%.8f" % median).rstrip("0").rstrip("."), -below, allowed)
+    if markets:
+        note += "; по отдельным биржам Spreader цены не отдаёт — сверяю по медиане"
+    return below <= allowed, ("" if below <= allowed else "дешевле Gate больше допуска: ") + note
+
+
 def _unknown(note):
     return {"status": "unknown", "rows": [], "note": note}
 
@@ -178,21 +225,24 @@ class SpreaderChecker:
             if hit:
                 return hit
         try:
+            # Кнопку «Spot» не жмём: таблицу бирж Spreader присылает в новом формате Telegram,
+            # и юзербот видит вместо неё пустое сообщение. Хватает медианы из карточки.
             text, note = await self.ub.ask(BOT, ticker, lambda t: is_final(t, ticker), tag="SPREADER",
-                                           skip_if=None if fresh else (lambda: self.cached(ticker) is not None),
-                                           press=lambda m: spot_button(m, ticker))
+                                           skip_if=None if fresh else (lambda: self.cached(ticker) is not None))
             if text is None and note == userbot.SKIPPED:
                 return self.cached(ticker) or _unknown("проверка в очереди")
             if text is None:
                 res = _unknown(note)
             else:
-                p = parse_prices(text, ticker)
-                if p["mismatch"]:
-                    res = _unknown("ответ про другую монету (%s)" % p["coin"])
-                elif len(p["rows"]) < 2:
-                    res = _unknown("не разобрал ответ: «%s»" % re.sub(r"\s+", " ", text).strip()[:120])
-                else:
+                p, c = parse_prices(text, ticker), parse_card(text, ticker)
+                if p["mismatch"] or c["mismatch"]:
+                    res = _unknown("ответ про другую монету (%s)" % (p["coin"] or c["coin"]))
+                elif len(p["rows"]) >= 2:
                     res = {"status": "ok", "rows": p["rows"], "note": ""}
+                elif c["median"] is not None:
+                    res = {"status": "ok", "rows": [], "median": c["median"], "n": c["n"], "note": ""}
+                else:
+                    res = _unknown("не разобрал ответ: «%s»" % re.sub(r"\s+", " ", text).strip()[:120])
         except Exception as e:
             res = _unknown("ошибка: %s" % type(e).__name__)
             print("[SPREADER] %s: ошибка %r" % (ticker, e), flush=True)

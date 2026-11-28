@@ -5208,7 +5208,7 @@ async def auto_offer(coin, net, route_contract, halal_v, spread, net_spread, gat
                                                                                "note": "юзербот не настроен"}
     if sp["status"] != "ok":
         return head + "не беру — цены по рынку не получил (%s)" % html.escape(sp.get("note") or "")
-    ok, why = spreader.market_check(sp["rows"], float(gate_bid), float(spread), arb.get("auto_markets") or None)
+    ok, why = spreader.verdict(sp, float(gate_bid), float(spread), arb.get("auto_markets") or None)
     if not ok:
         return head + "не беру — рынок: %s" % html.escape(why)
     cfg = {"pct": float(need) + float(trade_fees), "net": net, "probe": 0, "htx_chain": None, "gate_net": None,
@@ -5250,8 +5250,7 @@ async def auto_recheck(coin, cfg, opp):
     sp = await ctx.spreader.check(coin)
     if sp["status"] != "ok":
         return False, "цены по рынку не получил (%s)" % sp.get("note")
-    ok, why = spreader.market_check(sp["rows"], float(opp["gate_bid"]), float(opp["spread"]),
-                                    arb.get("auto_markets") or None)
+    ok, why = spreader.verdict(sp, float(opp["gate_bid"]), float(opp["spread"]), arb.get("auto_markets") or None)
     return ok, ("" if ok else "рынок: " + why)
 
 
@@ -5476,14 +5475,15 @@ async def cmd_auto(message: types.Message, command: CommandObject):
     if a:
         await save()
     autos = sorted(c for c, cfg in arb["coins"].items() if cfg.get("auto"))
-    mk = ", ".join(arb.get("auto_markets") or []) or "весь рынок (кроме HTX и Gate, объём от 1000$)"
+    mk = "медиана по всем спот-рынкам из @SpreaderApp"
     halal_ready = bool(getattr(ctx, "halal", None) and ctx.halal.ready)
     await message.answer(
         f"🤖 <b>Автоарбитраж всего рынка</b>: {'✅ ВКЛ' if arb.get('auto_on') else '⏸ ВЫКЛ'}\n"
         f"Мин. чистый спред (после торговых комиссий и вывода): <b>{fmt(D(str(arb.get('auto_net_pct', 3))))}%</b>\n"
         f"Сверка цены по биржам: {html.escape(mk)} — /arb_markets\n"
         f"Беру монету, только если: сигнал HTX→Gate, халяль подтверждён, контракт на HTX и Gate совпал, "
-        f"сеть поддерживается, и на выбранных биржах цена не ниже Gate больше чем на половину спреда.\n"
+        f"сеть поддерживается, и медиана цены по рынку (от {spreader.MIN_MEDIAN_N} спот-рынков) не ниже Gate "
+        f"больше чем на половину спреда.\n"
         f"Юзербот (халяль + @SpreaderApp): {'✅ подключён' if halal_ready else '⚠️ не подключён — монеты брать не будет'}\n"
         f"Общий автоарбитраж: {'▶️ ВКЛ' if arb['enabled'] else '⏸ ВЫКЛ (/arb_on)'} · "
         f"{'🧪 тест' if arb['dry_run'] else '💸 реальные сделки'}\n"
@@ -5512,11 +5512,13 @@ async def cmd_markets(message: types.Message, command: CommandObject):
         await save()
     mk = arb.get("auto_markets") or []
     await message.answer(
-        "📊 <b>Сверка цены перед автопокупкой</b>: "
-        + (html.escape(", ".join(mk)) if mk else "весь рынок (все биржи из @SpreaderApp, кроме HTX и Gate, объём от 1000$)")
-        + "\nПравило: на каждой из них цена не ниже Gate больше чем на половину спреда HTX→Gate. "
-          "Биржи, где монеты нет, пропускаются; если нет ни одной — не покупаю.\n"
-          "/arb_markets binance okx bybit · /arb_markets all",
+        "📊 <b>Сверка цены перед автопокупкой</b>: сейчас по медиане цены по всем спот-рынкам из @SpreaderApp "
+        "(таблицу по отдельным биржам он присылает в формате, который юзербот не видит).\n"
+        "Правило: медиана не ниже Gate больше чем на половину спреда HTX→Gate; монета должна быть "
+        f"хотя бы на {spreader.MIN_MEDIAN_N} спот-рынках.\n"
+        "Список бирж сохранён, но пока не применяется: "
+        + (html.escape(", ".join(mk)) if mk else "не задан")
+        + "\n/arb_markets binance okx bybit · /arb_markets all",
         parse_mode="HTML")
 
 
