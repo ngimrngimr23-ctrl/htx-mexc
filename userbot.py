@@ -94,7 +94,7 @@ class UserBot:
             log("юзербот не подключился: %s" % self.last_error, "ERR")
             return False
 
-    async def ask(self, bot, text, is_final, reply_timeout=None, tag="TG", skip_if=None, press=None):
+    async def ask(self, bot, text, is_final, reply_timeout=None, tag="TG", skip_if=None, press=None, observe=None):
         """Отправляет text боту и ждёт ответ. Никогда не бросает исключений.
 
         is_final(text) -> True, когда ответ окончательный (вердикт, таблица и т.п.).
@@ -122,7 +122,7 @@ class UserBot:
             log("спрашиваю @%s: %s" % (bot, text), tag)
             try:
                 reply, note = await asyncio.wait_for(
-                    self._ask(bot, text, is_final, reply_timeout, press), HARD_TIMEOUT)
+                    self._ask(bot, text, is_final, reply_timeout, press, observe), HARD_TIMEOUT)
             except asyncio.TimeoutError:
                 reply, note = None, "запрос завис дольше %d с" % HARD_TIMEOUT
                 self.last_error = "@%s %s: %s" % (bot, text, note)
@@ -145,7 +145,7 @@ class UserBot:
                                          time.time() - started), tag)
             return reply, note
 
-    async def _ask(self, bot, text, is_final, reply_timeout, press=None):
+    async def _ask(self, bot, text, is_final, reply_timeout, press=None, observe=None):
         """Не client.conversation: бот может сначала прислать «ищу…», а потом
         ОТРЕДАКТИРОВАТЬ это же сообщение в ответ — события новых сообщений правку
         не видят. get_messages всегда отдаёт текущий текст: видны и новые, и правки."""
@@ -158,6 +158,8 @@ class UserBot:
             for msg in sorted(msgs or [], key=lambda m: m.id):
                 if getattr(msg, "out", False):
                     continue  # своё исходящее
+                if observe is not None:
+                    observe(msg)  # диагностика (/ask): что реально пришло, в т.ч. без текста
                 t = getattr(msg, "raw_text", None) or ""
                 if not t:
                     continue

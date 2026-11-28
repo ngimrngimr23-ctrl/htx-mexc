@@ -685,7 +685,17 @@ async def ask_cmd(message: types.Message, command: CommandObject):
     if "|" in text:  # /ask SpreaderApp ETC | Спот — нажать кнопку под ответом
         text, button = [x.strip() for x in text.split("|", 1)]
 
-    seen = {"buttons": [], "pressed": None}
+    seen = {"buttons": [], "pressed": None, "msgs": {}}
+
+    def observe(msg):
+        media = getattr(msg, "media", None)
+        txt = getattr(msg, "raw_text", None) or ""
+        urls = [getattr(b, "url", None) for row in (getattr(msg, "buttons", None) or []) for b in row]
+        seen["msgs"][msg.id] = (f"#{msg.id}: текст {len(txt)} симв."
+                                + (f", вложение {type(media).__name__}" if media else "")
+                                + (", отредактировано" if getattr(msg, "edit_date", None) else "")
+                                + (f", ссылки: {', '.join(u for u in urls if u)[:200]}" if any(urls) else "")
+                                + (f" — «{txt[:60]}»" if txt else ""))
 
     def press(msg):
         rows = getattr(msg, "buttons", None) or []
@@ -711,10 +721,13 @@ async def ask_cmd(message: types.Message, command: CommandObject):
         return
     queue = " (жду очереди)" if ub.busy else ""
     await message.answer(f"⏳ Спрашиваю @{bot_name}: {html.escape(text)}…{queue}", parse_mode="HTML")
-    reply, note = await ub.ask(bot_name, text, lambda t: False, reply_timeout=12, tag="ASK", press=press)
+    reply, note = await ub.ask(bot_name, text, lambda t: False, reply_timeout=12, tag="ASK", press=press,
+                               observe=observe)
     info = ""
     if seen["buttons"]:
         info += "\n🔘 Кнопки под ответом: " + html.escape(" · ".join(seen["buttons"]))
+    if seen["msgs"]:
+        info += "\n🧾 Сообщения бота (последнее состояние):\n" + html.escape("\n".join(seen["msgs"].values()))[:1500]
     if button:
         info += ("\n👆 Нажал: " + html.escape(seen["pressed"])) if seen["pressed"] else \
                 ("\n⚠️ Кнопку «" + html.escape(button) + "» не нашёл")
