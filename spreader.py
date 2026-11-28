@@ -144,7 +144,7 @@ def spot_button(msg, ticker):
     return None
 
 
-def market_check(rows, gate_ref, spread_pct, markets=None):
+def market_check(rows, gate_ref, spread_pct, markets=None, tol_pct=None):
     """(ok, пояснение). markets — ключи бирж (okx, binance…); пусто — весь рынок, кроме HTX и Gate.
     ok=False, если хоть одна выбранная биржа дешевле Gate больше чем на spread_pct/2,
     или сверять не с чем."""
@@ -167,7 +167,7 @@ def market_check(rows, gate_ref, spread_pct, markets=None):
     if not best:
         return False, ("на выбранных биржах (%s) монеты нет" % ", ".join(markets) if markets
                        else "кроме HTX и Gate сравнить не с чем")
-    allowed = float(spread_pct) / 2
+    allowed = float(tol_pct) if tol_pct is not None else float(spread_pct) / 2
     parts, bad = [], []
     for r in sorted(best.values(), key=lambda r: r["price"]):
         below = (gate - r["price"]) / gate * 100
@@ -175,7 +175,7 @@ def market_check(rows, gate_ref, spread_pct, markets=None):
         parts.append(part)
         if below > allowed:
             bad.append(part)
-    tail = " (к Gate; допуск −%.2f%% = половина спреда)" % allowed
+    tail = " (к Gate; допуск −%.2f%%%s)" % (allowed, "" if tol_pct is not None else " = половина спреда")
     if bad:
         return False, "дешевле Gate больше допуска: %s%s" % (", ".join(bad), tail)
     return True, ", ".join(parts) + tail
@@ -184,21 +184,22 @@ def market_check(rows, gate_ref, spread_pct, markets=None):
 MIN_MEDIAN_N = 3  # медиана по 1–2 биржам (а это почти одни HTX и Gate) — не показатель
 
 
-def verdict(sp, gate_ref, spread_pct, markets=None, min_n=MIN_MEDIAN_N):
+def verdict(sp, gate_ref, spread_pct, markets=None, min_n=MIN_MEDIAN_N, tol_pct=None):
     """(ok, пояснение) по результату check(): по таблице бирж, если она есть, иначе по медиане.
     Медиана — цена монеты по всем спот-рынкам из Spreader; правило то же: не ниже Gate больше
     чем на половину спреда HTX→Gate."""
     if sp.get("rows"):
-        return market_check(sp["rows"], gate_ref, spread_pct, markets)
+        return market_check(sp["rows"], gate_ref, spread_pct, markets, tol_pct)
     median, n = sp.get("median"), sp.get("n") or 0
     if not median or not gate_ref:
         return False, "нет медианы цены по рынку"
     if n < min_n:
         return False, "монета всего на %d спот-рынках, нужно от %d (/arb_markets)" % (n, min_n)
     below = (float(gate_ref) - median) / float(gate_ref) * 100
-    allowed = float(spread_pct) / 2
-    note = "медиана по %d спот-рынкам %s (%+.2f%% к Gate; допуск −%.2f%% = половина спреда)" % (
-        n, ("%.8f" % median).rstrip("0").rstrip("."), -below, allowed)
+    allowed = float(tol_pct) if tol_pct is not None else float(spread_pct) / 2
+    note = "медиана по %d спот-рынкам %s (%+.2f%% к Gate; допуск −%.2f%%%s)" % (
+        n, ("%.8f" % median).rstrip("0").rstrip("."), -below, allowed,
+        "" if tol_pct is not None else " = половина спреда")
     if markets:
         note += "; по отдельным биржам Spreader цены не отдаёт — сверяю по медиане"
     return below <= allowed, ("" if below <= allowed else "дешевле Gate больше допуска: ") + note
