@@ -685,12 +685,19 @@ async def ask_cmd(message: types.Message, command: CommandObject):
     if "|" in text:  # /ask SpreaderApp ETC | Спот — нажать кнопку под ответом
         text, button = [x.strip() for x in text.split("|", 1)]
 
+    seen = {"buttons": [], "pressed": None}
+
     def press(msg):
+        rows = getattr(msg, "buttons", None) or []
+        names = [getattr(btn, "text", "") or "" for row in rows for btn in row]
+        if names:
+            seen["buttons"] = names
         if not button:
             return None
-        for row in getattr(msg, "buttons", None) or []:
+        for row in rows:
             for btn in row:
                 if button.lower() in (getattr(btn, "text", "") or "").lower():
+                    seen["pressed"] = btn.text
                     return btn
         return None
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", bot_name):
@@ -702,10 +709,16 @@ async def ask_cmd(message: types.Message, command: CommandObject):
     queue = " (жду очереди)" if ub.busy else ""
     await message.answer(f"⏳ Спрашиваю @{bot_name}: {html.escape(text)}…{queue}", parse_mode="HTML")
     reply, note = await ub.ask(bot_name, text, lambda t: False, reply_timeout=12, tag="ASK", press=press)
+    info = ""
+    if seen["buttons"]:
+        info += "\n🔘 Кнопки под ответом: " + html.escape(" · ".join(seen["buttons"]))
+    if button:
+        info += ("\n👆 Нажал: " + html.escape(seen["pressed"])) if seen["pressed"] else \
+                ("\n⚠️ Кнопку «" + html.escape(button) + "» не нашёл")
     if reply is None:
-        await message.answer(f"❔ Ответа нет: {html.escape(note)}")
+        await message.answer(f"❔ Ответа нет: {html.escape(note)}{info}", parse_mode="HTML")
         return
-    await message.answer(f"📨 @{bot_name} ответил (сырой текст):\n<pre>{html.escape(reply[:3500])}</pre>",
+    await message.answer(f"📨 @{bot_name} ответил (сырой текст):\n<pre>{html.escape(reply[:3400])}</pre>{info}",
                          parse_mode="HTML")
 
 
