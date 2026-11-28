@@ -694,9 +694,12 @@ async def ask_cmd(message: types.Message, command: CommandObject):
             seen["buttons"] = names
         if not button:
             return None
+        # У юзербота может быть другой язык Telegram: «Спот» ↔ «Spot» и т.п.
+        alias = {"спот": "spot", "spot": "спот", "перп": "perp", "perp": "перп"}
+        want = {button.lower(), alias.get(button.lower(), button.lower())}
         for row in rows:
             for btn in row:
-                if button.lower() in (getattr(btn, "text", "") or "").lower():
+                if any(w in (getattr(btn, "text", "") or "").lower() for w in want):
                     seen["pressed"] = btn.text
                     return btn
         return None
