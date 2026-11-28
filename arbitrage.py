@@ -183,6 +183,9 @@ arb = {
     "auto_net_pct": 3.0,
     # Биржи для сверки цены (/arb_markets): ключи вроде binance, okx; пусто — весь рынок.
     "auto_markets": [],
+    # Мин. число спот-рынков монеты (по карточке @SpreaderApp «median of N spot», HTX и Gate
+    # входят в N): меньше — медиана не показатель, не покупаем. /arb_markets 5
+    "auto_min_markets": 3,
     # Куплено на HTX, но не выведено (вывод не окупался): {монета: {"qty", "cost"}}.
     # Следующая сделка по монете начинает с этого остатка и выводит всё разом.
     "carry": {},
@@ -5208,7 +5211,8 @@ async def auto_offer(coin, net, route_contract, halal_v, spread, net_spread, gat
                                                                                "note": "юзербот не настроен"}
     if sp["status"] != "ok":
         return head + "не беру — цены по рынку не получил (%s)" % html.escape(sp.get("note") or "")
-    ok, why = spreader.verdict(sp, float(gate_bid), float(spread), arb.get("auto_markets") or None)
+    ok, why = spreader.verdict(sp, float(gate_bid), float(spread), arb.get("auto_markets") or None,
+                               int(arb.get("auto_min_markets", spreader.MIN_MEDIAN_N)))
     if not ok:
         return head + "не беру — рынок: %s" % html.escape(why)
     cfg = {"pct": float(need) + float(trade_fees), "net": net, "probe": 0, "htx_chain": None, "gate_net": None,
@@ -5250,7 +5254,8 @@ async def auto_recheck(coin, cfg, opp):
     sp = await ctx.spreader.check(coin)
     if sp["status"] != "ok":
         return False, "цены по рынку не получил (%s)" % sp.get("note")
-    ok, why = spreader.verdict(sp, float(opp["gate_bid"]), float(opp["spread"]), arb.get("auto_markets") or None)
+    ok, why = spreader.verdict(sp, float(opp["gate_bid"]), float(opp["spread"]), arb.get("auto_markets") or None,
+                               int(arb.get("auto_min_markets", spreader.MIN_MEDIAN_N)))
     return ok, ("" if ok else "рынок: " + why)
 
 
@@ -5482,7 +5487,8 @@ async def cmd_auto(message: types.Message, command: CommandObject):
         f"Мин. чистый спред (после торговых комиссий и вывода): <b>{fmt(D(str(arb.get('auto_net_pct', 3))))}%</b>\n"
         f"Сверка цены по биржам: {html.escape(mk)} — /arb_markets\n"
         f"Беру монету, только если: сигнал HTX→Gate, халяль подтверждён, контракт на HTX и Gate совпал, "
-        f"сеть поддерживается, и медиана цены по рынку (от {spreader.MIN_MEDIAN_N} спот-рынков) не ниже Gate "
+        f"сеть поддерживается, и медиана цены по рынку (от {arb.get('auto_min_markets', 3)} спот-рынков, "
+        f"/arb_markets) не ниже Gate "
         f"больше чем на половину спреда.\n"
         f"Юзербот (халяль + @SpreaderApp): {'✅ подключён' if halal_ready else '⚠️ не подключён — монеты брать не будет'}\n"
         f"Общий автоарбитраж: {'▶️ ВКЛ' if arb['enabled'] else '⏸ ВЫКЛ (/arb_on)'} · "
@@ -5499,7 +5505,15 @@ async def cmd_markets(message: types.Message, command: CommandObject):
     if not await _guard(message):
         return
     a = (command.args or "").strip()
-    if a.lower() in ("all", "все", "всё"):
+    num = re.fullmatch(r"(?:min\s+|мин\s+)?(\d{1,3})", a.lower())
+    if num:
+        n = int(num.group(1))
+        if n < 1:
+            await message.answer("Минимум — 1 рынок. Пример: /arb_markets 5")
+            return
+        arb["auto_min_markets"] = n
+        await save()
+    elif a.lower() in ("all", "все", "всё"):
         arb["auto_markets"] = []
         await save()
     elif a:
@@ -5514,11 +5528,12 @@ async def cmd_markets(message: types.Message, command: CommandObject):
     await message.answer(
         "📊 <b>Сверка цены перед автопокупкой</b>: сейчас по медиане цены по всем спот-рынкам из @SpreaderApp "
         "(таблицу по отдельным биржам он присылает в формате, который юзербот не видит).\n"
-        "Правило: медиана не ниже Gate больше чем на половину спреда HTX→Gate; монета должна быть "
-        f"хотя бы на {spreader.MIN_MEDIAN_N} спот-рынках.\n"
+        "Правило: медиана не ниже Gate больше чем на половину спреда HTX→Gate.\n"
+        f"Мин. спот-рынков у монеты: <b>{arb.get('auto_min_markets', 3)}</b> (HTX и Gate входят в счёт) — "
+        f"меньше не покупаю. Задать: /arb_markets 5\n"
         "Список бирж сохранён, но пока не применяется: "
         + (html.escape(", ".join(mk)) if mk else "не задан")
-        + "\n/arb_markets binance okx bybit · /arb_markets all",
+        + "\n/arb_markets 5 — мин. спот-рынков · /arb_markets binance okx bybit · /arb_markets all",
         parse_mode="HTML")
 
 
@@ -6230,7 +6245,7 @@ BOT_COMMANDS = [
     ("arb_add", "Добавить монету: PEPE 3 bsc [проба$]"),
     ("arb_del", "Убрать монету из автоарбитража"),
     ("arb_auto", "Автоарбитраж всего рынка: on/off, порог"),
-    ("arb_markets", "Биржи для сверки цены перед покупкой"),
+    ("arb_markets", "Сверка цены по рынку: мин. число рынков (/arb_markets 5)"),
     ("arb_chains", "Сети монеты на HTX и Gate"),
     ("arb_confirm", "Подтвердить контракт монеты вручную"),
     ("arb_htx", "Что HTX отдаёт по монете (проверка API)"),

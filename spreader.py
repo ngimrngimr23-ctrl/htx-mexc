@@ -184,7 +184,7 @@ def market_check(rows, gate_ref, spread_pct, markets=None):
 MIN_MEDIAN_N = 3  # медиана по 1–2 биржам (а это почти одни HTX и Gate) — не показатель
 
 
-def verdict(sp, gate_ref, spread_pct, markets=None):
+def verdict(sp, gate_ref, spread_pct, markets=None, min_n=MIN_MEDIAN_N):
     """(ok, пояснение) по результату check(): по таблице бирж, если она есть, иначе по медиане.
     Медиана — цена монеты по всем спот-рынкам из Spreader; правило то же: не ниже Gate больше
     чем на половину спреда HTX→Gate."""
@@ -193,8 +193,8 @@ def verdict(sp, gate_ref, spread_pct, markets=None):
     median, n = sp.get("median"), sp.get("n") or 0
     if not median or not gate_ref:
         return False, "нет медианы цены по рынку"
-    if n < MIN_MEDIAN_N:
-        return False, "монета есть всего на %d спот-рынках — сверять не с чем" % n
+    if n < min_n:
+        return False, "монета всего на %d спот-рынках, нужно от %d (/arb_markets)" % (n, min_n)
     below = (float(gate_ref) - median) / float(gate_ref) * 100
     allowed = float(spread_pct) / 2
     note = "медиана по %d спот-рынкам %s (%+.2f%% к Gate; допуск −%.2f%% = половина спреда)" % (
